@@ -359,6 +359,14 @@ class TokenizerCommunicatorMixin:
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
         result = (await self.profile_communicator(req))[0]
         if not result.success:
+            # Make STOP_PROFILE idempotent for clients: profiling may have already auto-stopped
+            # (e.g., when started with num_steps), and calling /stop_profile again should not
+            # surface as an exception + ASGI error spam.
+            if (
+                req.type == ProfileReqType.STOP_PROFILE
+                and "Profiling is not in progress" in (result.message or "")
+            ):
+                return result
             raise RuntimeError(result.message)
         return result
 

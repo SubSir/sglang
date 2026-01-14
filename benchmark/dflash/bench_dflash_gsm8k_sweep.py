@@ -5,7 +5,8 @@ launches servers for multiple (attention_backend, tp_size) configs and runs a
 GSM8K workload for each (concurrency, num_questions) setting.
 
 Example usage:
-  ./venv/bin/python benchmark/gsm8k/bench_dflash_gsm8k_sweep.py --output-md dflash_gsm8k_sweep.md
+  ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py --output-md dflash_gsm8k_sweep.md
+  ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py --skip-baseline --profile --concurrencies 32 --tp-sizes 8
 """
 
 from __future__ import annotations
@@ -80,6 +81,81 @@ def _flush_cache(base_url: str) -> None:
     resp.raise_for_status()
 
 
+def _start_profile(
+    base_url: str,
+    *,
+    output_dir: str,
+    profile_prefix: str,
+    num_steps: int,
+) -> None:
+    # Profile inside the server process (scheduler), so GPU kernels are captured.
+    payload: dict = {
+        "output_dir": output_dir,
+        "num_steps": int(num_steps),
+        "profile_by_stage": True,
+        "profile_prefix": profile_prefix,
+        # Default to CPU+GPU traces (perfetto/chrome-trace compatible).
+        "activities": ["CPU", "GPU"],
+    }
+    resp = requests.post(base_url + "/start_profile", json=payload, timeout=60)
+    resp.raise_for_status()
+
+
+def _try_stop_profile(base_url: str) -> None:
+    # If profiling already auto-stopped (num_steps), /stop_profile can return 500.
+    # Treat that as non-fatal.
+    try:
+        resp = requests.post(base_url + "/stop_profile", timeout=60)
+        if resp.status_code != 200:
+            print(
+                f"[profile] stop_profile returned status={resp.status_code}: {resp.text.strip()}"
+            )
+    except Exception as e:
+        print(f"[profile] stop_profile failed: {e}")
+
+
+def _sanitize_for_filename(s: str) -> str:
+    # Keep filenames readable and safe across platforms.
+    s = re.sub(r"[^0-9A-Za-z._-]+", "_", str(s))
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _default_profile_trace_name(
+    *,
+    algorithm: str,
+    backend: str,
+    tp: int,
+    conc: int,
+    target_model: str,
+    draft_model: str,
+    prompt_style: str,
+    num_shots: int,
+    max_new_tokens: int,
+    dtype: str,
+    disable_radix_cache: bool,
+) -> str:
+    target = _sanitize_for_filename(target_model.split("/")[-1])
+    draft = _sanitize_for_filename(draft_model.split("/")[-1])
+    parts = [
+        "dflash_gsm8k",
+        _sanitize_for_filename(algorithm),
+        f"backend={_sanitize_for_filename(backend)}",
+        f"tp={int(tp)}",
+        f"conc={int(conc)}",
+        f"maxnew={int(max_new_tokens)}",
+        f"dtype={_sanitize_for_filename(dtype)}",
+        f"prompt={_sanitize_for_filename(prompt_style)}",
+        f"shots={int(num_shots)}",
+        f"radix={'0' if disable_radix_cache else '1'}",
+        f"target={target}",
+        f"draft={draft}",
+    ]
+    name = "__".join(parts)
+    # Keep filenames from getting too unwieldy.
+    return name[:200]
+
+
 def _send_generate(
     base_url: str,
     prompt: str,
@@ -108,6 +184,42 @@ def _send_generate(
     return resp.json()
 
 
+def _send_generate_batch(
+    base_url: str,
+    prompts: list[str],
+    *,
+    max_new_tokens: int,
+    stop: list[str],
+    timeout_s: int,
+) -> list[dict]:
+    if not prompts:
+        return []
+    sampling_params: dict = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 1,
+        "max_new_tokens": int(max_new_tokens),
+    }
+    if stop:
+        sampling_params["stop"] = stop
+    resp = requests.post(
+        base_url + "/generate",
+        json={
+            "text": prompts,
+            "sampling_params": sampling_params,
+        },
+        timeout=int(timeout_s),
+    )
+    resp.raise_for_status()
+    out = resp.json()
+    if not isinstance(out, list):
+        raise RuntimeError(
+            "Expected a list response for batched /generate, but got "
+            f"type={type(out).__name__}."
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class BenchMetrics:
     latency_s: float
@@ -126,6 +238,7 @@ def _run_gsm8k_requests(
     labels: Optional[list[int]],
     max_new_tokens: int,
     concurrency: int,
+    batch_requests: bool,
     stop: list[str],
     timeout_s: int,
     expect_dflash: bool,
@@ -140,36 +253,71 @@ def _run_gsm8k_requests(
     correct = 0
     invalid = 0
 
-    with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
-        futures = {
-            pool.submit(
-                _send_generate,
+    if batch_requests:
+        bs = max(int(concurrency), 1)
+        for start_idx in range(0, len(prompts), bs):
+            chunk_prompts = prompts[start_idx : start_idx + bs]
+            chunk_labels = labels[start_idx : start_idx + bs] if labels is not None else None
+            outs = _send_generate_batch(
                 base_url,
-                prompt,
+                chunk_prompts,
                 max_new_tokens=max_new_tokens,
                 stop=stop,
                 timeout_s=timeout_s,
-            ): i
-            for i, prompt in enumerate(prompts)
-        }
-        for fut in as_completed(futures):
-            i = futures[fut]
-            out = fut.result()
-            meta = out.get("meta_info", {}) or {}
-            total_tokens += int(meta.get("completion_tokens", 0))
-            spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
-            if "spec_accept_length" in meta:
-                try:
-                    spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                except (TypeError, ValueError):
-                    pass
+            )
+            if len(outs) != len(chunk_prompts):
+                raise RuntimeError(
+                    "Batched /generate output length mismatch: "
+                    f"got {len(outs)} outputs for {len(chunk_prompts)} prompts."
+                )
 
-            if labels is not None:
-                pred = _get_answer_value(out.get("text", ""))
-                if pred == INVALID:
-                    invalid += 1
-                if pred == labels[i]:
-                    correct += 1
+            for j, out in enumerate(outs):
+                meta = out.get("meta_info", {}) or {}
+                total_tokens += int(meta.get("completion_tokens", 0))
+                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+                if "spec_accept_length" in meta:
+                    try:
+                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
+                    except (TypeError, ValueError):
+                        pass
+
+                if chunk_labels is not None:
+                    pred = _get_answer_value(out.get("text", ""))
+                    if pred == INVALID:
+                        invalid += 1
+                    if pred == chunk_labels[j]:
+                        correct += 1
+    else:
+        with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
+            futures = {
+                pool.submit(
+                    _send_generate,
+                    base_url,
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    stop=stop,
+                    timeout_s=timeout_s,
+                ): i
+                for i, prompt in enumerate(prompts)
+            }
+            for fut in as_completed(futures):
+                i = futures[fut]
+                out = fut.result()
+                meta = out.get("meta_info", {}) or {}
+                total_tokens += int(meta.get("completion_tokens", 0))
+                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+                if "spec_accept_length" in meta:
+                    try:
+                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
+                    except (TypeError, ValueError):
+                        pass
+
+                if labels is not None:
+                    pred = _get_answer_value(out.get("text", ""))
+                    if pred == INVALID:
+                        invalid += 1
+                    if pred == labels[i]:
+                        correct += 1
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -225,10 +373,30 @@ def _format_table(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-md", type=str, default="dflash_gsm8k_sweep.md")
+    parser.add_argument(
+        "--output-md",
+        type=str,
+        default=None,
+        help="Write a markdown report to this file (disabled by default).",
+    )
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
+    parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip running the baseline (target-only) sweep; only run DFLASH and report N/A for baseline/speedup.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable server-side torch profiler for DFLASH runs and save perfetto-compatible traces.",
+    )
+    parser.add_argument(
+        "--batch-requests",
+        action="store_true",
+        help="Send prompts as server-side batched /generate requests (batch size = concurrency) instead of client-side concurrent requests.",
+    )
     parser.add_argument(
         "--prompt-style",
         type=str,
@@ -358,11 +526,12 @@ def main() -> None:
     baseline_acc: dict[tuple[str, int, int], Optional[float]] = {}
     dflash_acc: dict[tuple[str, int, int], Optional[float]] = {}
 
+    profile_output_dir = os.path.abspath("trace")
+    profile_num_steps = 10
+
     for backend in attention_backends:
         for tp in tp_sizes:
-            print(f"\n=== backend={backend} tp={tp} (baseline) ===")
-            baseline_port = find_available_port(20000)
-            baseline_url = f"http://127.0.0.1:{baseline_port}"
+            port_base = find_available_port(20000)
 
             common_server_args: list[str] = [
                 "--trust-remote-code",
@@ -383,52 +552,59 @@ def main() -> None:
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
 
-            baseline_proc = popen_launch_server(
-                args.target_model,
-                baseline_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=common_server_args,
-            )
-            try:
-                # Warm up.
-                _send_generate(
+            if not args.skip_baseline:
+                if args.profile:
+                    print("[profile] note: baseline profiling is disabled; profiling only applies to DFLASH runs.")
+                print(f"\n=== backend={backend} tp={tp} (baseline) ===")
+                baseline_port = port_base
+                baseline_url = f"http://127.0.0.1:{baseline_port}"
+                baseline_proc = popen_launch_server(
+                    args.target_model,
                     baseline_url,
-                    "Hello",
-                    max_new_tokens=8,
-                    stop=[],
-                    timeout_s=min(int(args.timeout_s), 300),
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    other_args=common_server_args,
                 )
-
-                for conc in concurrencies:
-                    n = num_questions_by_conc[conc]
-                    _flush_cache(baseline_url)
-                    metrics = _run_gsm8k_requests(
-                        baseline_url,
-                        prompts=prompts[:n],
-                        labels=labels[:n],
-                        max_new_tokens=int(args.max_new_tokens),
-                        concurrency=int(conc),
-                        stop=default_stop,
-                        timeout_s=int(args.timeout_s),
-                        expect_dflash=False,
-                    )
-                    baseline_toks[(backend, tp, conc)] = metrics.output_toks_per_s
-                    baseline_acc[(backend, tp, conc)] = metrics.accuracy
-                    print(
-                        f"[baseline] conc={conc:>2} n={n:<4} "
-                        f"toks/s={metrics.output_toks_per_s:,.2f} "
-                        f"latency={metrics.latency_s:.1f}s "
-                        f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f}"
-                    )
-            finally:
-                kill_process_tree(baseline_proc.pid)
                 try:
-                    baseline_proc.wait(timeout=30)
-                except Exception:
-                    pass
+                    # Warm up.
+                    _send_generate(
+                        baseline_url,
+                        "Hello",
+                        max_new_tokens=8,
+                        stop=[],
+                        timeout_s=min(int(args.timeout_s), 300),
+                    )
+
+                    for conc in concurrencies:
+                        n = num_questions_by_conc[conc]
+                        _flush_cache(baseline_url)
+                        metrics = _run_gsm8k_requests(
+                            baseline_url,
+                            prompts=prompts[:n],
+                            labels=labels[:n],
+                            max_new_tokens=int(args.max_new_tokens),
+                            concurrency=int(conc),
+                            batch_requests=bool(args.batch_requests),
+                            stop=default_stop,
+                            timeout_s=int(args.timeout_s),
+                            expect_dflash=False,
+                        )
+                        baseline_toks[(backend, tp, conc)] = metrics.output_toks_per_s
+                        baseline_acc[(backend, tp, conc)] = metrics.accuracy
+                        print(
+                            f"[baseline] conc={conc:>2} n={n:<4} "
+                            f"toks/s={metrics.output_toks_per_s:,.2f} "
+                            f"latency={metrics.latency_s:.1f}s "
+                            f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f}"
+                        )
+                finally:
+                    kill_process_tree(baseline_proc.pid)
+                    try:
+                        baseline_proc.wait(timeout=30)
+                    except Exception:
+                        pass
 
             print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
-            dflash_port = find_available_port(baseline_port + 1)
+            dflash_port = find_available_port(port_base + 1)
             dflash_url = f"http://127.0.0.1:{dflash_port}"
             dflash_proc = popen_launch_server(
                 args.target_model,
@@ -453,16 +629,43 @@ def main() -> None:
                 for conc in concurrencies:
                     n = num_questions_by_conc[conc]
                     _flush_cache(dflash_url)
+                    if args.profile:
+                        trace_name = _default_profile_trace_name(
+                            algorithm="dflash",
+                            backend=backend,
+                            tp=tp,
+                            conc=conc,
+                            target_model=args.target_model,
+                            draft_model=args.draft_model,
+                            prompt_style=args.prompt_style,
+                            num_shots=int(args.num_shots),
+                            max_new_tokens=int(args.max_new_tokens),
+                            dtype=str(args.dtype),
+                            disable_radix_cache=bool(args.disable_radix_cache),
+                        )
+                        print(
+                            f"[profile] start (dflash) trace_dir={profile_output_dir} trace_name={trace_name}"
+                        )
+                        _start_profile(
+                            dflash_url,
+                            output_dir=profile_output_dir,
+                            profile_prefix=trace_name,
+                            num_steps=profile_num_steps,
+                        )
                     metrics = _run_gsm8k_requests(
                         dflash_url,
                         prompts=prompts[:n],
                         labels=labels[:n],
                         max_new_tokens=int(args.max_new_tokens),
                         concurrency=int(conc),
+                        batch_requests=bool(args.batch_requests),
                         stop=default_stop,
                         timeout_s=int(args.timeout_s),
                         expect_dflash=True,
                     )
+                    if args.profile:
+                        _try_stop_profile(dflash_url)
+                        print("[profile] stop (dflash)")
                     dflash_toks[(backend, tp, conc)] = metrics.output_toks_per_s
                     dflash_accept_len[(backend, tp, conc)] = metrics.spec_accept_length
                     dflash_acc[(backend, tp, conc)] = metrics.accuracy
@@ -498,6 +701,8 @@ def main() -> None:
     md_lines.append(f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`")
     md_lines.append(f"- device_sm: `{device_sm}`")
     md_lines.append(f"- is_blackwell: `{is_blackwell}`")
+    md_lines.append(f"- skip_baseline: `{bool(args.skip_baseline)}`")
+    md_lines.append(f"- profile: `{bool(args.profile)}`")
     md_lines.append("")
     md_lines.append(
         "Note: DFLASH and baseline greedy outputs may diverge on some prompts due to numerical differences "
@@ -600,11 +805,13 @@ def main() -> None:
         )
         md_lines.append("")
 
-    with open(args.output_md, "w", encoding="utf-8") as f:
-        f.write("\n".join(md_lines))
-        f.write("\n")
-
-    print(f"\nWrote markdown report to: {args.output_md}")
+    if args.output_md:
+        with open(args.output_md, "w", encoding="utf-8") as f:
+            f.write("\n".join(md_lines))
+            f.write("\n")
+        print(f"\nWrote markdown report to: {args.output_md}")
+    else:
+        print("\nMarkdown report disabled (pass --output-md to write one).")
 
 
 if __name__ == "__main__":
