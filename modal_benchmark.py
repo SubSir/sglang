@@ -99,14 +99,6 @@ def run_sglang_and_test(model_path: str, draft_model_path: str) -> str:
     server_process.terminate()
     return test_result.stdout
 
-@app.function(image=official_image, gpu="H200:1")
-def debug_sgl_kernel():
-    import torch
-    import sgl_kernel
-    print("CUDA available:", torch.cuda.is_available())
-    print("Device:", torch.cuda.get_device_name(0))
-    print("sgl_kernel version:", sgl_kernel.__version__)
-
 @app.function(
     gpu="H200:4",  # 使用 4 块 H200
     timeout=3600,
