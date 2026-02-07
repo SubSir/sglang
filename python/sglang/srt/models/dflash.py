@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(self, config, quant_config, layer_id: int) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_tensor_model_parallel_world_size())
@@ -77,12 +77,14 @@ class DFlashAttention(nn.Module):
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
+            quant_config=quant_config,
             prefix="qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
+            quant_config=quant_config,
             prefix="o_proj",
         )
 
@@ -211,15 +213,15 @@ class DFlashMLP(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(self, config, quant_config, layer_id: int) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.self_attn = DFlashAttention(config=config, layer_id=layer_id)
+        self.self_attn = DFlashAttention(config=config, quant_config=quant_config, layer_id=layer_id)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config)
+        self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
     def forward(
         self,
@@ -271,7 +273,7 @@ class DFlashDraftModel(nn.Module):
         dflash_cfg_dict = get_dflash_config(config)
 
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
+            [DFlashDecoderLayer(config=config, quant_config=quant_config, layer_id=i) for i in range(num_layers)]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -287,8 +289,12 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
+        self.fc = RowParallelLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix="fc" if not prefix else f"{prefix}.fc",
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -318,7 +324,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -328,7 +334,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        return self.hidden_norm(self.fc(target_hidden)[0])
 
     @torch.no_grad()
     def forward(
@@ -402,16 +408,16 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
-                    raise ValueError(
-                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
-                        "number of context features (K) does not match this config. "
-                        f"Expected fc.weight.shape={tuple(param.shape)} "
-                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
-                    )
+                # if resolved_name.endswith("fc.weight") and tuple(
+                #     loaded_weight.shape
+                # ) != tuple(param.shape):
+                #     raise ValueError(
+                #         "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                #         "number of context features (K) does not match this config. "
+                #         f"Expected fc.weight.shape={tuple(param.shape)} "
+                #         f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                #         f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+                #     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
