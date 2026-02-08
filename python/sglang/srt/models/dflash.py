@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    ColumnParallelLinear,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
@@ -289,10 +290,11 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = RowParallelLinear(
+        self.fc = ColumnParallelLinear(
             self.num_context_features * hidden_size,
             hidden_size,
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             prefix="fc" if not prefix else f"{prefix}.fc",
         )
