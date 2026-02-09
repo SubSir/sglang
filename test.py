@@ -164,4 +164,5 @@ if __name__ == "__main__":
     )
     args = add_common_sglang_args_and_parse(parser)
     args.parallel = 32
+    args.num_questions *= args.parallel
     main(args)

@@ -58,7 +58,7 @@ def run_sglang_and_test(model_path: str, draft_model_path: str) -> str:
         "--speculative-draft-model-path", draft_model_path,
         "--tp-size", "4",
         "--dtype", "bfloat16",
-        "--mem-fraction-static", "0.75",
+        "--mem-fraction-static", "0.6",
         "--trust-remote-code",
         "--port", "30000",
     ]
@@ -100,7 +100,7 @@ def run_sglang_and_test(model_path: str, draft_model_path: str) -> str:
     return test_result.stdout
 
 @app.function(
-    gpu="H200:4",  # 使用 4 块 H200
+    gpu="A100-40GB:4",  # 使用 4 块 H200
     timeout=3600,
     image=official_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -114,7 +114,7 @@ def test_official():
 
 
 @app.function(
-    gpu="H200:4",
+    gpu="A100-40GB:4",
     timeout=3600,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
