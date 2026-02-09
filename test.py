@@ -1,168 +1,277 @@
+"""
+Usage:
+# single GPU
+python tmp.py  --model-path Qwen/Qwen3-8B  --batch 1 2 4 8 16 32 --speculative-draft-model-path z-lab/Qwen3-8B-DFlash-b16 --speculative-algorithm DFLASH
+
+# multiple GPU
+python tmp.py  --model-path Qwen/Qwen3-8B  --batch 1 2 4 8 16 32 --speculative-draft-model-path z-lab/Qwen3-8B-DFlash-b16 --speculative-algorithm DFLASH --tp-size 4
+"""
+
 import argparse
-import ast
+import asyncio
 import json
 import os
-import random
-import re
 import time
+from types import SimpleNamespace
+from typing import List
 
 import numpy as np
-from datasets import load_dataset
+import requests
+from transformers import AutoTokenizer
 
-from sglang.lang.api import set_default_backend
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    dump_bench_raw_result,
-    select_sglang_backend,
+from sglang.bench_serving import (
+    DatasetRow,
+    benchmark,
+    sample_mmmu_requests,
+    set_global_args,
 )
-from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
-
-# Set all random seeds to 0
-random.seed(0)
-np.random.seed(0)
-
-INVALID = -9999999
-
-
-def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
+from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    kill_process_tree,
+    popen_launch_server,
+)
 
 
-def get_few_shot_examples(lines, k):
-    ret = ""
-    for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
+def node0_print(msg):
+    if server_args.node_rank == 0:
+        print(msg)
 
 
-def get_answer_value(answer_str):
-    answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
-    if len(numbers) < 1:
-        return INVALID
-    try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
-        return INVALID
+prompts = [
+    "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
+    "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
+    "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
+    "Human: I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. My first sentence is 'istanbulu cok seviyom burada olmak cok guzel'. Answer in more than 5000 words.\n\nAssistant:",
+    "Human: I want you to act as a storyteller. You will come up with entertaining stories that are engaging, imaginative and captivating for the audience. It can be fairy tales, educational stories or any other type of stories which has the potential to capture people's attention and imagination. Depending on the target audience, you may choose specific themes or topics for your storytelling session e.g., if it’s children then you can talk about animals; If it’s adults then history-based tales might engage them better etc. Answer in more than 5000 words. My first request is 'I need an interesting story on perseverance.'\n\nAssistant:",
+    "Human: Solve x^2 = -1. Think step-by-step. Give me a long detailed explanation. \n\nAssistant:",
+    "Human: Tell me about the president of the USA in wikipedia style.\n\nAssistant:",
+    "Human: Hello? Who are you? Write code, math, and poem to explanin yourself.\n\nAssistant:",
+]
 
 
-def main(args):
-    # Select backend
-    set_default_backend(select_sglang_backend(args))
+class FakeTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return []
 
-    # Read data
-    if args.platinum:
-        print("Loading GSM8K Platinum dataset from HuggingFace...")
-        dataset = load_dataset("madrylab/gsm8k-platinum", "main", split="test")
-        lines = [
-            {"question": item["question"], "answer": item["answer"]} for item in dataset
-        ]
+
+def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
+    # format: (prompt, input_len, output len). We set input_len as a dummy value 0.
+    if is_multimodal:
+        backend = "sglang-oai-chat"
+        api_url = f"{base_url}/v1/chat/completions"
+        input_requests = sample_mmmu_requests(
+            num_prompts,
+            processor,
+            backend=backend,
+            fixed_output_len=512,
+        )
+        tokenizer = processor.tokenizer
     else:
-        data_path = args.data_path
-        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-        if not os.path.isfile(data_path):
-            data_path = download_and_cache_file(url)
-        lines = list(read_jsonl(data_path))
+        padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
+            :num_prompts
+        ]
+        input_requests: List[DatasetRow] = [
+            DatasetRow(p, 0, 512) for p in padded_prompts
+        ]
+        backend = "sglang"
+        api_url = f"{base_url}/generate"
+        tokenizer = processor
 
-    # Construct prompts
-    num_questions = args.num_questions
-    num_shots = args.num_shots
-    few_shot_examples = get_few_shot_examples(lines, num_shots)
+    # We need to set some dummy values in order to call `benchmark` below.
+    args = SimpleNamespace(
+        disable_ignore_eos=False,
+        disable_stream=False,
+        return_logprob=False,
+        return_routed_experts=False,
+        plot_throughput=False,
+        backend=backend,
+        dataset_name="custom",
+        num_prompts=None,
+        sharegpt_output_len=None,
+        random_input_len=None,
+        random_output_len=None,
+        random_range_ratio=None,
+        output_file=None,
+        warmup_requests=1,
+        output_details=False,
+    )
+    set_global_args(args)
 
-    questions = []
-    labels = []
-    for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
-    assert all(l != INVALID for l in labels)
-    arguments = [{"question": q} for q in questions]
+    # Run benchmark
+    results = asyncio.run(
+        benchmark(
+            backend=backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id="default",
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            request_rate=float("inf"),
+            max_concurrency=batch_size,
+            disable_tqdm=False,
+            lora_names=None,
+            lora_request_distribution=None,
+            lora_zipf_alpha=None,
+            extra_request_body={},
+            profile=None,
+        )
+    )
 
-    #####################################
-    ######### SGL Program Begin #########
-    #####################################
+    assert results["completed"] == len(input_requests)
+    acc_length = results["accept_length"] or 1.0
+    avg_output_token = results["total_output_tokens"] / results["completed"]
 
-    import sglang as sgl
+    server_info = requests.get(base_url + "/get_server_info").json()
+    # We use 20% percentile instead of median on purpose
+    step_time = np.percentile(
+        server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
+    )
+    speed = 1 / step_time * acc_length
 
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=2048, stop=["Question", "Assistant:", "<|separator|>"]
+    return (
+        round(acc_length, 3),
+        round(step_time, 5),
+        round(speed, 3),
+        avg_output_token,
+    )
+
+
+def main(args, server_args):
+    base_url = "http://127.0.0.1:20000"
+
+    configs = []
+    for batch_size in args.batch_size:
+        configs.append(batch_size)
+
+    for i in range(args.start, args.end or len(configs)):
+        batch_size = configs[i]
+
+        node0_print(f"Start {i=}: {batch_size=}")
+
+        # Create an LLM.
+        other_args = []
+        if server_args.speculative_draft_model_path is not None:
+            other_args.extend(
+                [
+                    "--speculative-draft-model-path",
+                    server_args.speculative_draft_model_path,
+                    "--speculative-algorithm",
+                    server_args.speculative_algorithm,
+                ]
+            )
+
+        other_args.extend(
+            [
+                "--cuda-graph-max-bs",
+                batch_size,
+                "--mem-fraction-static",
+                server_args.mem_fraction_static,
+                "--tp-size",
+                server_args.tp_size,
+                "--max-running-requests",
+                batch_size,
+            ]
         )
 
-    #####################################
-    ########## SGL Program End ##########
-    #####################################
+        if server_args.trust_remote_code:
+            other_args.extend(
+                [
+                    "--trust-remote-code",
+                ]
+            )
 
-    # Run requests
-    tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
-        arguments,
-        temperature=0,
-        num_threads=args.parallel,
-        progress_bar=True,
-    )
-    latency = time.perf_counter() - tic
+        if server_args.attention_backend:
+            other_args.extend(
+                [
+                    "--attention-backend",
+                    server_args.attention_backend,
+                ]
+            )
 
-    preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+        if server_args.quantization:
+            other_args.extend(
+                [
+                    "--quantization",
+                    server_args.quantization,
+                ]
+            )
 
-    # Compute accuracy
-    acc = np.mean(np.array(preds) == np.array(labels))
-    invalid = np.mean(np.array(preds) == INVALID)
-
-    # Compute speed
-    num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
-    )
-    output_throughput = num_output_tokens / latency
-
-    # Print results
-    print(f"Accuracy: {acc:.3f}")
-    print(f"Invalid: {invalid:.3f}")
-    print(f"Latency: {latency:.3f} s")
-    print(f"Output throughput: {output_throughput:.3f} token/s")
-
-    # Dump results
-    dump_state_text(f"tmp_output_{args.backend}.txt", states)
-    dump_bench_raw_result(
-        path=args.raw_result_file,
-        states=states,
-        preds=preds,
-        labels=labels,
-    )
-
-    with open(args.result_file, "a") as fout:
-        value = {
-            "task": "gsm8k-platinum" if args.platinum else "gsm8k",
-            "backend": args.backend,
-            "num_gpus": 1,
-            "latency": round(latency, 3),
-            "accuracy": round(acc, 3),
-            "num_requests": args.num_questions,
-            "other": {
-                "num_questions": args.num_questions,
-                "parallel": args.parallel,
+        process = popen_launch_server(
+            args.model_path,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env={
+                "SGLANG_RECORD_STEP_TIME": "1",
+                **os.environ,
             },
+        )
+
+        if args.is_multimodal:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                args.model_path, trust_remote_code=server_args.trust_remote_code
+            )
+        else:
+            processor = AutoTokenizer.from_pretrained(
+                args.model_path, trust_remote_code=server_args.trust_remote_code
+            )
+
+        try:
+            # Warmup
+            send_one_batch(
+                base_url, batch_size, batch_size, processor, args.is_multimodal
+            )
+
+            # Benchmark
+            acc_length, step_time, speed, completion_tokens = send_one_batch(
+                base_url,
+                max(args.num_prompts, batch_size),
+                batch_size,
+                processor,
+                args.is_multimodal,
+            )
+        finally:
+            kill_process_tree(process.pid)
+
+        node0_print(
+            f"Finish {i=}: {batch_size=}, {speed=:.2f} token/s, step_time={step_time * 1000:.2f} ms"
+        )
+
+        record = {
+            "batch_size": batch_size,
+            "acc_length": acc_length,
+            "step_time": step_time,
+            "speed": speed,
+            "completion_tokens": completion_tokens,
         }
-        fout.write(json.dumps(value) + "\n")
+
+        with open(args.output, "a") as fout:
+            fout.write(json.dumps(record) + "\n")
+
+        # Wait for the server to shutdown
+        time.sleep(5)
 
 
+# The __main__ condition is necessary here because we use "spawn" to create subprocesses
+# Spawn starts a fresh program every time, if there is no __main__, it will run into infinite loop to keep spawning processes from sgl.Engine
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-shots", type=int, default=0)
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
-    parser.add_argument("--num-questions", type=int, default=128)
+    ServerArgs.add_cli_args(parser)
     parser.add_argument(
-        "--platinum",
-        action="store_false",
-        help="Use GSM8K Platinum dataset (drop-in replacement with corrected labels)",
+        "--batch-size",
+        type=int,
+        nargs="+",
+        default=(1, 2, 4, 8, 16),
     )
-    args = add_common_sglang_args_and_parse(parser)
-    args.parallel = 32
-    args.num_questions *= args.parallel
-    main(args)
+    parser.add_argument("--num-prompts", type=int, default=16)
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int)
+    parser.add_argument("--output", type=str, default="output.jsonl")
+    parser.add_argument("--is-multimodal", action="store_true", default=False)
+    args = parser.parse_args()
+    server_args: ServerArgs = ServerArgs.from_cli_args(args)
+
+    main(args, server_args)
