@@ -1,28 +1,32 @@
-"""DFLASH vs baseline GSM8K sweep.
+"""
+DFLASH vs baseline dataset sweep (generic).
 
 This is a *benchmark script* (not a CI test): it can take a long time because it
 launches servers for multiple (attention_backend, tp_size) configs and runs a
-GSM8K workload for each (concurrency, num_questions) setting.
+workload for each (concurrency, num_samples) setting.
 
 Example usage:
-  ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py --output-md dflash_gsm8k_sweep.md
-  ./venv/bin/python benchmark/dflash/bench_dflash_gsm8k_sweep.py --skip-baseline --concurrencies 32 --tp-sizes 8
+  ./venv/bin/python benchmark/dflash/bench_dflash_dataset_sweep.py \
+      --data-name gsm8k \
+      --output-md dflash_gsm8k_sweep.md
+
+  ./venv/bin/python benchmark/dflash/bench_dflash_dataset_sweep.py \
+      --data-name swe-bench --skip-baseline --concurrencies 32 --tp-sizes 8
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import os
-import re
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import requests
 import torch
+from datasets import load_dataset, Features, Sequence, Value
 from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs
@@ -32,9 +36,168 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
 
-INVALID = -9999999
+# -------------------------
+# Dataset loading & prompt
+# -------------------------
+
+
+def load_and_process_dataset(data_name: str):
+    """
+    The returned dataset must have a "turns" column, where each row is:
+      {"turns": [str, str, ...]}
+    We only use turns[0] as the prompt here.
+    """
+    # Math datasets
+    if data_name == "gsm8k":
+        dataset = load_dataset("openai/gsm8k", "main", split="test")
+        prompt_fmt = "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "math500":
+        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "aime24":
+        dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
+        prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "aime25":
+        dataset = load_dataset("MathArena/aime_2025", split="train")
+        prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    # Chat datasets
+    elif data_name == "alpaca":
+        dataset = load_dataset("tatsu-lab/alpaca", split="train")
+        dataset = dataset.map(
+            lambda x: {
+                "formatted_input": (
+                    f"{x['instruction']}\n\nInput:\n{x['input']}"
+                    if x["input"]
+                    else x["instruction"]
+                )
+            }
+        )
+        dataset = dataset.map(lambda x: {"turns": [x["formatted_input"]]})
+
+    elif data_name == "mt-bench":
+        dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
+        # prompt 字段就是一个多轮对话 turn 列表
+        dataset = dataset.map(lambda x: {"turns": x["prompt"]})
+
+    # Coding datasets
+    elif data_name == "humaneval":
+        dataset = load_dataset("openai/openai_humaneval", split="test")
+        prompt_fmt = (
+            "Write a solution to the following problem and make sure that it passes the tests:\n"
+            "```python\n{prompt}\n```"
+        )
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "mbpp":
+        dataset = load_dataset(
+            "google-research-datasets/mbpp", "sanitized", split="test"
+        )
+        dataset = dataset.map(lambda x: {"turns": [x["prompt"]]})
+
+    elif data_name == "lbpp":
+        LBPP_PY_TEST_URL = "https://huggingface.co/datasets/CohereLabs/lbpp/resolve/main/python/test.parquet"
+        dataset = load_dataset("parquet", data_files={"test": LBPP_PY_TEST_URL})["test"]
+        dataset = dataset.map(lambda x: {"turns": [x["instruction"]]})
+
+    elif data_name == "swe-bench":
+        dataset = load_dataset("princeton-nlp/SWE-bench_Lite", split="test")
+        prompt_fmt = "Problem Statement:\n{problem_statement}\nPlease fix the issue described above."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "livecodebench":
+        base = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main/"
+        allowed_files = [
+            "test.jsonl",
+            "test2.jsonl",
+            "test3.jsonl",
+            "test4.jsonl",
+            "test5.jsonl",
+            "test6.jsonl",
+        ]
+        urls = [base + fn for fn in allowed_files]
+        dataset = load_dataset("json", data_files={"test": urls})["test"]
+
+        def format_lcb(doc):
+            system_prompt = (
+                "You are an expert Python programmer. You will be given a question (problem specification) "
+                "and will generate a correct Python program that matches the specification and passes all tests. "
+                "You will NOT return anything except for the program"
+            )
+            question_block = f"### Question:\n{doc['question_content']}"
+            if doc.get("starter_code"):
+                format_message = "### Format: Use the following code structure:"
+                code_block = f"```python\n{doc['starter_code']}\n```"
+            else:
+                format_message = "### Format: Write your code in the following format:"
+                code_block = "```python\n# YOUR CODE HERE\n```"
+            answer_footer = "### Answer: (use the provided format with backticks)"
+            return f"{system_prompt}\n\n{question_block}\n\n{format_message}\n{code_block}\n\n{answer_footer}"
+
+        target_features = Features({"turns": Sequence(Value("large_string"))})
+        dataset = dataset.map(
+            lambda x: {"turns": [format_lcb(x)]},
+            remove_columns=dataset.column_names,
+            features=target_features,
+        )
+
+    else:
+        raise ValueError(f"Unsupported data_name: {data_name}")
+
+    return dataset
+
+
+def build_prompts_from_turns(
+    dataset,
+    tokenizer,
+    max_samples: int,
+    prompt_style: str,
+) -> List[str]:
+    """Convert dataset["turns"] into the final string prompt sent to /generate.
+
+    - For prompt_style == 'chat': treats turns as a multi-turn conversation and calls tokenizer.apply_chat_template
+    - For prompt_style == 'plain': uses turns[0] directly
+    """
+    prompts: List[str] = []
+
+    n_total = len(dataset)
+    if n_total == 0:
+        raise RuntimeError("Dataset is empty (no samples).")
+
+    for i in range(max_samples):
+        ex = dataset[i % n_total]
+        turns = ex["turns"]
+        if not isinstance(turns, list) or len(turns) == 0:
+            raise RuntimeError(f"Invalid turns field at index {i}: {turns}")
+
+        if prompt_style == "plain":
+            # 只用第一轮作为纯文本 prompt
+            prompts.append(str(turns[0]))
+        else:
+            # chat 风格：把每一轮当成 user 的一条 message
+            messages = [{"role": "user", "content": t} for t in turns]
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            prompts.append(prompt)
+
+    return prompts
+
+
+# -------------------------
+# Benchmark core
+# -------------------------
 
 
 def _is_blackwell() -> bool:
@@ -42,38 +205,6 @@ def _is_blackwell() -> bool:
     if envs.IS_BLACKWELL.get():
         return True
     return get_device_sm() >= 100
-
-
-def _get_one_example(lines, i: int, include_answer: bool) -> str:
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
-
-
-def _get_few_shot_examples(lines, k: int) -> str:
-    ret = ""
-    for i in range(k):
-        ret += _get_one_example(lines, i, True) + "\n\n"
-    return ret
-
-
-def _get_answer_value(answer_str: str) -> int:
-    answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
-    if len(numbers) < 1:
-        return INVALID
-    try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
-        return INVALID
-
-
-def _maybe_download_gsm8k(data_path: str) -> str:
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    if os.path.isfile(data_path):
-        return data_path
-    return download_and_cache_file(url)
 
 
 def _flush_cache(base_url: str) -> None:
@@ -156,11 +287,10 @@ class BenchMetrics:
     spec_verify_ct_sum: int
 
 
-def _run_gsm8k_requests(
+def _run_requests(
     base_url: str,
     *,
     prompts: list[str],
-    labels: Optional[list[int]],
     max_new_tokens: int,
     concurrency: int,
     batch_requests: bool,
@@ -168,23 +298,15 @@ def _run_gsm8k_requests(
     timeout_s: int,
     expect_dflash: bool,
 ) -> BenchMetrics:
-    if labels is not None and len(labels) != len(prompts):
-        raise ValueError("labels length must match prompts length")
-
     start = time.perf_counter()
     total_tokens = 0
     spec_verify_ct_sum = 0
     spec_accept_lengths: list[float] = []
-    correct = 0
-    invalid = 0
 
     if batch_requests:
         bs = max(int(concurrency), 1)
         for start_idx in range(0, len(prompts), bs):
             chunk_prompts = prompts[start_idx : start_idx + bs]
-            chunk_labels = (
-                labels[start_idx : start_idx + bs] if labels is not None else None
-            )
             outs = _send_generate_batch(
                 base_url,
                 chunk_prompts,
@@ -198,7 +320,7 @@ def _run_gsm8k_requests(
                     f"got {len(outs)} outputs for {len(chunk_prompts)} prompts."
                 )
 
-            for j, out in enumerate(outs):
+            for out in outs:
                 meta = out.get("meta_info", {}) or {}
                 total_tokens += int(meta.get("completion_tokens", 0))
                 spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
@@ -207,13 +329,6 @@ def _run_gsm8k_requests(
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
                     except (TypeError, ValueError):
                         pass
-
-                if chunk_labels is not None:
-                    pred = _get_answer_value(out.get("text", ""))
-                    if pred == INVALID:
-                        invalid += 1
-                    if pred == chunk_labels[j]:
-                        correct += 1
     else:
         with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
             futures = {
@@ -228,7 +343,6 @@ def _run_gsm8k_requests(
                 for i, prompt in enumerate(prompts)
             }
             for fut in as_completed(futures):
-                i = futures[fut]
                 out = fut.result()
                 meta = out.get("meta_info", {}) or {}
                 total_tokens += int(meta.get("completion_tokens", 0))
@@ -238,13 +352,6 @@ def _run_gsm8k_requests(
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
                     except (TypeError, ValueError):
                         pass
-
-                if labels is not None:
-                    pred = _get_answer_value(out.get("text", ""))
-                    if pred == INVALID:
-                        invalid += 1
-                    if pred == labels[i]:
-                        correct += 1
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -259,12 +366,9 @@ def _run_gsm8k_requests(
         float(statistics.mean(spec_accept_lengths)) if spec_accept_lengths else None
     )
 
-    if labels is None:
-        acc = None
-        invalid_rate = None
-    else:
-        acc = correct / max(len(prompts), 1)
-        invalid_rate = invalid / max(len(prompts), 1)
+    # 通用脚本这里不做正确性评估
+    acc = None
+    invalid_rate = None
 
     return BenchMetrics(
         latency_s=float(latency),
@@ -298,35 +402,60 @@ def _format_table(
     return "\n".join(lines)
 
 
+# -------------------------
+# main
+# -------------------------
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data-name",
+        type=str,
+        required=True,
+        help=(
+            "Dataset name, one of: "
+            "gsm8k, math500, aime24, aime25, alpaca, mt-bench, "
+            "humaneval, mbpp, lbpp, swe-bench, livecodebench"
+        ),
+    )
     parser.add_argument(
         "--output-md",
         type=str,
         default=None,
         help="Write a markdown report to this file (disabled by default).",
     )
-    parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
-    parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
+    parser.add_argument(
+        "--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16"
+    )
     parser.add_argument(
         "--skip-baseline",
         action="store_true",
-        help="Skip running the baseline (target-only) sweep; only run DFLASH and report N/A for baseline/speedup.",
+        help=(
+            "Skip running the baseline (target-only) sweep; "
+            "only run DFLASH and report N/A for baseline/speedup."
+        ),
     )
     parser.add_argument(
         "--batch-requests",
         action="store_true",
-        help="Send prompts as server-side batched /generate requests (batch size = concurrency) instead of client-side concurrent requests.",
+        help=(
+            "Send prompts as server-side batched /generate requests "
+            "(batch size = concurrency) instead of client-side concurrent requests."
+        ),
     )
     parser.add_argument(
         "--prompt-style",
         type=str,
-        choices=["fewshot_qa", "chat"],
+        choices=["chat", "plain"],
         default="chat",
-        help="Prompting style: 'chat' matches the DFlash HF demo prompt.",
+        help=(
+            "How to wrap dataset turns into the final prompt: "
+            "'chat' uses tokenizer.apply_chat_template on all turns; "
+            "'plain' uses turns[0] as raw text."
+        ),
     )
-    parser.add_argument("--num-shots", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--mem-fraction-static", type=float, default=0.7)
@@ -346,16 +475,16 @@ def main() -> None:
         help="Comma-separated list of client concurrency levels.",
     )
     parser.add_argument(
-        "--questions-per-concurrency-base",
+        "--samples-per-concurrency-base",
         type=int,
         default=128,
-        help="num_questions = base * concurrency (default matches the sweep plan).",
+        help="num_samples = base * concurrency.",
     )
     parser.add_argument(
-        "--max-questions-per-config",
+        "--max-samples-per-config",
         type=int,
         default=8192,
-        help="Cap num_questions per (tp, concurrency) run (default: 1024).",
+        help="Cap num_samples per (tp, concurrency) run.",
     )
     parser.add_argument(
         "--attention-backends",
@@ -370,7 +499,7 @@ def main() -> None:
 
     visible_gpus = int(torch.cuda.device_count())
     tp_sizes = [int(x) for x in args.tp_sizes.split(",") if x.strip()]
-    tp_sizes = [tp for tp in tp_sizes if tp >= 1 and tp <= visible_gpus]
+    tp_sizes = [tp for tp in tp_sizes if 1 <= tp <= visible_gpus]
     if not tp_sizes:
         raise RuntimeError(
             f"No tp sizes are runnable with visible_gpus={visible_gpus}. "
@@ -382,14 +511,14 @@ def main() -> None:
     if not concurrencies:
         raise RuntimeError("No concurrencies specified.")
 
-    num_questions_by_conc = {
+    num_samples_by_conc = {
         c: min(
-            int(args.questions_per_concurrency_base) * int(c),
-            int(args.max_questions_per_config),
+            int(args.samples_per_concurrency_base) * int(c),
+            int(args.max_samples_per_config),
         )
         for c in concurrencies
     }
-    max_questions = max(num_questions_by_conc.values())
+    max_samples = max(num_samples_by_conc.values())
 
     attention_backends = [
         s.strip() for s in args.attention_backends.split(",") if s.strip()
@@ -402,53 +531,21 @@ def main() -> None:
         attention_backends = [b for b in attention_backends if b != "fa3"]
     attention_backends = attention_backends or ["flashinfer"]
 
-    data_path = _maybe_download_gsm8k(args.data_path)
-    lines = list(read_jsonl(data_path))
+    # Load dataset & tokenizer
+    dataset = load_and_process_dataset(args.data_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
 
-    tokenizer = None
-    if args.prompt_style == "chat":
-        tokenizer = AutoTokenizer.from_pretrained(args.target_model)
-
-    few_shot = (
-        _get_few_shot_examples(lines, int(args.num_shots))
-        if args.prompt_style == "fewshot_qa"
-        else ""
+    prompts = build_prompts_from_turns(
+        dataset,
+        tokenizer=tokenizer,
+        max_samples=max_samples,
+        prompt_style=args.prompt_style,
     )
 
-    prompts: list[str] = []
-    labels: list[int] = []
-    num_lines = len(lines)
-    if num_lines == 0:
-        raise RuntimeError("GSM8K file is empty.")
-    for i in range(max_questions):
-        idx = i % num_lines
-        if args.prompt_style == "fewshot_qa":
-            prompts.append(few_shot + _get_one_example(lines, idx, False))
-        else:
-            assert tokenizer is not None
-            user_content = (
-                lines[idx]["question"]
-                + "\nPlease reason step by step, and put your final answer within \\boxed{}."
-            )
-            prompts.append(
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": user_content}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            )
-        labels.append(_get_answer_value(lines[idx]["answer"]))
-    if not all(l != INVALID for l in labels):
-        raise RuntimeError("Invalid labels in GSM8K data.")
+    # 通用脚本默认没有特殊 stop 标记；如果你有可以按数据集加逻辑
+    default_stop: list[str] = []
 
-    default_stop = (
-        ["Question", "Assistant:", "<|separator|>"]
-        if args.prompt_style == "fewshot_qa"
-        else []
-    )
-
-    # Results indexed by (backend, tp, concurrency) for baseline + dflash.
+    # Results indexed by (backend, tp, concurrency)
     baseline_toks: dict[tuple[str, int, int], Optional[float]] = {}
     dflash_toks: dict[tuple[str, int, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int, int], Optional[float]] = {}
@@ -483,6 +580,7 @@ def main() -> None:
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
 
+            # baseline
             if not args.skip_baseline:
                 print(f"\n=== backend={backend} tp={tp} (baseline) ===")
                 baseline_port = port_base
@@ -494,7 +592,7 @@ def main() -> None:
                     other_args=common_server_args,
                 )
                 try:
-                    # Warm up.
+                    # warm up
                     _send_generate(
                         baseline_url,
                         "Hello",
@@ -504,12 +602,11 @@ def main() -> None:
                     )
 
                     for conc in concurrencies:
-                        n = num_questions_by_conc[conc]
+                        n = num_samples_by_conc[conc]
                         _flush_cache(baseline_url)
-                        metrics = _run_gsm8k_requests(
+                        metrics = _run_requests(
                             baseline_url,
                             prompts=prompts[:n],
-                            labels=labels[:n],
                             max_new_tokens=int(args.max_new_tokens),
                             concurrency=int(conc),
                             batch_requests=bool(args.batch_requests),
@@ -522,8 +619,7 @@ def main() -> None:
                         print(
                             f"[baseline] conc={conc:>2} n={n:<4} "
                             f"toks/s={metrics.output_toks_per_s:,.2f} "
-                            f"latency={metrics.latency_s:.1f}s "
-                            f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f}"
+                            f"latency={metrics.latency_s:.1f}s"
                         )
                 finally:
                     kill_process_tree(baseline_proc.pid)
@@ -532,6 +628,7 @@ def main() -> None:
                     except Exception:
                         pass
 
+            # DFLASH
             print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
             dflash_port = find_available_port(port_base + 1)
             dflash_url = f"http://127.0.0.1:{dflash_port}"
@@ -556,12 +653,11 @@ def main() -> None:
                     timeout_s=min(int(args.timeout_s), 300),
                 )
                 for conc in concurrencies:
-                    n = num_questions_by_conc[conc]
+                    n = num_samples_by_conc[conc]
                     _flush_cache(dflash_url)
-                    metrics = _run_gsm8k_requests(
+                    metrics = _run_requests(
                         dflash_url,
                         prompts=prompts[:n],
-                        labels=labels[:n],
                         max_new_tokens=int(args.max_new_tokens),
                         concurrency=int(conc),
                         batch_requests=bool(args.batch_requests),
@@ -576,8 +672,7 @@ def main() -> None:
                         f"[DFLASH]   conc={conc:>2} n={n:<4} "
                         f"toks/s={metrics.output_toks_per_s:,.2f} "
                         f"latency={metrics.latency_s:.1f}s "
-                        f"acc={metrics.accuracy:.3f} invalid={metrics.invalid_rate:.3f} "
-                        f"accept_len={metrics.spec_accept_length:.3f} "
+                        f"accept_len={metrics.spec_accept_length:.3f if metrics.spec_accept_length is not None else float('nan')} "
                         f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
                     )
             finally:
@@ -589,28 +684,27 @@ def main() -> None:
 
     # Render markdown.
     md_lines: list[str] = []
-    md_lines.append("# DFLASH GSM8K Sweep")
+    md_lines.append(f"# DFLASH {args.data_name} Sweep")
     md_lines.append("")
     md_lines.append("## Settings")
+    md_lines.append(f"- data_name: `{args.data_name}`")
     md_lines.append(f"- target_model: `{args.target_model}`")
     md_lines.append(f"- draft_model: `{args.draft_model}`")
     md_lines.append(f"- prompt_style: `{args.prompt_style}`")
-    if args.prompt_style == "fewshot_qa":
-        md_lines.append(f"- num_shots: `{args.num_shots}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_sizes: `{', '.join(str(x) for x in tp_sizes)}`")
     md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")
     md_lines.append(
-        f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`"
+        f"- samples_per_concurrency: `base={args.samples_per_concurrency_base}`"
     )
     md_lines.append(f"- device_sm: `{device_sm}`")
     md_lines.append(f"- is_blackwell: `{is_blackwell}`")
     md_lines.append(f"- skip_baseline: `{bool(args.skip_baseline)}`")
     md_lines.append("")
     md_lines.append(
-        "Note: DFLASH and baseline greedy outputs may diverge on some prompts due to numerical differences "
-        "(e.g. verify path vs decode path). This sweep focuses on throughput."
+        "Note: This sweep focuses on throughput. Correctness is not evaluated "
+        "for this generic dataset script."
     )
     md_lines.append("")
 
@@ -647,20 +741,6 @@ def main() -> None:
             )
         )
         md_lines.append("")
-        md_lines.append("### Baseline accuracy")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values={
-                    (tp, conc): baseline_acc.get((backend, tp, conc), None)
-                    for tp in tp_sizes
-                    for conc in concurrencies
-                },
-                float_fmt=".3f",
-            )
-        )
-        md_lines.append("")
         md_lines.append("### DFLASH output tok/s")
         md_lines.append(
             _format_table(
@@ -668,20 +748,6 @@ def main() -> None:
                 concurrencies=concurrencies,
                 values=dflash_values,
                 float_fmt=",.2f",
-            )
-        )
-        md_lines.append("")
-        md_lines.append("### DFLASH accuracy")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values={
-                    (tp, conc): dflash_acc.get((backend, tp, conc), None)
-                    for tp in tp_sizes
-                    for conc in concurrencies
-                },
-                float_fmt=".3f",
             )
         )
         md_lines.append("")
@@ -695,7 +761,6 @@ def main() -> None:
             )
         )
         md_lines.append("")
-
         md_lines.append(
             "### DFLASH acceptance length (mean per-request spec_accept_length)"
         )
