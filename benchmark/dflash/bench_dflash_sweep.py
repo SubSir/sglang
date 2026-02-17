@@ -412,12 +412,18 @@ def main() -> None:
     parser.add_argument(
         "--data-name",
         type=str,
-        required=True,
+        default=None,
         help=(
             "Dataset name, one of: "
             "gsm8k, math500, aime24, aime25, alpaca, mt-bench, "
             "humaneval, mbpp, lbpp, swe-bench, livecodebench"
         ),
+    )
+    parser.add_argument(
+        "--data-names",
+        type=str,
+        default=None,
+        help="Comma-separated list of dataset names.",
     )
     parser.add_argument(
         "--output-md",
@@ -483,7 +489,7 @@ def main() -> None:
     parser.add_argument(
         "--max-samples-per-config",
         type=int,
-        default=8192,
+        default=2048,
         help="Cap num_samples per (tp, concurrency) run.",
     )
     parser.add_argument(
@@ -531,26 +537,37 @@ def main() -> None:
         attention_backends = [b for b in attention_backends if b != "fa3"]
     attention_backends = attention_backends or ["flashinfer"]
 
-    # Load dataset & tokenizer
-    dataset = load_and_process_dataset(args.data_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    # Determine data names to sweep
+    if args.data_names:
+        data_names = [s.strip() for s in args.data_names.split(",") if s.strip()]
+    elif args.data_name:
+        data_names = [args.data_name]
+    else:
+        raise ValueError("Either --data-name or --data-names must be provided.")
 
-    prompts = build_prompts_from_turns(
-        dataset,
-        tokenizer=tokenizer,
-        max_samples=max_samples,
-        prompt_style=args.prompt_style,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    
+    # Pre-load all datasets and prompts
+    dataset_prompts = {}
+    for dname in data_names:
+        print(f"Loading dataset: {dname}")
+        ds = load_and_process_dataset(dname)
+        dataset_prompts[dname] = build_prompts_from_turns(
+            ds,
+            tokenizer=tokenizer,
+            max_samples=max_samples,
+            prompt_style=args.prompt_style,
+        )
 
     # 通用脚本默认没有特殊 stop 标记；如果你有可以按数据集加逻辑
     default_stop: list[str] = []
 
-    # Results indexed by (backend, tp, concurrency)
-    baseline_toks: dict[tuple[str, int, int], Optional[float]] = {}
-    dflash_toks: dict[tuple[str, int, int], Optional[float]] = {}
-    dflash_accept_len: dict[tuple[str, int, int], Optional[float]] = {}
-    baseline_acc: dict[tuple[str, int, int], Optional[float]] = {}
-    dflash_acc: dict[tuple[str, int, int], Optional[float]] = {}
+    # Results indexed by (backend, tp, data_name, concurrency)
+    baseline_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
+    dflash_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
+    dflash_accept_len: dict[tuple[str, int, str, int], Optional[float]] = {}
+    baseline_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
+    dflash_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
 
     for backend in attention_backends:
         for tp in tp_sizes:
@@ -601,26 +618,29 @@ def main() -> None:
                         timeout_s=min(int(args.timeout_s), 300),
                     )
 
-                    for conc in concurrencies:
-                        n = num_samples_by_conc[conc]
-                        _flush_cache(baseline_url)
-                        metrics = _run_requests(
-                            baseline_url,
-                            prompts=prompts[:n],
-                            max_new_tokens=int(args.max_new_tokens),
-                            concurrency=int(conc),
-                            batch_requests=bool(args.batch_requests),
-                            stop=default_stop,
-                            timeout_s=int(args.timeout_s),
-                            expect_dflash=False,
-                        )
-                        baseline_toks[(backend, tp, conc)] = metrics.output_toks_per_s
-                        baseline_acc[(backend, tp, conc)] = metrics.accuracy
-                        print(
-                            f"[baseline] conc={conc:>2} n={n:<4} "
-                            f"toks/s={metrics.output_toks_per_s:,.2f} "
-                            f"latency={metrics.latency_s:.1f}s"
-                        )
+                    for dname in data_names:
+                        print(f"--- Dataset: {dname} (baseline) ---")
+                        prompts = dataset_prompts[dname]
+                        for conc in concurrencies:
+                            n = num_samples_by_conc[conc]
+                            _flush_cache(baseline_url)
+                            metrics = _run_requests(
+                                baseline_url,
+                                prompts=prompts[:n],
+                                max_new_tokens=int(args.max_new_tokens),
+                                concurrency=int(conc),
+                                batch_requests=bool(args.batch_requests),
+                                stop=default_stop,
+                                timeout_s=int(args.timeout_s),
+                                expect_dflash=False,
+                            )
+                            baseline_toks[(backend, tp, dname, conc)] = metrics.output_toks_per_s
+                            baseline_acc[(backend, tp, dname, conc)] = metrics.accuracy
+                            print(
+                                f"[{dname} baseline] conc={conc:>2} n={n:<4} "
+                                f"toks/s={metrics.output_toks_per_s:,.2f} "
+                                f"latency={metrics.latency_s:.1f}s"
+                            )
                 finally:
                     kill_process_tree(baseline_proc.pid)
                     try:
@@ -652,29 +672,32 @@ def main() -> None:
                     stop=[],
                     timeout_s=min(int(args.timeout_s), 300),
                 )
-                for conc in concurrencies:
-                    n = num_samples_by_conc[conc]
-                    _flush_cache(dflash_url)
-                    metrics = _run_requests(
-                        dflash_url,
-                        prompts=prompts[:n],
-                        max_new_tokens=int(args.max_new_tokens),
-                        concurrency=int(conc),
-                        batch_requests=bool(args.batch_requests),
-                        stop=default_stop,
-                        timeout_s=int(args.timeout_s),
-                        expect_dflash=True,
-                    )
-                    dflash_toks[(backend, tp, conc)] = metrics.output_toks_per_s
-                    dflash_accept_len[(backend, tp, conc)] = metrics.spec_accept_length
-                    dflash_acc[(backend, tp, conc)] = metrics.accuracy
-                    print(
-                        f"[DFLASH]   conc={conc:>2} n={n:<4} "
-                        f"toks/s={metrics.output_toks_per_s:,.2f} "
-                        f"latency={metrics.latency_s:.1f}s "
-                        f"accept_len={metrics.spec_accept_length:.3f if metrics.spec_accept_length is not None else float('nan')} "
-                        f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
-                    )
+                for dname in data_names:
+                    print(f"--- Dataset: {dname} (DFLASH) ---")
+                    prompts = dataset_prompts[dname]
+                    for conc in concurrencies:
+                        n = num_samples_by_conc[conc]
+                        _flush_cache(dflash_url)
+                        metrics = _run_requests(
+                            dflash_url,
+                            prompts=prompts[:n],
+                            max_new_tokens=int(args.max_new_tokens),
+                            concurrency=int(conc),
+                            batch_requests=bool(args.batch_requests),
+                            stop=default_stop,
+                            timeout_s=int(args.timeout_s),
+                            expect_dflash=True,
+                        )
+                        dflash_toks[(backend, tp, dname, conc)] = metrics.output_toks_per_s
+                        dflash_accept_len[(backend, tp, dname, conc)] = metrics.spec_accept_length
+                        dflash_acc[(backend, tp, dname, conc)] = metrics.accuracy
+                        print(
+                            f"[{dname} DFLASH]   conc={conc:>2} n={n:<4} "
+                            f"toks/s={metrics.output_toks_per_s:,.2f} "
+                            f"latency={metrics.latency_s:.1f}s "
+                            f"accept_len={metrics.spec_accept_length if metrics.spec_accept_length is not None else float('nan'):.3f} "
+                            f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
+                        )
             finally:
                 kill_process_tree(dflash_proc.pid)
                 try:
@@ -684,10 +707,11 @@ def main() -> None:
 
     # Render markdown.
     md_lines: list[str] = []
-    md_lines.append(f"# DFLASH {args.data_name} Sweep")
+    data_names_str = ", ".join(data_names)
+    md_lines.append(f"# DFLASH Sweep: {data_names_str}")
     md_lines.append("")
     md_lines.append("## Settings")
-    md_lines.append(f"- data_name: `{args.data_name}`")
+    md_lines.append(f"- data_names: `{data_names_str}`")
     md_lines.append(f"- target_model: `{args.target_model}`")
     md_lines.append(f"- draft_model: `{args.draft_model}`")
     md_lines.append(f"- prompt_style: `{args.prompt_style}`")
@@ -708,48 +732,78 @@ def main() -> None:
     )
     md_lines.append("")
 
-    for backend in attention_backends:
-        md_lines.append(f"## Backend: `{backend}`")
-        md_lines.append("")
+    for dname in data_names:
+        md_lines.append(f"# Results for Dataset: `{dname}`")
+        for backend in attention_backends:
+            md_lines.append(f"## Backend: `{backend}`")
+            md_lines.append("")
 
-        baseline_values = {
-            (tp, conc): baseline_toks.get((backend, tp, conc), None)
-            for tp in tp_sizes
-            for conc in concurrencies
-        }
-        dflash_values = {
-            (tp, conc): dflash_toks.get((backend, tp, conc), None)
-            for tp in tp_sizes
-            for conc in concurrencies
-        }
-        speedup_values: dict[tuple[int, int], Optional[float]] = {}
-        for tp in tp_sizes:
-            for conc in concurrencies:
-                b = baseline_values.get((tp, conc), None)
-                d = dflash_values.get((tp, conc), None)
-                speedup_values[(tp, conc)] = (
-                    None if (b is None or d is None or b <= 0) else (d / b)
+            baseline_values = {
+                (tp, conc): baseline_toks.get((backend, tp, dname, conc), None)
+                for tp in tp_sizes
+                for conc in concurrencies
+            }
+            dflash_values = {
+                (tp, conc): dflash_toks.get((backend, tp, dname, conc), None)
+                for tp in tp_sizes
+                for conc in concurrencies
+            }
+            speedup_values: dict[tuple[int, int], Optional[float]] = {}
+            for tp in tp_sizes:
+                for conc in concurrencies:
+                    b = baseline_values.get((tp, conc), None)
+                    d = dflash_values.get((tp, conc), None)
+                    speedup_values[(tp, conc)] = (
+                        None if (b is None or d is None or b <= 0) else (d / b)
+                    )
+
+            md_lines.append("### Baseline output tok/s")
+            md_lines.append(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values=baseline_values,
+                    float_fmt=",.2f",
                 )
-
-        md_lines.append("### Baseline output tok/s")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values=baseline_values,
-                float_fmt=",.2f",
             )
-        )
-        md_lines.append("")
-        md_lines.append("### DFLASH output tok/s")
-        md_lines.append(
-            _format_table(
-                tp_sizes=tp_sizes,
-                concurrencies=concurrencies,
-                values=dflash_values,
-                float_fmt=",.2f",
+            md_lines.append("")
+            md_lines.append("### DFLASH output tok/s")
+            md_lines.append(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values=dflash_values,
+                    float_fmt=",.2f",
+                )
             )
-        )
+            md_lines.append("")
+            md_lines.append("### Speedup (DFLASH / baseline)")
+            md_lines.append(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values=speedup_values,
+                    float_fmt=".3f",
+                )
+            )
+            md_lines.append("")
+            md_lines.append(
+                "### DFLASH acceptance length (mean per-request spec_accept_length)"
+            )
+            md_lines.append(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values={
+                        (tp, conc): dflash_accept_len.get((backend, tp, dname, conc), None)
+                        for tp in tp_sizes
+                        for conc in concurrencies
+                    },
+                    float_fmt=".3f",
+                )
+            )
+            md_lines.append("")
+        md_lines.append("---")
         md_lines.append("")
         md_lines.append("### Speedup (DFLASH / baseline)")
         md_lines.append(
