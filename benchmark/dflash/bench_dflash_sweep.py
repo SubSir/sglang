@@ -285,6 +285,7 @@ class BenchMetrics:
     invalid_rate: Optional[float]
     spec_accept_length: Optional[float]
     spec_verify_ct_sum: int
+    spec_verify_tokens_sum: int
 
 
 def _run_requests(
@@ -301,6 +302,7 @@ def _run_requests(
     start = time.perf_counter()
     total_tokens = 0
     spec_verify_ct_sum = 0
+    spec_verify_tokens_sum = 0
     spec_accept_lengths: list[float] = []
 
     if batch_requests:
@@ -324,6 +326,7 @@ def _run_requests(
                 meta = out.get("meta_info", {}) or {}
                 total_tokens += int(meta.get("completion_tokens", 0))
                 spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+                spec_verify_tokens_sum += int(meta.get("spec_verify_tokens", 0))
                 if "spec_accept_length" in meta:
                     try:
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
@@ -347,6 +350,7 @@ def _run_requests(
                 meta = out.get("meta_info", {}) or {}
                 total_tokens += int(meta.get("completion_tokens", 0))
                 spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+                spec_verify_tokens_sum += int(meta.get("spec_verify_tokens", 0))
                 if "spec_accept_length" in meta:
                     try:
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
@@ -378,6 +382,7 @@ def _run_requests(
         invalid_rate=invalid_rate,
         spec_accept_length=spec_accept_length,
         spec_verify_ct_sum=int(spec_verify_ct_sum),
+        spec_verify_tokens_sum=int(spec_verify_tokens_sum),
     )
 
 
@@ -566,6 +571,7 @@ def main() -> None:
     baseline_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int, str, int], Optional[float]] = {}
+    dflash_verify_tokens: dict[tuple[str, int, str, int], Optional[int]] = {}
     baseline_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
 
@@ -690,6 +696,7 @@ def main() -> None:
                         )
                         dflash_toks[(backend, tp, dname, conc)] = metrics.output_toks_per_s
                         dflash_accept_len[(backend, tp, dname, conc)] = metrics.spec_accept_length
+                        dflash_verify_tokens[(backend, tp, dname, conc)] = metrics.spec_verify_tokens_sum
                         dflash_acc[(backend, tp, dname, conc)] = metrics.accuracy
                         print(
                             f"[{dname} DFLASH]   conc={conc:>2} n={n:<4} "
@@ -823,11 +830,26 @@ def main() -> None:
                 tp_sizes=tp_sizes,
                 concurrencies=concurrencies,
                 values={
-                    (tp, conc): dflash_accept_len.get((backend, tp, conc), None)
+                    (tp, conc): dflash_accept_len.get((backend, tp, dname, conc), None)
                     for tp in tp_sizes
                     for conc in concurrencies
                 },
                 float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH total verified tokens")
+        md_lines.append(
+            _format_table(
+                tp_sizes=tp_sizes,
+                concurrencies=concurrencies,
+                values={
+                    (tp, conc): dflash_verify_tokens.get((backend, tp, dname, conc), None)
+                    for tp in tp_sizes
+                    for conc in concurrencies
+                },
+                float_fmt="d",
             )
         )
         md_lines.append("")

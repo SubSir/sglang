@@ -1790,6 +1790,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                if hasattr(recv_obj, "spec_verify_tokens"):
+                    meta_info["spec_verify_tokens"] = recv_obj.spec_verify_tokens[i]
 
     def _calculate_timing_metrics(
         self,
