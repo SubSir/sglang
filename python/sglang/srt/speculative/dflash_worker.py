@@ -1,7 +1,7 @@
 import logging
 import os
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -47,13 +47,13 @@ def _predict_acc_len_from_nll(token_nll: torch.Tensor, thresholds: torch.Tensor)
 
     Args:
         token_nll: [bs, num_pos]
-        thresholds: [num_pos]
+        thresholds: [bs, num_pos]
 
     Returns:
         acc_pred: [bs] int64 in [0, num_pos]
     """
 
-    gt = token_nll > thresholds.unsqueeze(0)
+    gt = token_nll > thresholds
     any_gt = gt.any(dim=1)
     first_idx = gt.to(torch.int64).argmax(dim=1)
     return torch.where(any_gt, first_idx, torch.full_like(first_idx, token_nll.shape[1]))
@@ -479,10 +479,20 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+        if self._k_online_enabled and int(self.block_size) > 1:
+            draft_next_flat, draft_nll_flat = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+                return_nll=True,
+            )
+            draft_next = draft_next_flat.view(bs, self.block_size - 1)
+            draft_token_nll = draft_nll_flat.view(bs, self.block_size - 1)
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+            draft_token_nll = None
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -497,8 +507,6 @@ class DFlashWorker:
             num_pos = int(self.block_size) - 1
             
             # --- 3a) Aggregated statistics from batch.reqs for vectorized prediction
-            # sum_by_acc_batch: [bs, num_pos + 1, num_pos]
-            # count_by_acc_batch: [bs, num_pos + 1]
             sum_by_acc_batch = torch.zeros((bs, num_pos + 1, num_pos), device=self.device, dtype=torch.float32)
             count_by_acc_batch = torch.zeros((bs, num_pos + 1), device=self.device, dtype=torch.int64)
             warmup_mask = torch.zeros((bs,), device=self.device, dtype=torch.bool)
@@ -515,74 +523,23 @@ class DFlashWorker:
                     warmup_mask[i] = True
 
             # --- 3b) Build thresholds per request
-            # thresholds_batch: [bs, num_pos]
             thresholds_batch = torch.full((bs, num_pos), float("inf"), device=self.device, dtype=torch.float32)
             acc_idx = torch.arange(num_pos, device=self.device, dtype=torch.long)
-            
-            # Gather relevant counts: [bs, num_pos]
-            c = count_by_acc_batch.index_select(1, acc_idx) # [bs, num_pos]
-            has = c > 0 # [bs, num_pos]
-            
+            c = count_by_acc_batch.index_select(1, acc_idx)
+            has = c > 0
             if bool(has.any().item()):
-                # mean_vec: [bs, num_pos, num_pos]
-                # We only need the diagonal for each request: sum_by_acc[i, acc_idx, acc_idx]
-                # sum_by_acc_batch index_select on dim 1 (acc_idx): [bs, num_pos, num_pos]
-                s_diag = sum_by_acc_batch.index_select(1, acc_idx) # [bs, num_pos, num_pos]
-                # Extract diagonal for each request: [bs, num_pos]
-                # torch.diagonal doesn't support batching in the way we need here directly for dim 1,2
-                # s_diag[:, acc_idx, acc_idx]
-                diag_vals = s_diag[:, acc_idx, acc_idx] # [bs, num_pos]
-                
+                s_diag = sum_by_acc_batch.index_select(1, acc_idx)
+                diag_vals = s_diag[:, acc_idx, acc_idx]
                 thresholds_batch = torch.where(has, diag_vals / c.clamp_min(1.0).to(torch.float32), thresholds_batch)
 
-            # --- 3c) Compute draft NLL
-            hidden_for_logits = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-            local_logits = lm_head(hidden_for_logits)
-            local_vocab = local_logits.shape[-1]
-            local_logprobs = F.log_softmax(local_logits, dim=-1)
-
-            proposed = draft_next.reshape(-1).to(torch.int64)
-            shard = lm_head.shard_indices
-            org_vocab_start = int(shard.org_vocab_start_index)
-            added_vocab_start = int(shard.added_vocab_start_index)
-            num_org = int(shard.num_org_elements)
-            num_org_padded = int(shard.num_org_elements_padded)
-            num_added = int(shard.num_added_elements)
-            # Map global token ids to local indices in this TP shard; -1 means not in shard.
-            local_idx = torch.full_like(proposed, -1)
-            is_org = (proposed >= org_vocab_start) & (proposed < org_vocab_start + num_org)
-            local_idx[is_org] = proposed[is_org] - org_vocab_start
-            if num_added > 0:
-                is_added = (proposed >= added_vocab_start) & (
-                    proposed < added_vocab_start + num_added
-                )
-                local_idx[is_added] = (
-                    proposed[is_added] - added_vocab_start + num_org_padded
-                )
-
-            token_logp_local = torch.full(
-                (proposed.numel(),), float("-inf"), device=self.device, dtype=local_logprobs.dtype
-            )
-            in_shard = local_idx >= 0
-            if bool(in_shard.any().item()):
-                rows = torch.arange(proposed.numel(), device=self.device, dtype=torch.int64)[
-                    in_shard
-                ]
-                cols = local_idx[in_shard].to(torch.int64).clamp(0, local_vocab - 1)
-                token_logp_local[in_shard] = local_logprobs[rows, cols]
-
-            # All-reduce logp across TP ranks to get the correct logp for each token.
-            tp_group = get_tp_group()
-            _safe_all_reduce_max_(tp_group, token_logp_local)
-
-            token_nll = (-token_logp_local).view(bs, num_pos).to(torch.float32)
+            # --- 3c) Use draft token NLL computed during draft greedy sampling.
+            if draft_token_nll is None:
+                raise RuntimeError("DFLASH k-online expected draft_token_nll, but got None.")
+            token_nll = draft_token_nll.to(torch.float32)
 
             # --- 3d) Vectorized prediction per request
             acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(torch.int64)
-            k = torch.minimum(
-                acc_pred + int(self._k_online_offset),
-                torch.full_like(acc_pred, num_pos),
-            )
+            k = torch.minimum(acc_pred + int(self._k_online_offset), torch.full_like(acc_pred, num_pos))
             verify_len_per_req = torch.where(warmup_mask, torch.full_like(k, int(self.block_size)), k + 1)
 
             max_verify_len = int(verify_len_per_req.max().item())
@@ -628,16 +585,21 @@ class DFlashWorker:
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_nll: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+        
+        If return_nll is True, it also returns the Negative Log-Likelihood (NLL)
+        of the selected tokens in a TP-safe way.
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            token_ids = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            return (token_ids, torch.empty((0,), dtype=torch.float32, device=hidden_states.device)) if return_nll else token_ids
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
@@ -651,9 +613,6 @@ class DFlashWorker:
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
 
-        # Valid ranges in the local shard (excluding padding):
-        #   base vocab:  [0, num_org)
-        #   added vocab: [num_org_padded, num_org_padded + num_added)
         num_org = int(shard.num_org_elements)
         num_org_padded = int(shard.num_org_elements_padded)
         num_added = int(shard.num_added_elements)
@@ -664,25 +623,29 @@ class DFlashWorker:
         out_token_ids = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
+        out_nlls = torch.empty((num_tokens,), dtype=torch.float32, device=hidden_states.device) if return_nll else None
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
-        # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
-                    )
+                    local_max, local_arg = torch.max(base_logits, dim=-1)
+                    out_token_ids[start:end] = local_arg.to(torch.long) + org_vocab_start
+                    if return_nll:
+                        # logp = logit - logsumexp(logits)
+                        logsumexp_val = torch.logsumexp(base_logits, dim=-1)
+                        out_nlls[start:end] = -(local_max.to(torch.float32) - logsumexp_val.to(torch.float32))
                 else:
                     out_token_ids[start:end] = 0
-            return out_token_ids
+                    if return_nll:
+                        out_nlls[start:end] = 0.0
+            return (out_token_ids, out_nlls) if return_nll else out_token_ids
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -693,108 +656,63 @@ class DFlashWorker:
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
                 local_max, local_arg = torch.max(base_logits, dim=-1)
+                local_lse = torch.logsumexp(base_logits, dim=-1) if return_nll else None
             else:
-                local_max = torch.full(
-                    (chunk_len,),
-                    torch.finfo(weight_dtype).min,
-                    dtype=weight_dtype,
-                    device=hs.device,
-                )
-                local_arg = torch.zeros(
-                    (chunk_len,), dtype=torch.int64, device=hs.device
-                )
+                local_max = torch.full((chunk_len,), torch.finfo(weight_dtype).min, dtype=weight_dtype, device=hs.device)
+                local_arg = torch.zeros((chunk_len,), dtype=torch.int64, device=hs.device)
+                local_lse = torch.full((chunk_len,), float("-inf"), dtype=torch.float32, device=hs.device) if return_nll else None
 
-            # Added vocab logits (e.g., LoRA-added embeddings), if present.
+            # Added vocab logits.
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
-                )
+                added_logits = torch.matmul(hs, weight[added_slice_start:added_slice_end].T)
                 added_max, added_arg = torch.max(added_logits, dim=-1)
+                
+                if return_nll:
+                    added_lse = torch.logsumexp(added_logits, dim=-1)
+                    local_lse = torch.log(torch.exp(local_lse) + torch.exp(added_lse))
+
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
-                # For base/added conversion below, keep local_arg expressed in the full local
-                # weight index space (base + padding + added), matching `lm_head.weight`.
-                local_arg = torch.where(
-                    use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
-                )
+                local_arg = torch.where(use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg)
 
             # Convert local argmax indices to global token ids.
             if num_added == 0:
-                local_arg.add_(org_vocab_start)
-                global_ids = local_arg
+                global_ids = local_arg + org_vocab_start
             else:
-                global_ids = torch.empty(
-                    (chunk_len,), dtype=torch.int64, device=hs.device
-                )
+                global_ids = torch.empty((chunk_len,), dtype=torch.int64, device=hs.device)
                 is_base = local_arg < num_org
                 global_ids[is_base] = org_vocab_start + local_arg[is_base]
-                global_ids[~is_base] = added_vocab_start + (
-                    local_arg[~is_base] - num_org_padded
-                )
+                global_ids[~is_base] = added_vocab_start + (local_arg[~is_base] - num_org_padded)
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                if return_nll:
+                    out_nlls[start:end] = -(local_max.to(torch.float32) - local_lse)
                 continue
 
-            # Gather per-rank maxima and associated global ids, then select the global max.
+            # Gather per-rank candidates and LSE.
             needed = tp_size * chunk_len
-            chunk_cap = int(chunk_size)
-            if (
-                self._draft_greedy_gather_cap < needed
-                or self._draft_greedy_gathered_max_buf is None
-                or self._draft_greedy_gathered_ids_buf is None
-                or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
-                or self._draft_greedy_gathered_max_buf.device != hs.device
-            ):
-                # Allocate enough space for the max chunk size to avoid reallocations.
-                cap = tp_size * chunk_cap
-                self._draft_greedy_gathered_max_buf = torch.empty(
-                    (cap,), dtype=local_max.dtype, device=hs.device
-                )
-                self._draft_greedy_gathered_ids_buf = torch.empty(
-                    (cap,), dtype=global_ids.dtype, device=hs.device
-                )
-                self._draft_greedy_gather_cap = cap
-
-            if (
-                self._draft_greedy_index_cap < chunk_len
-                or self._draft_greedy_best_rank_buf is None
-                or self._draft_greedy_rank_index_buf is None
-                or self._draft_greedy_selected_ids_buf is None
-                or self._draft_greedy_best_rank_buf.device != hs.device
-                or self._draft_greedy_selected_ids_buf.device != hs.device
-            ):
-                self._draft_greedy_best_rank_buf = torch.empty(
-                    (chunk_cap,), dtype=torch.int64, device=hs.device
-                )
-                self._draft_greedy_rank_index_buf = torch.empty(
-                    (1, chunk_cap), dtype=torch.int64, device=hs.device
-                )
-                self._draft_greedy_selected_ids_buf = torch.empty(
-                    (1, chunk_cap), dtype=torch.int64, device=hs.device
-                )
-                self._draft_greedy_index_cap = chunk_cap
-
-            gathered_max = self._draft_greedy_gathered_max_buf[:needed]
-            gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
-
+            gathered_max = torch.empty((tp_size, chunk_len), dtype=local_max.dtype, device=hs.device)
+            gathered_ids = torch.empty((tp_size, chunk_len), dtype=global_ids.dtype, device=hs.device)
+            
             tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
             tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
-            gathered_max = gathered_max.view(tp_size, chunk_len)
-            gathered_ids = gathered_ids.view(tp_size, chunk_len)
 
-            best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
-            torch.argmax(gathered_max, dim=0, out=best_rank)
+            best_rank = torch.argmax(gathered_max, dim=0)
+            global_max_val = torch.gather(gathered_max, 0, best_rank.unsqueeze(0)).squeeze(0)
+            selected_ids = torch.gather(gathered_ids, 0, best_rank.unsqueeze(0)).squeeze(0)
+            out_token_ids[start:end] = selected_ids
 
-            rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
-            rank_index[0].copy_(best_rank)
-            selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
-            torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
-            out_token_ids[start:end].copy_(selected_ids.view(-1))
+            if return_nll:
+                gathered_lse = torch.empty((tp_size, chunk_len), dtype=torch.float32, device=hs.device)
+                tp_group.all_gather_into_tensor(gathered_lse, local_lse.to(torch.float32).contiguous())
+                # Global LSE = log(sum(exp(sharded_lse)))
+                global_lse = torch.logsumexp(gathered_lse, dim=0)
+                out_nlls[start:end] = -(global_max_val.to(torch.float32) - global_lse)
 
-        return out_token_ids
+        return (out_token_ids, out_nlls) if return_nll else out_token_ids
 
     def _append_target_hidden_to_draft_kv(
         self,
