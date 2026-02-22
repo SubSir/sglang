@@ -117,6 +117,9 @@ class SpeculativeDecodingMetricsMixin:
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
 
+    # Verify tokens: Number of tokens verified by the target model during speculative decoding
+    spec_verify_tokens: List[int]
+
 
 @dataclass
 class APIServingTimingMixin:

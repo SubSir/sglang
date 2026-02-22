@@ -398,6 +398,7 @@ class DFlashVerifyInput(SpecInput):
 
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            req.spec_verify_tokens += int(self.draft_token_num)
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
 
@@ -439,6 +440,20 @@ class DFlashVerifyInput(SpecInput):
         )
         # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
         batch.seq_lens_sum += sum(commit_lens_cpu)
+
+        # --- Update K-online statistics (optional).
+        # The worker may stash per-block draft token NLL on the verify input.
+        if hasattr(self, "_k_online_token_nll") and self._k_online_token_nll is not None:
+            token_nll = self._k_online_token_nll  # [bs, num_pos]
+            num_pos = int(token_nll.shape[1])
+            k_online_sum_by_acc = getattr(batch, "_dflash_k_online_sum_by_acc", None)
+            k_online_count_by_acc = getattr(batch, "_dflash_k_online_count_by_acc", None)
+            if k_online_sum_by_acc is not None and k_online_count_by_acc is not None:
+                for i, acc_true in enumerate(accept_length_per_req_cpu):
+                    acc_true_idx = min(int(acc_true), int(num_pos))
+                    k_online_sum_by_acc[acc_true_idx, :] += token_nll[i]
+                    k_online_count_by_acc[acc_true_idx] += 1
+            self._k_online_token_nll = None
 
         # Build next-step context features from the committed verify-input tokens.
         hidden = logits_output.hidden_states

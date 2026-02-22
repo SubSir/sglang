@@ -734,6 +734,11 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # The total number of tokens verified by the target model for this request.
+        # For spec-v2, this should be close to `spec_verify_ct * speculative_num_draft_tokens`.
+        # For DFLASH with k-online, this may be smaller because we can verify fewer tokens per step.
+        self.spec_verify_tokens = 0
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None

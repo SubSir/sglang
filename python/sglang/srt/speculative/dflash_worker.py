@@ -1,8 +1,10 @@
 import logging
+import os
 from copy import deepcopy
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -22,7 +24,65 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
+
+def _safe_all_reduce_max_(tp_group, x: torch.Tensor) -> torch.Tensor:
+    # Some TP group wrappers expose .all_reduce, but op enums may differ; try best-effort.
+    try:
+        import torch.distributed as _dist
+
+        tp_group.all_reduce(x, op=_dist.ReduceOp.MAX)
+        return x
+    except Exception:
+        try:
+            tp_group.all_reduce(x)
+            return x
+        except Exception:
+            return x
+
 logger = logging.getLogger(__name__)
+
+
+def _predict_acc_len_from_nll(token_nll: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
+    """Vectorized version of k_online._predict_acc_len_from_nll.
+
+    Args:
+        token_nll: [bs, num_pos]
+        thresholds: [num_pos]
+
+    Returns:
+        acc_pred: [bs] int64 in [0, num_pos]
+    """
+
+    gt = token_nll > thresholds.unsqueeze(0)
+    any_gt = gt.any(dim=1)
+    first_idx = gt.to(torch.int64).argmax(dim=1)
+    return torch.where(any_gt, first_idx, torch.full_like(first_idx, token_nll.shape[1]))
+
+
+def _build_thresholds_from_running(
+    num_pos: int,
+    sum_by_acc: torch.Tensor,
+    count_by_acc: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Mirror k_online._build_thresholds_from_running.
+
+    Args:
+        sum_by_acc: [num_pos + 1, num_pos]
+        count_by_acc: [num_pos + 1]
+
+    Returns:
+        thresholds: [num_pos] (float32)
+    """
+
+    thresholds = torch.full((num_pos,), float("inf"), device=device, dtype=torch.float32)
+    acc_idx = torch.arange(num_pos, device=device, dtype=torch.long)
+    c = count_by_acc.index_select(0, acc_idx).to(torch.float32)
+    has = c > 0
+    if bool(has.any().item()):
+        mean_vec = sum_by_acc.index_select(0, acc_idx).to(torch.float32) / c.clamp_min(1.0).unsqueeze(1)
+        thresholds = torch.where(has, mean_vec[acc_idx, acc_idx], thresholds)
+    return thresholds
 
 
 class DFlashWorker:
@@ -169,6 +229,15 @@ class DFlashWorker:
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
 
+        # --- K-online verify length prediction (batch-max verify for simplicity).
+        # Enable via env var to keep backwards compatibility.
+        self._k_online_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0")))
+        self._k_online_offset: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_OFFSET", "2"))
+        self._k_online_warmup_steps: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_WARMUP", "0"))
+        self._k_online_global_step: int = 0
+        self._k_online_sum_by_acc: Optional[torch.Tensor] = None
+        self._k_online_count_by_acc: Optional[torch.Tensor] = None
+
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
             0
@@ -312,7 +381,6 @@ class DFlashWorker:
                 self._warned_forced_greedy = True
 
         bs = batch.batch_size()
-        device = self.model_runner.device
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -423,10 +491,101 @@ class DFlashWorker:
         draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
+        # --- 3) (Optional) K-online predict verify length.
+        # We still build a single verify batch with max_verify_len for cuda-graph friendliness.
+        verify_len_per_req = None
+        max_verify_len = int(self.block_size)
+
+        if self._k_online_enabled and int(self.block_size) > 1:
+            num_pos = int(self.block_size) - 1
+            if (
+                self._k_online_sum_by_acc is None
+                or self._k_online_count_by_acc is None
+                or int(self._k_online_sum_by_acc.shape[1]) != int(num_pos)
+            ):
+                self._k_online_sum_by_acc = torch.zeros(
+                    (num_pos + 1, num_pos), device=self.device, dtype=torch.float32
+                )
+                self._k_online_count_by_acc = torch.zeros(
+                    (num_pos + 1,), device=self.device, dtype=torch.int64
+                )
+                self._k_online_global_step = 0
+
+            thresholds = _build_thresholds_from_running(
+                num_pos=num_pos,
+                sum_by_acc=self._k_online_sum_by_acc,
+                count_by_acc=self._k_online_count_by_acc,
+                device=self.device,
+            )
+
+            # Compute draft NLL for the proposed tokens in this block.
+            # draft_hidden: [bs, block, hidden] -> logits over vocab shard.
+            hidden_for_logits = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+            local_logits = lm_head(hidden_for_logits)
+            local_vocab = local_logits.shape[-1]
+            local_logprobs = F.log_softmax(local_logits, dim=-1)
+
+            proposed = draft_next.reshape(-1).to(torch.int64)
+            shard = lm_head.shard_indices
+            org_vocab_start = int(shard.org_vocab_start_index)
+            added_vocab_start = int(shard.added_vocab_start_index)
+            num_org = int(shard.num_org_elements)
+            num_org_padded = int(shard.num_org_elements_padded)
+            num_added = int(shard.num_added_elements)
+            # Map global token ids to local indices in this TP shard; -1 means not in shard.
+            local_idx = torch.full_like(proposed, -1)
+            is_org = (proposed >= org_vocab_start) & (proposed < org_vocab_start + num_org)
+            local_idx[is_org] = proposed[is_org] - org_vocab_start
+            if num_added > 0:
+                is_added = (proposed >= added_vocab_start) & (
+                    proposed < added_vocab_start + num_added
+                )
+                local_idx[is_added] = (
+                    proposed[is_added] - added_vocab_start + num_org_padded
+                )
+
+            token_logp_local = torch.full(
+                (proposed.numel(),), float("-inf"), device=self.device, dtype=local_logprobs.dtype
+            )
+            in_shard = local_idx >= 0
+            if bool(in_shard.any().item()):
+                rows = torch.arange(proposed.numel(), device=self.device, dtype=torch.int64)[
+                    in_shard
+                ]
+                cols = local_idx[in_shard].to(torch.int64).clamp(0, local_vocab - 1)
+                token_logp_local[in_shard] = local_logprobs[rows, cols]
+
+            # All-reduce logp across TP ranks to get the correct logp for each token.
+            tp_group = get_tp_group()
+            _safe_all_reduce_max_(tp_group, token_logp_local)
+
+            token_nll = (-token_logp_local).view(bs, num_pos).to(torch.float32)
+
+            if int(self._k_online_global_step) < int(self._k_online_warmup_steps):
+                verify_len_per_req = torch.full(
+                    (bs,), int(self.block_size), device=self.device, dtype=torch.int64
+                )
+            else:
+                acc_pred = _predict_acc_len_from_nll(token_nll, thresholds).to(torch.int64)
+                k = torch.minimum(
+                    acc_pred + int(self._k_online_offset),
+                    torch.full_like(acc_pred, num_pos),
+                )
+                verify_len_per_req = k + 1
+
+            max_verify_len = int(verify_len_per_req.max().item())
+            max_verify_len = max(1, min(max_verify_len, int(self.block_size)))
+
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=draft_tokens[:, :max_verify_len].reshape(-1),
+            positions=positions_2d[:, :max_verify_len].reshape(-1),
+            draft_token_num=int(max_verify_len),
+        )
+
+        # Stash per-req predictions on the verify input for the verify stage to update stats.
+        verify_input._k_online_verify_len_per_req = verify_len_per_req
+        verify_input._k_online_token_nll = (
+            token_nll.detach() if (self._k_online_enabled and int(self.block_size) > 1) else None
         )
         backend_name = type(self.model_runner.attn_backend).__name__
         skip_custom_mask = backend_name in {
@@ -847,6 +1006,13 @@ class DFlashWorker:
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+
+        # --- Update K-online global step.
+        if self._k_online_enabled:
+            self._k_online_global_step += 1
+            # We also update the step in the batch if needed for consistency, 
+            # though the worker's instance state is the source of truth for the session.
+            setattr(batch, "_dflash_k_online_global_step", self._k_online_global_step)
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:

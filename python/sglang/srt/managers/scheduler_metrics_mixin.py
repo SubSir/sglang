@@ -60,9 +60,12 @@ class SchedulerMetricsMixin:
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        # The number of target-verified tokens for the recent `decode_log_interval` batches (for logging)
+        self.spec_num_verify_tokens = 0
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+        self.spec_total_num_verify_tokens = 0
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -118,9 +121,10 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int, num_verify_tokens: int = 0):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
+        self.spec_num_verify_tokens += num_verify_tokens
         self.num_generated_tokens += num_accepted_tokens
 
     def reset_metrics(self: Scheduler):
@@ -128,8 +132,10 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        self.spec_num_verify_tokens = 0
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+        self.spec_total_num_verify_tokens = 0
 
     def log_prefill_stats(
         self: Scheduler,
@@ -358,10 +364,12 @@ class SchedulerMetricsMixin:
                 if total_draft_tokens > 0
                 else 0
             )
+            spec_total_verify_tokens = self.spec_num_verify_tokens
             self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            self.spec_total_num_verify_tokens += self.spec_num_verify_tokens
+            self.spec_num_accepted_tokens = self.spec_num_forward_ct = self.spec_num_verify_tokens = 0
+            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, total verify num: {spec_total_verify_tokens}, "
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:

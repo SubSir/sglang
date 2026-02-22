@@ -386,7 +386,21 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            num_verify_tokens = 0
+            if result.accept_length_per_req_cpu is not None:
+                num_draft_tokens = getattr(
+                    self.draft_worker, "speculative_num_draft_tokens", None
+                )
+                if num_draft_tokens is None:
+                    draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+                    num_draft_tokens = self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
+                num_verify_tokens = int(len(result.accept_length_per_req_cpu)) * int(num_draft_tokens)
+
+            self.update_spec_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                num_verify_tokens=num_verify_tokens,
+            )
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
@@ -1089,6 +1103,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
+                    spec_verify_tokens=[req.spec_verify_tokens for req in reqs if req is not skip_req] if not self.spec_algorithm.is_none() else [],
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
                     prefill_launch_delay=prefill_launch_delays,
