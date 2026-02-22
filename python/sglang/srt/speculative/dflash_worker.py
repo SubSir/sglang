@@ -223,6 +223,7 @@ class DFlashWorker:
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_lse_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
         self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
@@ -592,14 +593,21 @@ class DFlashWorker:
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
-        
+
         If return_nll is True, it also returns the Negative Log-Likelihood (NLL)
         of the selected tokens in a TP-safe way.
         """
 
         if hidden_states.numel() == 0:
             token_ids = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
-            return (token_ids, torch.empty((0,), dtype=torch.float32, device=hidden_states.device)) if return_nll else token_ids
+            return (
+                (
+                    token_ids,
+                    torch.empty((0,), dtype=torch.float32, device=hidden_states.device),
+                )
+                if return_nll
+                else token_ids
+            )
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
@@ -613,6 +621,9 @@ class DFlashWorker:
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
 
+        # Valid ranges in the local shard (excluding padding):
+        #   base vocab:  [0, num_org)
+        #   added vocab: [num_org_padded, num_org_padded + num_added)
         num_org = int(shard.num_org_elements)
         num_org_padded = int(shard.num_org_elements_padded)
         num_added = int(shard.num_added_elements)
@@ -623,12 +634,17 @@ class DFlashWorker:
         out_token_ids = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
-        out_nlls = torch.empty((num_tokens,), dtype=torch.float32, device=hidden_states.device) if return_nll else None
+        out_nlls = (
+            torch.empty((num_tokens,), dtype=torch.float32, device=hidden_states.device)
+            if return_nll
+            else None
+        )
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
+        # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
@@ -636,11 +652,15 @@ class DFlashWorker:
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
                     local_max, local_arg = torch.max(base_logits, dim=-1)
-                    out_token_ids[start:end] = local_arg.to(torch.long) + org_vocab_start
+                    out_token_ids[start:end] = (
+                        local_arg.to(torch.long) + org_vocab_start
+                    )
                     if return_nll:
                         # logp = logit - logsumexp(logits)
-                        logsumexp_val = torch.logsumexp(base_logits, dim=-1)
-                        out_nlls[start:end] = -(local_max.to(torch.float32) - logsumexp_val.to(torch.float32))
+                        local_lse = torch.logsumexp(base_logits, dim=-1)
+                        out_nlls[start:end] = -(
+                            local_max.to(torch.float32) - local_lse.to(torch.float32)
+                        )
                 else:
                     out_token_ids[start:end] = 0
                     if return_nll:
@@ -656,35 +676,65 @@ class DFlashWorker:
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
                 local_max, local_arg = torch.max(base_logits, dim=-1)
-                local_lse = torch.logsumexp(base_logits, dim=-1) if return_nll else None
+                local_lse = (
+                    torch.logsumexp(base_logits, dim=-1) if return_nll else None
+                )
             else:
-                local_max = torch.full((chunk_len,), torch.finfo(weight_dtype).min, dtype=weight_dtype, device=hs.device)
-                local_arg = torch.zeros((chunk_len,), dtype=torch.int64, device=hs.device)
-                local_lse = torch.full((chunk_len,), float("-inf"), dtype=torch.float32, device=hs.device) if return_nll else None
+                local_max = torch.full(
+                    (chunk_len,),
+                    torch.finfo(weight_dtype).min,
+                    dtype=weight_dtype,
+                    device=hs.device,
+                )
+                local_arg = torch.zeros(
+                    (chunk_len,), dtype=torch.int64, device=hs.device
+                )
+                local_lse = (
+                    torch.full(
+                        (chunk_len,), float("-inf"), dtype=torch.float32, device=hs.device
+                    )
+                    if return_nll
+                    else None
+                )
 
-            # Added vocab logits.
+            # Added vocab logits (e.g., LoRA-added embeddings), if present.
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(hs, weight[added_slice_start:added_slice_end].T)
+                added_logits = torch.matmul(
+                    hs, weight[added_slice_start:added_slice_end].T
+                )
                 added_max, added_arg = torch.max(added_logits, dim=-1)
-                
+
                 if return_nll:
                     added_lse = torch.logsumexp(added_logits, dim=-1)
-                    local_lse = torch.log(torch.exp(local_lse) + torch.exp(added_lse))
+                    # local_lse = log(exp(local_lse) + exp(added_lse))
+                    local_lse = torch.logsumexp(
+                        torch.stack([local_lse, added_lse.to(torch.float32)], dim=0),
+                        dim=0,
+                    )
 
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
-                local_arg = torch.where(use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg)
+                # For base/added conversion below, keep local_arg expressed in the full local
+                # weight index space (base + padding + added), matching `lm_head.weight`.
+                local_arg = torch.where(
+                    use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
+                )
 
             # Convert local argmax indices to global token ids.
             if num_added == 0:
-                global_ids = local_arg + org_vocab_start
+                local_arg_global = local_arg + org_vocab_start
+                global_ids = local_arg_global
             else:
-                global_ids = torch.empty((chunk_len,), dtype=torch.int64, device=hs.device)
+                global_ids = torch.empty(
+                    (chunk_len,), dtype=torch.int64, device=hs.device
+                )
                 is_base = local_arg < num_org
                 global_ids[is_base] = org_vocab_start + local_arg[is_base]
-                global_ids[~is_base] = added_vocab_start + (local_arg[~is_base] - num_org_padded)
+                global_ids[~is_base] = added_vocab_start + (
+                    local_arg[~is_base] - num_org_padded
+                )
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
@@ -692,24 +742,85 @@ class DFlashWorker:
                     out_nlls[start:end] = -(local_max.to(torch.float32) - local_lse)
                 continue
 
-            # Gather per-rank candidates and LSE.
+            # Gather per-rank maxima and associated global ids, then select the global max.
             needed = tp_size * chunk_len
-            gathered_max = torch.empty((tp_size, chunk_len), dtype=local_max.dtype, device=hs.device)
-            gathered_ids = torch.empty((tp_size, chunk_len), dtype=global_ids.dtype, device=hs.device)
-            
-            tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
-            tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+            chunk_cap = int(chunk_size)
+            if (
+                self._draft_greedy_gather_cap < needed
+                or self._draft_greedy_gathered_max_buf is None
+                or self._draft_greedy_gathered_ids_buf is None
+                or (return_nll and self._draft_greedy_gathered_lse_buf is None)
+                or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
+                or self._draft_greedy_gathered_max_buf.device != hs.device
+            ):
+                # Allocate enough space for the max chunk size to avoid reallocations.
+                cap = tp_size * chunk_cap
+                self._draft_greedy_gathered_max_buf = torch.empty(
+                    (cap,), dtype=local_max.dtype, device=hs.device
+                )
+                self._draft_greedy_gathered_ids_buf = torch.empty(
+                    (cap,), dtype=global_ids.dtype, device=hs.device
+                )
+                if return_nll:
+                    self._draft_greedy_gathered_lse_buf = torch.empty(
+                        (cap,), dtype=torch.float32, device=hs.device
+                    )
+                self._draft_greedy_gather_cap = cap
 
-            best_rank = torch.argmax(gathered_max, dim=0)
-            global_max_val = torch.gather(gathered_max, 0, best_rank.unsqueeze(0)).squeeze(0)
-            selected_ids = torch.gather(gathered_ids, 0, best_rank.unsqueeze(0)).squeeze(0)
-            out_token_ids[start:end] = selected_ids
+            if (
+                self._draft_greedy_index_cap < chunk_len
+                or self._draft_greedy_best_rank_buf is None
+                or self._draft_greedy_rank_index_buf is None
+                or self._draft_greedy_selected_ids_buf is None
+                or self._draft_greedy_best_rank_buf.device != hs.device
+                or self._draft_greedy_selected_ids_buf.device != hs.device
+            ):
+                self._draft_greedy_best_rank_buf = torch.empty(
+                    (chunk_cap,), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_rank_index_buf = torch.empty(
+                    (1, chunk_cap), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_selected_ids_buf = torch.empty(
+                    (1, chunk_cap), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_index_cap = chunk_cap
+
+            gathered_max_flat = self._draft_greedy_gathered_max_buf[:needed]
+            gathered_ids_flat = self._draft_greedy_gathered_ids_buf[:needed]
+
+            tp_group.all_gather_into_tensor(gathered_max_flat, local_max.contiguous())
+            tp_group.all_gather_into_tensor(gathered_ids_flat, global_ids.contiguous())
+            gathered_max = gathered_max_flat.view(tp_size, chunk_len)
+            gathered_ids = gathered_ids_flat.view(tp_size, chunk_len)
+
+            best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
+            torch.argmax(gathered_max, dim=0, out=best_rank)
+
+            rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
+            rank_index[0].copy_(best_rank)
+            selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
+            torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
+            out_token_ids[start:end].copy_(selected_ids.view(-1))
 
             if return_nll:
-                gathered_lse = torch.empty((tp_size, chunk_len), dtype=torch.float32, device=hs.device)
-                tp_group.all_gather_into_tensor(gathered_lse, local_lse.to(torch.float32).contiguous())
+                gathered_lse_flat = self._draft_greedy_gathered_lse_buf[:needed]
+                tp_group.all_gather_into_tensor(
+                    gathered_lse_flat, local_lse.to(torch.float32).contiguous()
+                )
+                gathered_lse = gathered_lse_flat.view(tp_size, chunk_len)
                 # Global LSE = log(sum(exp(sharded_lse)))
                 global_lse = torch.logsumexp(gathered_lse, dim=0)
+
+                # Get global max value to compute NLL
+                global_max_val = torch.empty(
+                    (chunk_len,), dtype=local_max.dtype, device=hs.device
+                )
+                # Reuse selected_ids buffer for float values if needed, but better use a temp or gather specifically
+                # For simplicity and correctness:
+                global_max_val = torch.gather(
+                    gathered_max, 0, rank_index
+                ).view(-1)
                 out_nlls[start:end] = -(global_max_val.to(torch.float32) - global_lse)
 
         return (out_token_ids, out_nlls) if return_nll else out_token_ids
