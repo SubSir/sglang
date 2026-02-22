@@ -739,6 +739,11 @@ class Req:
         # For DFLASH with k-online, this may be smaller because we can verify fewer tokens per step.
         self.spec_verify_tokens = 0
 
+        # K-online per-request statistics
+        self.k_online_sum_by_acc: Optional[torch.Tensor] = None
+        self.k_online_count_by_acc: Optional[torch.Tensor] = None
+        self.k_online_step = 0
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None

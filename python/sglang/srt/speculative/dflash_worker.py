@@ -234,9 +234,6 @@ class DFlashWorker:
         self._k_online_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0")))
         self._k_online_offset: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_OFFSET", "2"))
         self._k_online_warmup_steps: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_WARMUP", "0"))
-        self._k_online_global_step: int = 0
-        self._k_online_sum_by_acc: Optional[torch.Tensor] = None
-        self._k_online_count_by_acc: Optional[torch.Tensor] = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -498,28 +495,47 @@ class DFlashWorker:
 
         if self._k_online_enabled and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
-            if (
-                self._k_online_sum_by_acc is None
-                or self._k_online_count_by_acc is None
-                or int(self._k_online_sum_by_acc.shape[1]) != int(num_pos)
-            ):
-                self._k_online_sum_by_acc = torch.zeros(
-                    (num_pos + 1, num_pos), device=self.device, dtype=torch.float32
-                )
-                self._k_online_count_by_acc = torch.zeros(
-                    (num_pos + 1,), device=self.device, dtype=torch.int64
-                )
-                self._k_online_global_step = 0
+            
+            # --- 3a) Aggregated statistics from batch.reqs for vectorized prediction
+            # sum_by_acc_batch: [bs, num_pos + 1, num_pos]
+            # count_by_acc_batch: [bs, num_pos + 1]
+            sum_by_acc_batch = torch.zeros((bs, num_pos + 1, num_pos), device=self.device, dtype=torch.float32)
+            count_by_acc_batch = torch.zeros((bs, num_pos + 1), device=self.device, dtype=torch.int64)
+            warmup_mask = torch.zeros((bs,), device=self.device, dtype=torch.bool)
 
-            thresholds = _build_thresholds_from_running(
-                num_pos=num_pos,
-                sum_by_acc=self._k_online_sum_by_acc,
-                count_by_acc=self._k_online_count_by_acc,
-                device=self.device,
-            )
+            for i, req in enumerate(batch.reqs):
+                if req.k_online_sum_by_acc is None:
+                    req.k_online_sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=self.device, dtype=torch.float32)
+                    req.k_online_count_by_acc = torch.zeros((num_pos + 1,), device=self.device, dtype=torch.int64)
+                    req.k_online_step = 0
+                
+                sum_by_acc_batch[i] = req.k_online_sum_by_acc
+                count_by_acc_batch[i] = req.k_online_count_by_acc
+                if req.k_online_step < self._k_online_warmup_steps:
+                    warmup_mask[i] = True
 
-            # Compute draft NLL for the proposed tokens in this block.
-            # draft_hidden: [bs, block, hidden] -> logits over vocab shard.
+            # --- 3b) Build thresholds per request
+            # thresholds_batch: [bs, num_pos]
+            thresholds_batch = torch.full((bs, num_pos), float("inf"), device=self.device, dtype=torch.float32)
+            acc_idx = torch.arange(num_pos, device=self.device, dtype=torch.long)
+            
+            # Gather relevant counts: [bs, num_pos]
+            c = count_by_acc_batch.index_select(1, acc_idx) # [bs, num_pos]
+            has = c > 0 # [bs, num_pos]
+            
+            if bool(has.any().item()):
+                # mean_vec: [bs, num_pos, num_pos]
+                # We only need the diagonal for each request: sum_by_acc[i, acc_idx, acc_idx]
+                # sum_by_acc_batch index_select on dim 1 (acc_idx): [bs, num_pos, num_pos]
+                s_diag = sum_by_acc_batch.index_select(1, acc_idx) # [bs, num_pos, num_pos]
+                # Extract diagonal for each request: [bs, num_pos]
+                # torch.diagonal doesn't support batching in the way we need here directly for dim 1,2
+                # s_diag[:, acc_idx, acc_idx]
+                diag_vals = s_diag[:, acc_idx, acc_idx] # [bs, num_pos]
+                
+                thresholds_batch = torch.where(has, diag_vals / c.clamp_min(1.0).to(torch.float32), thresholds_batch)
+
+            # --- 3c) Compute draft NLL
             hidden_for_logits = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
             local_logits = lm_head(hidden_for_logits)
             local_vocab = local_logits.shape[-1]
@@ -561,17 +577,13 @@ class DFlashWorker:
 
             token_nll = (-token_logp_local).view(bs, num_pos).to(torch.float32)
 
-            if int(self._k_online_global_step) < int(self._k_online_warmup_steps):
-                verify_len_per_req = torch.full(
-                    (bs,), int(self.block_size), device=self.device, dtype=torch.int64
-                )
-            else:
-                acc_pred = _predict_acc_len_from_nll(token_nll, thresholds).to(torch.int64)
-                k = torch.minimum(
-                    acc_pred + int(self._k_online_offset),
-                    torch.full_like(acc_pred, num_pos),
-                )
-                verify_len_per_req = k + 1
+            # --- 3d) Vectorized prediction per request
+            acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(torch.int64)
+            k = torch.minimum(
+                acc_pred + int(self._k_online_offset),
+                torch.full_like(acc_pred, num_pos),
+            )
+            verify_len_per_req = torch.where(warmup_mask, torch.full_like(k, int(self.block_size)), k + 1)
 
             max_verify_len = int(verify_len_per_req.max().item())
             max_verify_len = max(1, min(max_verify_len, int(self.block_size)))
@@ -1007,12 +1019,6 @@ class DFlashWorker:
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        # --- Update K-online global step.
-        if self._k_online_enabled:
-            self._k_online_global_step += 1
-            # We also update the step in the batch if needed for consistency, 
-            # though the worker's instance state is the source of truth for the session.
-            setattr(batch, "_dflash_k_online_global_step", self._k_online_global_step)
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:

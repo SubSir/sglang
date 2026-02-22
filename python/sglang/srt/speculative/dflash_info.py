@@ -446,13 +446,12 @@ class DFlashVerifyInput(SpecInput):
         if hasattr(self, "_k_online_token_nll") and self._k_online_token_nll is not None:
             token_nll = self._k_online_token_nll  # [bs, num_pos]
             num_pos = int(token_nll.shape[1])
-            k_online_sum_by_acc = getattr(batch, "_dflash_k_online_sum_by_acc", None)
-            k_online_count_by_acc = getattr(batch, "_dflash_k_online_count_by_acc", None)
-            if k_online_sum_by_acc is not None and k_online_count_by_acc is not None:
-                for i, acc_true in enumerate(accept_length_per_req_cpu):
+            for i, (req, acc_true) in enumerate(zip(batch.reqs, accept_length_per_req_cpu)):
+                if req.k_online_sum_by_acc is not None:
                     acc_true_idx = min(int(acc_true), int(num_pos))
-                    k_online_sum_by_acc[acc_true_idx, :] += token_nll[i]
-                    k_online_count_by_acc[acc_true_idx] += 1
+                    req.k_online_sum_by_acc[acc_true_idx, :] += token_nll[i]
+                    req.k_online_count_by_acc[acc_true_idx] += 1
+                    req.k_online_step += 1
             self._k_online_token_nll = None
 
         # Build next-step context features from the committed verify-input tokens.
