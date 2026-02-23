@@ -231,6 +231,18 @@ class DFlashWorker:
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
 
+        # --- Buffers for k-online verify length prediction
+        self._k_online_sum_by_acc_buf: Optional[torch.Tensor] = None
+        self._k_online_count_by_acc_buf: Optional[torch.Tensor] = None
+        self._k_online_warmup_mask_buf: Optional[torch.Tensor] = None
+        self._k_online_thresholds_buf: Optional[torch.Tensor] = None
+        self._k_online_cap: int = 0
+
+        # --- Buffers for ragged verify flatten
+        self._verify_tokens_flat_buf: Optional[torch.Tensor] = None
+        self._verify_positions_flat_buf: Optional[torch.Tensor] = None
+        self._verify_flat_cap: int = 0
+
         # --- K-online verify length prediction (batch-max verify for simplicity).
         # Enable via env var to keep backwards compatibility.
         self._k_online_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0")))
@@ -264,6 +276,46 @@ class DFlashWorker:
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+
+    def _ensure_k_online_buffers(self, bs: int, num_pos: int, dtype: torch.dtype) -> None:
+        if (
+            self._k_online_cap >= bs
+            and self._k_online_sum_by_acc_buf is not None
+            and self._k_online_sum_by_acc_buf.dtype == dtype
+        ):
+            return
+
+        new_cap = max(bs, self._k_online_cap * 2 if self._k_online_cap > 0 else bs)
+        device = self.device
+        self._k_online_sum_by_acc_buf = torch.zeros(
+            (new_cap, num_pos + 1, num_pos), dtype=dtype, device=device
+        )
+        self._k_online_count_by_acc_buf = torch.zeros(
+            (new_cap, num_pos + 1), dtype=torch.int64, device=device
+        )
+        self._k_online_warmup_mask_buf = torch.zeros(
+            (new_cap,), dtype=torch.bool, device=device
+        )
+        self._k_online_thresholds_buf = torch.full(
+            (new_cap, num_pos), float("inf"), dtype=dtype, device=device
+        )
+        self._k_online_cap = new_cap
+
+    def _ensure_verify_flat_buffers(self, total_tokens: int) -> None:
+        if self._verify_flat_cap >= total_tokens:
+            return
+
+        new_cap = max(
+            total_tokens, self._verify_flat_cap * 2 if self._verify_flat_cap > 0 else total_tokens
+        )
+        device = self.device
+        self._verify_tokens_flat_buf = torch.empty(
+            (new_cap,), dtype=torch.long, device=device
+        )
+        self._verify_positions_flat_buf = torch.empty(
+            (new_cap,), dtype=torch.int64, device=device
+        )
+        self._verify_flat_cap = new_cap
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
@@ -512,37 +564,39 @@ class DFlashWorker:
 
         if self._k_online_enabled and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
-            
+            dtype = draft_hidden.dtype
+            self._ensure_k_online_buffers(bs, num_pos, dtype)
+
             # --- 3a) Aggregated statistics from batch.reqs for vectorized prediction
-            sum_by_acc_batch = torch.zeros((bs, num_pos + 1, num_pos), device=self.device, dtype=torch.float32)
-            count_by_acc_batch = torch.zeros((bs, num_pos + 1), device=self.device, dtype=torch.int64)
-            warmup_mask = torch.zeros((bs,), device=self.device, dtype=torch.bool)
+            sum_by_acc_batch = self._k_online_sum_by_acc_buf[:bs].zero_()
+            count_by_acc_batch = self._k_online_count_by_acc_buf[:bs].zero_()
+            warmup_mask = self._k_online_warmup_mask_buf[:bs].zero_()
 
             for i, req in enumerate(batch.reqs):
                 if req.k_online_sum_by_acc is None:
-                    req.k_online_sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=self.device, dtype=torch.float32)
+                    req.k_online_sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=self.device, dtype=dtype)
                     req.k_online_count_by_acc = torch.zeros((num_pos + 1,), device=self.device, dtype=torch.int64)
                     req.k_online_step = 0
                 
-                sum_by_acc_batch[i] = req.k_online_sum_by_acc
-                count_by_acc_batch[i] = req.k_online_count_by_acc
+                sum_by_acc_batch[i].copy_(req.k_online_sum_by_acc)
+                count_by_acc_batch[i].copy_(req.k_online_count_by_acc)
                 if req.k_online_step < self._k_online_warmup_steps:
                     warmup_mask[i] = True
 
             # --- 3b) Build thresholds per request
-            thresholds_batch = torch.full((bs, num_pos), float("inf"), device=self.device, dtype=torch.float32)
+            thresholds_batch = self._k_online_thresholds_buf[:bs].fill_(float("inf"))
             acc_idx = torch.arange(num_pos, device=self.device, dtype=torch.long)
             c = count_by_acc_batch.index_select(1, acc_idx)
             has = c > 0
             if bool(has.any().item()):
                 s_diag = sum_by_acc_batch.index_select(1, acc_idx)
                 diag_vals = s_diag[:, acc_idx, acc_idx]
-                thresholds_batch = torch.where(has, diag_vals / c.clamp_min(1.0).to(torch.float32), thresholds_batch)
+                thresholds_batch = torch.where(has, diag_vals / c.clamp_min(1.0).to(dtype), thresholds_batch)
 
             # --- 3c) Use draft token NLL computed during draft greedy sampling.
             if draft_token_nll is None:
                 raise RuntimeError("DFLASH k-online expected draft_token_nll, but got None.")
-            token_nll = draft_token_nll.to(torch.float32)
+            token_nll = draft_token_nll.to(dtype)
 
             # --- 3d) Vectorized prediction per request
             acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(torch.int64)
@@ -564,12 +618,9 @@ class DFlashWorker:
         if total_verify_tokens <= 0:
             raise RuntimeError("DFLASH verify: total_verify_tokens is 0.")
 
-        verify_tokens_flat = torch.empty(
-            (total_verify_tokens,), dtype=torch.long, device=self.device
-        )
-        verify_positions_flat = torch.empty(
-            (total_verify_tokens,), dtype=torch.int64, device=self.device
-        )
+        self._ensure_verify_flat_buffers(total_verify_tokens)
+        verify_tokens_flat = self._verify_tokens_flat_buf[:total_verify_tokens]
+        verify_positions_flat = self._verify_positions_flat_buf[:total_verify_tokens]
         # Per-request start offsets in the flattened arrays.
         verify_start_offsets_cpu = [0] * bs
 
@@ -633,7 +684,7 @@ class DFlashWorker:
             return (
                 (
                     token_ids,
-                    torch.empty((0,), dtype=torch.float32, device=hidden_states.device),
+                    torch.empty((0,), dtype=weight_dtype, device=hidden_states.device),
                 )
                 if return_nll
                 else token_ids
@@ -665,7 +716,7 @@ class DFlashWorker:
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
         out_nlls = (
-            torch.empty((num_tokens,), dtype=torch.float32, device=hidden_states.device)
+            torch.empty((num_tokens,), dtype=weight_dtype, device=hidden_states.device)
             if return_nll
             else None
         )
@@ -689,7 +740,7 @@ class DFlashWorker:
                         # logp = logit - logsumexp(logits)
                         local_lse = torch.logsumexp(base_logits, dim=-1)
                         out_nlls[start:end] = -(
-                            local_max.to(torch.float32) - local_lse.to(torch.float32)
+                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
                         )
                 else:
                     out_token_ids[start:end] = 0
@@ -721,7 +772,7 @@ class DFlashWorker:
                 )
                 local_lse = (
                     torch.full(
-                        (chunk_len,), float("-inf"), dtype=torch.float32, device=hs.device
+                        (chunk_len,), float("-inf"), dtype=weight_dtype, device=hs.device
                     )
                     if return_nll
                     else None
@@ -740,7 +791,7 @@ class DFlashWorker:
                     added_lse = torch.logsumexp(added_logits, dim=-1)
                     # local_lse = log(exp(local_lse) + exp(added_lse))
                     local_lse = torch.logsumexp(
-                        torch.stack([local_lse, added_lse.to(torch.float32)], dim=0),
+                        torch.stack([local_lse, added_lse.to(weight_dtype)], dim=0),
                         dim=0,
                     )
 
@@ -769,7 +820,7 @@ class DFlashWorker:
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
                 if return_nll:
-                    out_nlls[start:end] = -(local_max.to(torch.float32) - local_lse)
+                    out_nlls[start:end] = -(local_max.to(weight_dtype) - local_lse)
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -793,7 +844,7 @@ class DFlashWorker:
                 )
                 if return_nll:
                     self._draft_greedy_gathered_lse_buf = torch.empty(
-                        (cap,), dtype=torch.float32, device=hs.device
+                        (cap,), dtype=weight_dtype, device=hs.device
                     )
                 self._draft_greedy_gather_cap = cap
 
@@ -836,22 +887,17 @@ class DFlashWorker:
             if return_nll:
                 gathered_lse_flat = self._draft_greedy_gathered_lse_buf[:needed]
                 tp_group.all_gather_into_tensor(
-                    gathered_lse_flat, local_lse.to(torch.float32).contiguous()
+                    gathered_lse_flat, local_lse.to(weight_dtype).contiguous()
                 )
                 gathered_lse = gathered_lse_flat.view(tp_size, chunk_len)
                 # Global LSE = log(sum(exp(sharded_lse)))
                 global_lse = torch.logsumexp(gathered_lse, dim=0)
 
                 # Get global max value to compute NLL
-                global_max_val = torch.empty(
-                    (chunk_len,), dtype=local_max.dtype, device=hs.device
-                )
-                # Reuse selected_ids buffer for float values if needed, but better use a temp or gather specifically
-                # For simplicity and correctness:
                 global_max_val = torch.gather(
                     gathered_max, 0, rank_index
                 ).view(-1)
-                out_nlls[start:end] = -(global_max_val.to(torch.float32) - global_lse)
+                out_nlls[start:end] = -(global_max_val.to(weight_dtype) - global_lse)
 
         return (out_token_ids, out_nlls) if return_nll else out_token_ids
 
