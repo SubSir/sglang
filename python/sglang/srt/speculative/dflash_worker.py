@@ -21,6 +21,7 @@ from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -218,7 +219,7 @@ class DFlashWorker:
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
             draft_token_num=int(self.block_size),
-            custom_mask=None,
+            verify_token_lens=torch.empty((0,), dtype=torch.int32),
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
@@ -416,8 +417,15 @@ class DFlashWorker:
         prefix_lens = batch.seq_lens  # int32, device
 
         positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
-        positions = positions_2d.reshape(-1)
+        # Use int64 for AMD rotary embedding kernel compatibility
+        positions_dtype = torch.int64 if is_hip() else torch.int32
+        # Use prefix_lens as positions [pos, pos+1, ...] matching origin logic
+        torch.add(
+            prefix_lens.unsqueeze(1),
+            self._block_pos_offsets.to(positions_dtype),
+            out=positions_2d,
+        )
+        positions_flat = positions_2d.reshape(-1)
 
         block_start = prefix_lens
         block_end = self._draft_block_end_buf[:bs]
@@ -450,6 +458,7 @@ class DFlashWorker:
             # In this mode, `seq_lens` stores the prefix lengths; attention backends
             # derive kv_len by adding `draft_token_num`.
             draft_spec_info = self._draft_block_spec_info
+            draft_spec_info.positions = positions_flat
             seq_lens = prefix_lens
             seq_lens_sum = int(batch.seq_lens_sum)
             forward_batch = ForwardBatch(
@@ -461,7 +470,7 @@ class DFlashWorker:
                 out_cache_loc=block_cache_loc,
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
-                positions=positions,
+                positions=positions_flat,
                 req_to_token_pool=self.draft_model_runner.req_to_token_pool,
                 token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
                 attn_backend=self.draft_model_runner.attn_backend,
@@ -497,12 +506,9 @@ class DFlashWorker:
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
 
         # --- 3) (Optional) K-online predict verify length.
-        # We still build a single verify batch with max_verify_len for cuda-graph friendliness.
         verify_len_per_req = None
-        max_verify_len = int(self.block_size)
 
         if self._k_online_enabled and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
@@ -541,15 +547,48 @@ class DFlashWorker:
             # --- 3d) Vectorized prediction per request
             acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(torch.int64)
             k = torch.minimum(acc_pred + int(self._k_online_offset), torch.full_like(acc_pred, num_pos))
+            # verify_len_per_req is number of tokens to verify (1..block_size)
             verify_len_per_req = torch.where(warmup_mask, torch.full_like(k, int(self.block_size)), k + 1)
 
-            max_verify_len = int(verify_len_per_req.max().item())
-            max_verify_len = max(1, min(max_verify_len, int(self.block_size)))
+        # --- 4) Build ragged verify inputs for target forward.
+        # We will run the target forward in ForwardMode.DFLASH_VERIFY (ragged EXTEND-style).
+        # Total tokens = sum(verify_len_per_req) (or bs * block_size if k-online disabled).
+        if verify_len_per_req is None:
+            verify_len_per_req = torch.full(
+                (bs,), int(self.block_size), device=self.device, dtype=torch.int64
+            )
+
+        verify_len_cpu = verify_len_per_req.to(torch.int32).cpu()
+        vlen_list = verify_len_cpu.tolist()
+        total_verify_tokens = int(sum(vlen_list))
+        if total_verify_tokens <= 0:
+            raise RuntimeError("DFLASH verify: total_verify_tokens is 0.")
+
+        verify_tokens_flat = torch.empty(
+            (total_verify_tokens,), dtype=torch.long, device=self.device
+        )
+        verify_positions_flat = torch.empty(
+            (total_verify_tokens,), dtype=torch.int64, device=self.device
+        )
+        # Per-request start offsets in the flattened arrays.
+        verify_start_offsets_cpu = [0] * bs
+
+        pt = 0
+        for i, vlen in enumerate(vlen_list):
+            verify_start_offsets_cpu[i] = pt
+            v = int(vlen)
+            if v <= 0:
+                continue
+            verify_tokens_flat[pt : pt + v].copy_(draft_tokens[i, :v])
+            verify_positions_flat[pt : pt + v].copy_(positions_2d[i, :v])
+            pt += v
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens[:, :max_verify_len].reshape(-1),
-            positions=positions_2d[:, :max_verify_len].reshape(-1),
-            draft_token_num=int(max_verify_len),
+            draft_token=verify_tokens_flat,
+            positions=verify_positions_flat,
+            draft_token_num=int(self.block_size),  # legacy field
+            verify_token_lens=verify_len_cpu,
+            verify_start_offsets_cpu=verify_start_offsets_cpu,
         )
 
         # Stash per-req predictions on the verify input for the verify stage to update stats.
@@ -557,28 +596,19 @@ class DFlashWorker:
         verify_input._k_online_token_nll = (
             token_nll.detach() if (self._k_online_enabled and int(self.block_size) > 1) else None
         )
-        backend_name = type(self.model_runner.attn_backend).__name__
-        skip_custom_mask = backend_name in {
-            "FlashInferAttnBackend",
-            "FlashInferMLAAttnBackend",
-            "FlashAttentionBackend",
-            "TRTLLMHAAttnBackend",
-            "TRTLLMMLABackend",
-        }
-        build_custom_mask = not skip_custom_mask
+
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
-            build_custom_mask=build_custom_mask,
         )
 
-        batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if not batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
+        # Set forward fields for DFLASH_VERIFY (ragged EXTEND-style).
+        batch.forward_mode = ForwardMode.DFLASH_VERIFY
+        batch.extend_seq_lens = vlen_list
+        batch.extend_prefix_lens = batch.seq_lens_cpu.tolist()
+        batch.extend_num_tokens = total_verify_tokens
         batch.spec_info = verify_input
-        batch.return_hidden_states = False
+        batch.return_hidden_states = True  # Required for next step context features
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1016,7 +1046,7 @@ class DFlashWorker:
         self._prepare_for_speculative_decoding(batch, draft_input)
 
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.forward_mode.is_target_verify()
+        assert model_worker_batch.forward_mode == ForwardMode.DFLASH_VERIFY
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
 

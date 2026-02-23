@@ -81,6 +81,8 @@ class ForwardMode(IntEnum):
 
     # Used in speculative decoding: verify a batch in the target model.
     TARGET_VERIFY = auto()
+    # Used in DFLASH speculative decoding: verify a ragged batch in the target model.
+    DFLASH_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
@@ -106,6 +108,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.DRAFT_EXTEND
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DFLASH_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
         )
@@ -134,7 +137,7 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     def is_target_verify(self):
-        return self == ForwardMode.TARGET_VERIFY
+        return self == ForwardMode.TARGET_VERIFY or self == ForwardMode.DFLASH_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
         return self == ForwardMode.DRAFT_EXTEND or (
@@ -507,10 +510,13 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        # - DECODE and TARGET_VERIFY use clamp_position.
+        # - DFLASH_VERIFY is extend-style (ragged) and must use extend_seq_lens/extend_prefix_lens.
+        if ret.forward_mode.is_decode() or ret.forward_mode == ForwardMode.TARGET_VERIFY:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            # EXTEND / MIXED / DRAFT_EXTEND / DFLASH_VERIFY / ...
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
@@ -984,6 +990,12 @@ class ForwardBatch:
                 bs = bs * self.spec_info.num_tokens_per_batch
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
+            elif self.forward_mode == ForwardMode.DFLASH_VERIFY:
+                # DFLASH ragged verify: keep token-level outputs (do NOT slice to batch-size).
+                # `seq_lens_sum` is the true number of verify tokens in this ragged batch.
+                num_tokens = self.seq_lens_sum
+                logits_output.next_token_logits = logits_output.next_token_logits[:num_tokens]
+                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
