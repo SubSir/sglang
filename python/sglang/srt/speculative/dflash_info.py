@@ -86,13 +86,16 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    verify_token_lens: torch.Tensor
+    verify_token_lens: Optional[torch.Tensor] = None
+    custom_mask: Optional[torch.Tensor] = None
     verify_start_offsets_cpu: Optional[List[int]] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     num_tokens_per_batch: int = -1
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
+        if self.verify_token_lens is None:
+            self.verify_token_lens = torch.empty((0,), dtype=torch.int32)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num) if int(self.draft_token_num) > 0 else 1
 
