@@ -446,7 +446,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, False, False
             )
-        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY:
+        elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
