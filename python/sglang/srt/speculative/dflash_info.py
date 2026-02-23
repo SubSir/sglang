@@ -115,6 +115,7 @@ class DFlashVerifyInput(SpecInput):
             )
 
         batch.input_ids = self.draft_token
+        batch.positions = self.positions
         batch.out_cache_loc = alloc_token_slots(batch.tree_cache, len(batch.input_ids))
 
         prefix_lens = batch.seq_lens
@@ -210,9 +211,37 @@ class DFlashVerifyInput(SpecInput):
             # current_candidates: [vlen], includes verified_id at index 0.
             # positions: [vlen], verified_id is at prefix_lens[i].
             current_candidates = self.draft_token[offset : offset + vlen]
-            # current_logits[t] is prediction for current_candidates[t+1].
-            current_logits = logits_flat[offset : offset + vlen]
-            current_predict = torch.argmax(current_logits, dim=-1)
+            # Ragged alignment (critical): in causal LM, `next_token_logits[pos]` predicts
+            # the token at `pos+1`. Our `draft_token[offset:offset+vlen]` contains:
+            #   [verified_id, draft_1, draft_2, ...]
+            # We must compare `draft_1` with prediction from logits at verified_id position,
+            # i.e. use logits slice length (vlen-1), aligned to candidates[1:]
+            if vlen < 2:
+                # Degenerate: only verified token present; accept 0 draft, bonus = argmax at this pos.
+                current_candidates = self.draft_token[offset : offset + vlen]
+                current_logits = logits_flat[offset : offset + vlen]
+                current_predict = torch.argmax(current_logits, dim=-1)
+                acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
+                    candidates=current_candidates.unsqueeze(0),
+                    target_predict=current_predict.unsqueeze(0),
+                )
+                acc_len = int(acc_len_t.item())
+                bonus = int(bonus_t.item())
+            else:
+                # Normal: use logits[offset : offset+vlen-1] to predict candidates[1:]
+                current_candidates = self.draft_token[offset : offset + vlen]
+                current_logits = logits_flat[offset : offset + vlen - 1]
+                current_predict = torch.argmax(current_logits, dim=-1)
+                # compute_dflash_accept_len_and_bonus expects target_predict same length as candidates
+                # (it uses target_predict[:, :-1] vs candidates[:, 1:]). Pad last element with dummy.
+                pad = current_predict.new_full((1,), int(current_predict[-1]))
+                current_predict_padded = torch.cat([current_predict, pad], dim=0)
+                acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
+                    candidates=current_candidates.unsqueeze(0),
+                    target_predict=current_predict_padded.unsqueeze(0),
+                )
+                acc_len = int(acc_len_t.item())
+                bonus = int(bonus_t.item())
 
             # # Debug logs for Shift-1 alignment analysis
             # if i == 0:
@@ -220,19 +249,6 @@ class DFlashVerifyInput(SpecInput):
             #     print(f"DEBUG: [Req 0] current_candidates[:5]={current_candidates[:5].tolist()}")
             #     print(f"DEBUG: [Req 0] current_predict[:5]={current_predict[:5].tolist()}")
             #     print(f"DEBUG: [Req 0] logits_flat.shape={logits_flat.shape}")
-            
-            # The rule in compute_dflash_accept_len_and_bonus is:
-            #   accept while candidates[:, 1:] == target_predict[:, :-1]
-            # In our ragged case, target_predict[t] is prediction for candidates[t+1].
-            # So target_predict[:-1] are predictions for candidates[1:].
-            # This matches exactly.
-            acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
-                candidates=current_candidates.unsqueeze(0),
-                target_predict=current_predict.unsqueeze(0),
-            )
-            
-            acc_len = int(acc_len_t.item())
-            bonus = int(bonus_t.item())
             
             # The tokens to append: accepted draft tokens (indices 1 to acc_len) + 1 bonus.
             proposed: List[int] = []
