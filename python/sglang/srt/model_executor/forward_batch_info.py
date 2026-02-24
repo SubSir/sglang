@@ -98,6 +98,9 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
+    # Used in DFlash ragged verify (EXTEND-style forward with ragged token counts)
+    DFLASH_VERIFY = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -108,6 +111,8 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.DRAFT_EXTEND
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DFLASH_VERIFY
+            or self == ForwardMode.DFLASH_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
         )
@@ -925,8 +930,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :num_tokens
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
-            elif self.forward_mode.is_target_verify():  # verify
+            elif self.forward_mode.is_target_verify():  # verify (fixed block)
                 num_tokens = bs * self.spec_info.draft_token_num
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :num_tokens
+                ]
+                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            elif self.forward_mode == ForwardMode.DFLASH_VERIFY:  # verify (ragged)
+                # Ragged verify uses EXTEND-style tokenization; actual token count is len(input_ids).
+                num_tokens = int(self.input_ids.shape[0])
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]

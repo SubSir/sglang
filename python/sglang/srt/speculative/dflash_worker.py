@@ -1,9 +1,11 @@
 import logging
 import math
+import os
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -21,9 +23,27 @@ from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
 )
+from sglang.srt.utils import is_hip, is_cuda
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+
+
+def _predict_acc_len_from_nll(token_nll: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
+    """Vectorized version of k_online._predict_acc_len_from_nll.
+
+    Args:
+        token_nll: [bs, num_pos]
+        thresholds: [bs, num_pos]
+
+    Returns:
+        acc_pred: [bs] int64 in [0, num_pos]
+    """
+
+    gt = token_nll > thresholds
+    any_gt = gt.any(dim=1)
+    first_idx = gt.to(torch.int64).argmax(dim=1)
+    return torch.where(any_gt, first_idx, torch.full_like(first_idx, token_nll.shape[1]))
+
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +217,54 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        # --- Buffers for k-online verify length prediction
+        self._k_online_sum_by_acc_buf: Optional[torch.Tensor] = None
+        self._k_online_count_by_acc_buf: Optional[torch.Tensor] = None
+        self._k_online_warmup_mask_buf: Optional[torch.Tensor] = None
+        self._k_online_thresholds_buf: Optional[torch.Tensor] = None
+        self._k_online_cap: int = 0
+
+        # --- Buffers for ragged verify flatten
+        self._verify_tokens_flat_buf: Optional[torch.Tensor] = None
+        self._verify_positions_flat_buf: Optional[torch.Tensor] = None
+        self._verify_flat_cap: int = 0
+
+        # --- K-online verify length prediction (batch-max verify for simplicity).
+        # Enable via env var to keep backwards compatibility.
+        self._k_online_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0")))
+        self._k_online_offset: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_OFFSET", "2"))
+        self._k_online_warmup_steps: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_WARMUP", "0"))
+
+        # --- Block verify vs ragged verify mode selection
+        # block_verify=1: use original block verify (TARGET_VERIFY + custom_mask)
+        # block_verify=0: use ragged verify (DFLASH_VERIFY)
+        # Note: k_online=1 implies ragged verify, so block_verify must also be 1
+        self._block_verify_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_BLOCK_VERIFY", "1")))
+
+        # Mutual exclusion check: k_online=1 requires block_verify=1 (ragged + k-online)
+        if self._k_online_enabled and not self._block_verify_enabled:
+            raise ValueError(
+                f"Invalid DFlash config: SGLANG_DFLASH_K_ONLINE=1 but SGLANG_DFLASH_BLOCK_VERIFY=0. "
+                f"k-online mode requires ragged verify, please set SGLANG_DFLASH_BLOCK_VERIFY=1."
+            )
+
+        # Determine actual verify mode:
+        # - k_online=1 -> ragged (k-online always uses ragged)
+        # - k_online=0, block_verify=1 -> block verify (original)
+        # - k_online=0, block_verify=0 -> ragged (no k-online prediction, just use block_size for all)
+        if self._k_online_enabled:
+            self._use_ragged_verify = True
+        else:
+            self._use_ragged_verify = not self._block_verify_enabled
+
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH verify mode: k_online=%s, block_verify=%s -> %s",
+                self._k_online_enabled,
+                self._block_verify_enabled,
+                "ragged" if self._use_ragged_verify else "block",
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -512,34 +580,139 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+
+        # --- 2.5) Sample draft tokens (and optionally token NLL for k-online)
+        if self._use_ragged_verify and self._k_online_enabled and int(self.block_size) > 1:
+            draft_next_flat, draft_nll_flat = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+                return_nll=True,
+            )
+            draft_next = draft_next_flat.view(bs, self.block_size - 1)
+            draft_token_nll = draft_nll_flat.view(bs, self.block_size - 1)
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+            draft_token_nll = None
+
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+
+        # --- 3) Choose verify path based on env
+        if not self._use_ragged_verify:
+            # ===== block verify (original) =====
+            positions = positions_2d.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=self.block_size,
+            )
+            _, build_custom_mask = self._resolve_verify_mask_policy()
+            verify_input.prepare_for_verify(
+                batch,
+                self.page_size,
+                build_custom_mask=build_custom_mask,
+            )
+
+            batch.forward_mode = (
+                ForwardMode.TARGET_VERIFY
+                if not batch.forward_mode.is_idle()
+                else ForwardMode.IDLE
+            )
+            batch.spec_info = verify_input
+            batch.return_hidden_states = False
+            return
+
+        # ===== ragged verify (DFLASH_VERIFY) =====
+        # 3a) Determine per-request verify length
+        if self._k_online_enabled and int(self.block_size) > 1:
+            num_pos = int(self.block_size) - 1
+            dtype = draft_hidden.dtype
+
+            # Ensure per-req running stats exist, then build thresholds batch
+            thresholds_batch = torch.full((bs, num_pos), float("inf"), device=self.device, dtype=dtype)
+            warmup_mask = torch.zeros((bs,), dtype=torch.bool, device=self.device)
+
+            for i, req in enumerate(batch.reqs):
+                if getattr(req, "k_online_sum_by_acc", None) is None:
+                    req.k_online_sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=self.device, dtype=dtype)
+                    req.k_online_count_by_acc = torch.zeros((num_pos + 1,), device=self.device, dtype=torch.int64)
+                    req.k_online_step = 0
+
+                if int(getattr(req, "k_online_step", 0)) < int(self._k_online_warmup_steps):
+                    warmup_mask[i] = True
+
+                c = req.k_online_count_by_acc[:num_pos].to(dtype)
+                has = c > 0
+                if bool(has.any().item()):
+                    diag = torch.diagonal(req.k_online_sum_by_acc[:num_pos, :num_pos]).to(dtype)
+                    thresholds_batch[i] = torch.where(has, diag / c.clamp_min(1.0), thresholds_batch[i])
+
+            if draft_token_nll is None:
+                raise RuntimeError("DFLASH k-online expected draft_token_nll, but got None.")
+            token_nll = draft_token_nll.to(dtype)
+
+            acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(torch.int64)
+            k = torch.minimum(
+                acc_pred + int(self._k_online_offset),
+                torch.full_like(acc_pred, num_pos, dtype=torch.int64),
+            )
+            verify_len_per_req = torch.where(
+                warmup_mask,
+                torch.full_like(k, int(self.block_size), dtype=torch.int64),
+                k + 1,
+            )
+        else:
+            verify_len_per_req = torch.full(
+                (bs,), int(self.block_size), device=self.device, dtype=torch.int64
+            )
+            token_nll = None
+
+        verify_len_cpu = verify_len_per_req.to(torch.int32).cpu()
+        vlen_list = verify_len_cpu.tolist()
+        total_verify_tokens = int(sum(vlen_list))
+        if total_verify_tokens <= 0:
+            raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
+
+        # 3b) Flatten tokens and build per-req offsets (CPU)
+        if self._verify_tokens_flat_buf is None or int(self._verify_flat_cap) < total_verify_tokens:
+            new_cap = max(total_verify_tokens, int(self._verify_flat_cap) * 2 if int(self._verify_flat_cap) > 0 else total_verify_tokens)
+            self._verify_tokens_flat_buf = torch.empty((new_cap,), dtype=torch.long, device=self.device)
+            self._verify_flat_cap = new_cap
+
+        verify_tokens_flat = self._verify_tokens_flat_buf[:total_verify_tokens]
+        verify_start_offsets_cpu = [0] * bs
+        pt = 0
+        for i, vlen in enumerate(vlen_list):
+            verify_start_offsets_cpu[i] = pt
+            v = int(vlen)
+            if v <= 0:
+                continue
+            verify_tokens_flat[pt : pt + v].copy_(draft_tokens[i, :v])
+            pt += v
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=verify_tokens_flat,
+            positions=None,  # IMPORTANT: let ForwardBatchInfo compute positions from extend_* to avoid RoPE mismatch
+            draft_token_num=int(self.block_size),
+            verify_token_lens=verify_len_cpu,
+            verify_start_offsets_cpu=verify_start_offsets_cpu,
         )
-        _, build_custom_mask = self._resolve_verify_mask_policy()
-        verify_input.prepare_for_verify(
-            batch,
-            self.page_size,
-            build_custom_mask=build_custom_mask,
-        )
+        # stash k-online nll for stats update in verify()
+        verify_input._k_online_token_nll = token_nll.detach() if token_nll is not None else None
 
-        batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if not batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
+        # 3c) Prepare batch for EXTEND-style ragged verify
+        verify_input.prepare_for_verify(batch, self.page_size)
+
+        batch.forward_mode = ForwardMode.DFLASH_VERIFY
+        batch.extend_seq_lens = vlen_list
+        batch.extend_prefix_lens = batch.seq_lens_cpu.tolist()
+        batch.extend_num_tokens = total_verify_tokens
         batch.spec_info = verify_input
-        batch.return_hidden_states = False
+        batch.return_hidden_states = True
 
     def _greedy_sample_from_vocab_parallel_head(
         self,

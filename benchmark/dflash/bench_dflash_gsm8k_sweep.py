@@ -329,10 +329,10 @@ def main() -> None:
     parser.add_argument("--num-shots", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--timeout-s", type=int, default=3600)
-    parser.add_argument("--mem-fraction-static", type=float, default=0.75)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.7)
     parser.add_argument("--disable-radix-cache", action="store_true")
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--max-running-requests", type=int, default=64)
+    parser.add_argument("--max-running-requests", type=int, default=128)
     parser.add_argument(
         "--tp-sizes",
         type=str,
@@ -342,7 +342,7 @@ def main() -> None:
     parser.add_argument(
         "--concurrencies",
         type=str,
-        default="1,2,4,8,16,32",
+        default="1,2,4,8,16,32,64,128",
         help="Comma-separated list of client concurrency levels.",
     )
     parser.add_argument(
@@ -354,7 +354,7 @@ def main() -> None:
     parser.add_argument(
         "--max-questions-per-config",
         type=int,
-        default=1024,
+        default=8192,
         help="Cap num_questions per (tp, concurrency) run (default: 1024).",
     )
     parser.add_argument(
@@ -404,10 +404,6 @@ def main() -> None:
 
     data_path = _maybe_download_gsm8k(args.data_path)
     lines = list(read_jsonl(data_path))
-    if len(lines) < max_questions:
-        raise RuntimeError(
-            f"GSM8K file only has {len(lines)} lines, but need {max_questions}."
-        )
 
     tokenizer = None
     if args.prompt_style == "chat":
@@ -421,13 +417,17 @@ def main() -> None:
 
     prompts: list[str] = []
     labels: list[int] = []
+    num_lines = len(lines)
+    if num_lines == 0:
+        raise RuntimeError("GSM8K file is empty.")
     for i in range(max_questions):
+        idx = i % num_lines
         if args.prompt_style == "fewshot_qa":
-            prompts.append(few_shot + _get_one_example(lines, i, False))
+            prompts.append(few_shot + _get_one_example(lines, idx, False))
         else:
             assert tokenizer is not None
             user_content = (
-                lines[i]["question"]
+                lines[idx]["question"]
                 + "\nPlease reason step by step, and put your final answer within \\boxed{}."
             )
             prompts.append(
@@ -438,7 +438,7 @@ def main() -> None:
                     enable_thinking=False,
                 )
             )
-        labels.append(_get_answer_value(lines[i]["answer"]))
+        labels.append(_get_answer_value(lines[idx]["answer"]))
     if not all(l != INVALID for l in labels):
         raise RuntimeError("Invalid labels in GSM8K data.")
 
@@ -475,9 +475,9 @@ def main() -> None:
             common_server_args.extend(
                 [
                     "--cuda-graph-bs",
-                    *[str(i) for i in range(1, 33)],
+                    *[str(i) for i in range(1, 129)],
                     "--cuda-graph-max-bs",
-                    "32",
+                    "128",
                 ]
             )
             if args.disable_radix_cache:
