@@ -420,37 +420,37 @@ class DFlashVerifyInput(SpecInput):
                 current_candidates = self.draft_token[logit_off : logit_off + vlen]
                 current_logits = logits_flat[logit_off : logit_off + vlen]
 
-                if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
-                    if torch.isnan(current_logits).any().item() or torch.isinf(current_logits).any().item():
-                        # Dump more metadata for target logits NaN
-                        sl_cpu = batch.seq_lens_cpu.tolist() if batch.seq_lens_cpu is not None else []
-                        sl_dev = batch.seq_lens.tolist()
-                        vlens = self.verify_token_lens.tolist() if self.verify_token_lens is not None else []
-                        oc_min = int(batch.out_cache_loc.min().item()) if batch.out_cache_loc.numel() > 0 else -1
-                        oc_max = int(batch.out_cache_loc.max().item()) if batch.out_cache_loc.numel() > 0 else -1
+                # if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
+                #     if torch.isnan(current_logits).any().item() or torch.isinf(current_logits).any().item():
+                #         # Dump more metadata for target logits NaN
+                #         sl_cpu = batch.seq_lens_cpu.tolist() if batch.seq_lens_cpu is not None else []
+                #         sl_dev = batch.seq_lens.tolist()
+                #         vlens = self.verify_token_lens.tolist() if self.verify_token_lens is not None else []
+                #         oc_min = int(batch.out_cache_loc.min().item()) if batch.out_cache_loc.numel() > 0 else -1
+                #         oc_max = int(batch.out_cache_loc.max().item()) if batch.out_cache_loc.numel() > 0 else -1
                         
-                        # Add positions info if available
-                        pos_info = ""
-                        if self.positions is not None:
-                            p_slice = self.positions[logit_off : logit_off + vlen]
-                            pos_info = f"explicit_pos_slice=[{int(p_slice.min().item())},{int(p_slice.max().item())}], pos_head={p_slice[:min(8, vlen)].cpu().tolist()}"
-                        else:
-                            pos_info = "explicit_pos=None (recomputed by FBInfo)"
+                #         # Add positions info if available
+                #         pos_info = ""
+                #         if self.positions is not None:
+                #             p_slice = self.positions[logit_off : logit_off + vlen]
+                #             pos_info = f"explicit_pos_slice=[{int(p_slice.min().item())},{int(p_slice.max().item())}], pos_head={p_slice[:min(8, vlen)].cpu().tolist()}"
+                #         else:
+                #             pos_info = "explicit_pos=None (recomputed by FBInfo)"
 
-                        raise RuntimeError(
-                            "DFLASH_NAN_GUARD: NaN/Inf in target logits during ragged verify. "
-                            f"req={i}, vlen={vlen}, logit_off={logit_off}, "
-                            f"batch_seq_lens_cpu={sl_cpu}, batch_seq_lens_dev={sl_dev}, "
-                            f"verify_token_lens={vlens}, out_cache_loc_range=[{oc_min},{oc_max}], "
-                            f"{pos_info}, candidates_head={current_candidates[:min(8, vlen)].cpu().tolist()}"
-                        )
+                #         raise RuntimeError(
+                #             "DFLASH_NAN_GUARD: NaN/Inf in target logits during ragged verify. "
+                #             f"req={i}, vlen={vlen}, logit_off={logit_off}, "
+                #             f"batch_seq_lens_cpu={sl_cpu}, batch_seq_lens_dev={sl_dev}, "
+                #             f"verify_token_lens={vlens}, out_cache_loc_range=[{oc_min},{oc_max}], "
+                #             f"{pos_info}, candidates_head={current_candidates[:min(8, vlen)].cpu().tolist()}"
+                #         )
 
                 current_predict = torch.argmax(current_logits, dim=-1)  # shape [vlen]
 
-                if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-                    print(f"[DFLASH DEBUG] req={i}, vlen={vlen}, logit_off={logit_off}")
-                    print(f"[DFLASH DEBUG]   candidates={current_candidates.cpu().tolist()}")
-                    print(f"[DFLASH DEBUG]   current_predict={current_predict.cpu().tolist()}")
+                # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
+                #     print(f"[DFLASH DEBUG] req={i}, vlen={vlen}, logit_off={logit_off}")
+                #     print(f"[DFLASH DEBUG]   candidates={current_candidates.cpu().tolist()}")
+                #     print(f"[DFLASH DEBUG]   current_predict={current_predict.cpu().tolist()}")
 
                 # Ensure target_predict has the same shape as candidates.
                 # `current_predict` is already length vlen, so no extra padding is needed.

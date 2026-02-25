@@ -578,31 +578,31 @@ class DFlashWorker:
                     forward_batch
                 ).logits_output
 
-                if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-                    print(f"[DFLASH DEBUG] draft_hidden: mean={draft_hidden.mean().item():.4f}, std={draft_hidden.std().item():.4f}, has_nan={torch.isnan(draft_hidden).any().item()}")
+                # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
+                #     print(f"[DFLASH DEBUG] draft_hidden: mean={draft_hidden.mean().item():.4f}, std={draft_hidden.std().item():.4f}, has_nan={torch.isnan(draft_hidden).any().item()}")
 
-                if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
-                    if torch.isnan(draft_hidden).any().item() or torch.isinf(draft_hidden).any().item():
-                        # Dump minimal metadata to diagnose position/KV-index issues.
-                        pos_min = int(positions.min().item()) if positions.numel() > 0 else -1
-                        pos_max = int(positions.max().item()) if positions.numel() > 0 else -1
-                        pl_min = int(prefix_lens.min().item()) if prefix_lens.numel() > 0 else -1
-                        pl_max = int(prefix_lens.max().item()) if prefix_lens.numel() > 0 else -1
-                        oc_min = int(block_cache_loc.min().item()) if block_cache_loc.numel() > 0 else -1
-                        oc_max = int(block_cache_loc.max().item()) if block_cache_loc.numel() > 0 else -1
+                # if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
+                #     if torch.isnan(draft_hidden).any().item() or torch.isinf(draft_hidden).any().item():
+                #         # Dump minimal metadata to diagnose position/KV-index issues.
+                #         pos_min = int(positions.min().item()) if positions.numel() > 0 else -1
+                #         pos_max = int(positions.max().item()) if positions.numel() > 0 else -1
+                #         pl_min = int(prefix_lens.min().item()) if prefix_lens.numel() > 0 else -1
+                #         pl_max = int(prefix_lens.max().item()) if prefix_lens.numel() > 0 else -1
+                #         oc_min = int(block_cache_loc.min().item()) if block_cache_loc.numel() > 0 else -1
+                #         oc_max = int(block_cache_loc.max().item()) if block_cache_loc.numel() > 0 else -1
                         
-                        # Check req_to_token mapping for one req
-                        req_idx = 0
-                        token_pool = self.draft_model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[req_idx]]
-                        relevant_tokens = token_pool[block_start[req_idx]:block_end[req_idx]]
+                #         # Check req_to_token mapping for one req
+                #         req_idx = 0
+                #         token_pool = self.draft_model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[req_idx]]
+                #         relevant_tokens = token_pool[block_start[req_idx]:block_end[req_idx]]
                         
-                        raise RuntimeError(
-                            "DFLASH_NAN_GUARD: NaN/Inf in draft_hidden. "
-                            f"bs={bs}, block_size={int(self.block_size)}, seq_lens_sum={seq_lens_sum}, "
-                            f"prefix_lens=[{pl_min},{pl_max}], positions=[{pos_min},{pos_max}], "
-                            f"block_cache_loc=[{oc_min},{oc_max}], "
-                            f"req0_pool_sample={relevant_tokens.cpu().tolist()}"
-                        )
+                #         raise RuntimeError(
+                #             "DFLASH_NAN_GUARD: NaN/Inf in draft_hidden. "
+                #             f"bs={bs}, block_size={int(self.block_size)}, seq_lens_sum={seq_lens_sum}, "
+                #             f"prefix_lens=[{pl_min},{pl_max}], positions=[{pos_min},{pos_max}], "
+                #             f"block_cache_loc=[{oc_min},{oc_max}], "
+                #             f"req0_pool_sample={relevant_tokens.cpu().tolist()}"
+                #         )
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -629,11 +629,11 @@ class DFlashWorker:
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-            print(f"[DFLASH DEBUG] draft_next: min={draft_next.min().item()}, max={draft_next.max().item()}, zero_ratio={(draft_next == 0).float().mean().item():.4f}")
-            print(f"[DFLASH DEBUG] block_ids[:,0]: min={block_ids[:,0].min().item()}, max={block_ids[:,0].max().item()}")
-            for i in range(min(3, bs)):
-                print(f"[DFLASH DEBUG] draft_tokens[{i}] = {draft_tokens[i].cpu().tolist()}")
+        # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
+        #     print(f"[DFLASH DEBUG] draft_next: min={draft_next.min().item()}, max={draft_next.max().item()}, zero_ratio={(draft_next == 0).float().mean().item():.4f}")
+        #     print(f"[DFLASH DEBUG] block_ids[:,0]: min={block_ids[:,0].min().item()}, max={block_ids[:,0].max().item()}")
+        #     for i in range(min(3, bs)):
+        #         print(f"[DFLASH DEBUG] draft_tokens[{i}] = {draft_tokens[i].cpu().tolist()}")
 
         # --- 3) Choose verify path based on env
         if not self._use_ragged_verify:
@@ -742,10 +742,10 @@ class DFlashWorker:
             verify_tokens_flat[pt : pt + v].copy_(draft_tokens[i, :v])
             pt += v
 
-        if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-            print(f"[DFLASH DEBUG] verify_flat: total={total_verify_tokens}, head={verify_tokens_flat[:min(32, total_verify_tokens)].cpu().tolist()}")
-            for i in range(min(3, bs)):
-                print(f"[DFLASH DEBUG] verify vlen[{i}]={int(vlen_list[i])}, start={verify_start_offsets_cpu[i]}, draft_tokens[{i},:vlen] = {draft_tokens[i, :int(vlen_list[i])].cpu().tolist()}")
+        # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
+        #     print(f"[DFLASH DEBUG] verify_flat: total={total_verify_tokens}, head={verify_tokens_flat[:min(32, total_verify_tokens)].cpu().tolist()}")
+        #     for i in range(min(3, bs)):
+        #         print(f"[DFLASH DEBUG] verify vlen[{i}]={int(vlen_list[i])}, start={verify_start_offsets_cpu[i]}, draft_tokens[{i},:vlen] = {draft_tokens[i, :int(vlen_list[i])].cpu().tolist()}")
 
         if explicit_pos:
             # Old behavior: explicitly flatten positions to avoid relying on ForwardBatchInfo.
