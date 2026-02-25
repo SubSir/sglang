@@ -528,14 +528,6 @@ class DFlashVerifyInput(SpecInput):
                 acc_true = max(0, appended - 1)
                 accept_length_per_req_cpu.append(acc_true)
 
-                # Some Req implementations may not initialize speculative metrics; be defensive.
-                if not hasattr(req, "spec_verify_ct"):
-                    req.spec_verify_ct = 0
-                if not hasattr(req, "spec_accepted_tokens"):
-                    req.spec_accepted_tokens = 0
-                if not hasattr(req, "spec_verify_tokens"):
-                    req.spec_verify_tokens = 0
-
                 req.spec_verify_ct += 1
                 req.spec_accepted_tokens += acc_true
                 req.spec_verify_tokens += vlen
@@ -718,6 +710,7 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            req.spec_verify_tokens += self.draft_token_num
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(
