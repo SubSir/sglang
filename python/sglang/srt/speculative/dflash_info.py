@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import torch
-
+import os
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -132,6 +132,9 @@ class DFlashVerifyInput(SpecInput):
     # ragged verify：CPU 上的 per-req 起始 offset（len == bs）
     verify_start_offsets_cpu: Optional[List[int]] = None
 
+    # ragged verify: the extend_start_loc calculated by ForwardBatchInfo, used to slice logits
+    verify_extend_start_loc: Optional[torch.Tensor] = None
+
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
@@ -175,8 +178,20 @@ class DFlashVerifyInput(SpecInput):
         batch.input_ids = self.draft_token
 
         # ragged verify：不覆盖 batch.positions，让 ForwardBatchInfo 用 extend_* 字段计算
-        if self.positions is not None:
-            batch.positions = self.positions
+        # if self.positions is not None:
+        batch.positions = self.positions
+
+        # Defensive checks: if scheduler enters DFLASH_VERIFY mode, ragged metadata must be present.
+        if batch.forward_mode.name == "DFLASH_VERIFY":
+            if not self._is_ragged_verify():
+                raise RuntimeError(
+                    "DFLASH_VERIFY forward requires ragged metadata, but verify_token_lens is empty. "
+                    "This can lead to invalid attention indices and GPU faults."
+                )
+            if self.verify_start_offsets_cpu is None or len(self.verify_start_offsets_cpu) != bs:
+                raise RuntimeError(
+                    "DFLASH_VERIFY forward requires verify_start_offsets_cpu with length == batch_size."
+                )
 
         if self._is_ragged_verify():
             # --- ragged verify path
@@ -404,26 +419,64 @@ class DFlashVerifyInput(SpecInput):
 
                 current_candidates = self.draft_token[offset : offset + vlen]
 
-                if vlen < 2:
-                    current_logits = logits_flat[offset : offset + vlen]
-                    current_predict = torch.argmax(current_logits, dim=-1)
-                    acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
-                        candidates=current_candidates.unsqueeze(0),
-                        target_predict=current_predict.unsqueeze(0),
-                    )
-                    acc_len = int(acc_len_t.item())
-                    bonus = int(bonus_t.item())
-                else:
-                    current_logits = logits_flat[offset : offset + vlen - 1]
-                    current_predict = torch.argmax(current_logits, dim=-1)
-                    pad = current_predict.new_full((1,), int(current_predict[-1]))
-                    current_predict_padded = torch.cat([current_predict, pad], dim=0)
-                    acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
-                        candidates=current_candidates.unsqueeze(0),
-                        target_predict=current_predict_padded.unsqueeze(0),
-                    )
-                    acc_len = int(acc_len_t.item())
-                    bonus = int(bonus_t.item())
+                # Use extend_start_loc to correctly slice logits for each request.
+                # extend_start_loc[i] is the start index in the flattened logits tensor for request i.
+                # Each token position t in the request corresponds to logits at index extend_start_loc[i] + t,
+                # which predicts the token at position t+1.
+                # if self.verify_extend_start_loc is not None:
+                #     logit_off = int(self.verify_extend_start_loc[i].item())
+                # else:
+                    # Fallback to draft token offset if extend_start_loc is not available (should not happen in normal flow)
+                logit_off = offset
+
+                # A-scheme: mirror original DFlash spec.
+                # logits_flat[logit_off + j] is the prediction made after seeing candidates[j].
+                # We compare candidates[1:] with current_predict[:-1].
+                logits_len = vlen
+                current_logits = logits_flat[logit_off : logit_off + logits_len]
+
+                if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
+                    if torch.isnan(current_logits).any().item() or torch.isinf(current_logits).any().item():
+                        # Dump more metadata for target logits NaN
+                        sl_cpu = batch.seq_lens_cpu.tolist() if batch.seq_lens_cpu is not None else []
+                        sl_dev = batch.seq_lens.tolist()
+                        vlens = self.verify_token_lens.tolist() if self.verify_token_lens is not None else []
+                        oc_min = int(batch.out_cache_loc.min().item()) if batch.out_cache_loc.numel() > 0 else -1
+                        oc_max = int(batch.out_cache_loc.max().item()) if batch.out_cache_loc.numel() > 0 else -1
+                        
+                        # Add positions info if available
+                        pos_info = ""
+                        if self.positions is not None:
+                            p_slice = self.positions[offset : offset + vlen]
+                            pos_info = f"explicit_pos_slice=[{int(p_slice.min().item())},{int(p_slice.max().item())}], pos_head={p_slice[:min(8, vlen)].cpu().tolist()}"
+                        else:
+                            pos_info = "explicit_pos=None (recomputed by FBInfo)"
+
+                        raise RuntimeError(
+                            "DFLASH_NAN_GUARD: NaN/Inf in target logits during ragged verify. "
+                            f"req={i}, vlen={vlen}, logit_off={logit_off}, logits_len={logits_len}, "
+                            f"batch_seq_lens_cpu={sl_cpu}, batch_seq_lens_dev={sl_dev}, "
+                            f"verify_token_lens={vlens}, out_cache_loc_range=[{oc_min},{oc_max}], "
+                            f"{pos_info}, candidates_head={current_candidates[:min(8, vlen)].cpu().tolist()}"
+                        )
+
+                current_predict = torch.argmax(current_logits, dim=-1)  # shape [vlen]
+
+                if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
+                    print(f"[DFLASH DEBUG] req={i}, vlen={vlen}, logit_off={logit_off}, logits_len={logits_len}")
+                    print(f"[DFLASH DEBUG]   candidates={current_candidates.cpu().tolist()}")
+                    print(f"[DFLASH DEBUG]   current_predict={current_predict.cpu().tolist()}")
+
+                # Ensure target_predict has the same shape as candidates.
+                # `current_predict` is already length vlen, so no extra padding is needed.
+                target_predict = current_predict
+
+                acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
+                    candidates=current_candidates.unsqueeze(0),
+                    target_predict=target_predict.unsqueeze(0),
+                )
+                acc_len = int(acc_len_t.item())
+                bonus = int(bonus_t.item())
 
                 proposed: List[int] = []
                 if acc_len > 0:
@@ -490,6 +543,14 @@ class DFlashVerifyInput(SpecInput):
                 acc_true = max(0, appended - 1)
                 accept_length_per_req_cpu.append(acc_true)
 
+                # Some Req implementations may not initialize speculative metrics; be defensive.
+                if not hasattr(req, "spec_verify_ct"):
+                    req.spec_verify_ct = 0
+                if not hasattr(req, "spec_accepted_tokens"):
+                    req.spec_accepted_tokens = 0
+                if not hasattr(req, "spec_verify_tokens"):
+                    req.spec_verify_tokens = 0
+
                 req.spec_verify_ct += 1
                 req.spec_accepted_tokens += acc_true
                 req.spec_verify_tokens += vlen
@@ -514,6 +575,15 @@ class DFlashVerifyInput(SpecInput):
 
             if page_size == 1:
                 out_cache_loc = batch.out_cache_loc
+                # Consistency check
+                if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
+                    total_vlen_expected = sum(vlen_list)
+                    if out_cache_loc.numel() != total_vlen_expected:
+                        raise RuntimeError(
+                            f"DFLASH KV Consistency Error: batch.out_cache_loc.numel() ({out_cache_loc.numel()}) "
+                            f"!= sum(vlen_list) ({total_vlen_expected}). vlen_list={vlen_list}"
+                        )
+
                 to_free_chunks, kept_chunks = [], []
                 curr = 0
                 for i, vlen in enumerate(vlen_list):
@@ -522,6 +592,7 @@ class DFlashVerifyInput(SpecInput):
                     if vlen > committed:
                         to_free_chunks.append(out_cache_loc[curr + committed : curr + vlen])
                     curr += vlen
+                
                 if to_free_chunks:
                     batch.token_to_kv_pool_allocator.free(torch.cat(to_free_chunks))
                 batch.out_cache_loc = torch.cat(kept_chunks) if kept_chunks else out_cache_loc[:0]

@@ -428,6 +428,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         device = model_runner.device
 
+
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
@@ -485,6 +486,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
+            # Allow DFLASH_VERIFY to use explicit positions from spec_info
             ret.positions = ret.spec_info.positions
 
         # Init position information
@@ -507,8 +509,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
             )
+            # For DFLASH_VERIFY (ragged verify), we prefer explicit positions from spec_info if available.
             if ret.positions is None:
                 ret.positions = positions
+
+            # Record extend_start_loc for DFLASH_VERIFY to enable correct logits slicing in verify()
+            if ret.forward_mode == ForwardMode.DFLASH_VERIFY and ret.spec_info is not None:
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+                if isinstance(ret.spec_info, DFlashVerifyInput):
+                    ret.spec_info.verify_extend_start_loc = ret.extend_start_loc
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
