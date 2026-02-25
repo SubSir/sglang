@@ -1862,6 +1862,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                meta_info["spec_verify_tokens"] = recv_obj.spec_verify_tokens[i]
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
