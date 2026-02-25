@@ -580,6 +580,7 @@ def main() -> None:
             port_base = find_available_port(20000)
 
             common_server_args: list[str] = [
+                # "--disable-cuda-graph",
                 "--trust-remote-code",
                 "--attention-backend",
                 backend,

@@ -112,7 +112,6 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.DFLASH_VERIFY
-            or self == ForwardMode.DFLASH_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
         )
@@ -141,7 +140,7 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     def is_target_verify(self):
-        return self == ForwardMode.TARGET_VERIFY
+        return self == ForwardMode.TARGET_VERIFY or self == ForwardMode.DFLASH_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
         return self == ForwardMode.DRAFT_EXTEND or (
@@ -490,7 +489,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        if ret.forward_mode.is_decode() or ret.forward_mode == ForwardMode.TARGET_VERIFY:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:

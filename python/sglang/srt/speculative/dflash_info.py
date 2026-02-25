@@ -178,8 +178,8 @@ class DFlashVerifyInput(SpecInput):
         batch.input_ids = self.draft_token
 
         # ragged verify：不覆盖 batch.positions，让 ForwardBatchInfo 用 extend_* 字段计算
-        # if self.positions is not None:
-        batch.positions = self.positions
+        if self.positions is not None:
+            batch.positions = self.positions
 
         # Defensive checks: if scheduler enters DFLASH_VERIFY mode, ragged metadata must be present.
         if batch.forward_mode.name == "DFLASH_VERIFY":
@@ -415,25 +415,10 @@ class DFlashVerifyInput(SpecInput):
 
             for i, req in enumerate(batch.reqs):
                 vlen = int(vlen_list[i])
-                offset = int(start_offsets[i])
+                logit_off = int(start_offsets[i])
 
-                current_candidates = self.draft_token[offset : offset + vlen]
-
-                # Use extend_start_loc to correctly slice logits for each request.
-                # extend_start_loc[i] is the start index in the flattened logits tensor for request i.
-                # Each token position t in the request corresponds to logits at index extend_start_loc[i] + t,
-                # which predicts the token at position t+1.
-                # if self.verify_extend_start_loc is not None:
-                #     logit_off = int(self.verify_extend_start_loc[i].item())
-                # else:
-                    # Fallback to draft token offset if extend_start_loc is not available (should not happen in normal flow)
-                logit_off = offset
-
-                # A-scheme: mirror original DFlash spec.
-                # logits_flat[logit_off + j] is the prediction made after seeing candidates[j].
-                # We compare candidates[1:] with current_predict[:-1].
-                logits_len = vlen
-                current_logits = logits_flat[logit_off : logit_off + logits_len]
+                current_candidates = self.draft_token[logit_off : logit_off + vlen]
+                current_logits = logits_flat[logit_off : logit_off + vlen]
 
                 if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
                     if torch.isnan(current_logits).any().item() or torch.isinf(current_logits).any().item():
@@ -447,14 +432,14 @@ class DFlashVerifyInput(SpecInput):
                         # Add positions info if available
                         pos_info = ""
                         if self.positions is not None:
-                            p_slice = self.positions[offset : offset + vlen]
+                            p_slice = self.positions[logit_off : logit_off + vlen]
                             pos_info = f"explicit_pos_slice=[{int(p_slice.min().item())},{int(p_slice.max().item())}], pos_head={p_slice[:min(8, vlen)].cpu().tolist()}"
                         else:
                             pos_info = "explicit_pos=None (recomputed by FBInfo)"
 
                         raise RuntimeError(
                             "DFLASH_NAN_GUARD: NaN/Inf in target logits during ragged verify. "
-                            f"req={i}, vlen={vlen}, logit_off={logit_off}, logits_len={logits_len}, "
+                            f"req={i}, vlen={vlen}, logit_off={logit_off}, "
                             f"batch_seq_lens_cpu={sl_cpu}, batch_seq_lens_dev={sl_dev}, "
                             f"verify_token_lens={vlens}, out_cache_loc_range=[{oc_min},{oc_max}], "
                             f"{pos_info}, candidates_head={current_candidates[:min(8, vlen)].cpu().tolist()}"
@@ -463,7 +448,7 @@ class DFlashVerifyInput(SpecInput):
                 current_predict = torch.argmax(current_logits, dim=-1)  # shape [vlen]
 
                 if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-                    print(f"[DFLASH DEBUG] req={i}, vlen={vlen}, logit_off={logit_off}, logits_len={logits_len}")
+                    print(f"[DFLASH DEBUG] req={i}, vlen={vlen}, logit_off={logit_off}")
                     print(f"[DFLASH DEBUG]   candidates={current_candidates.cpu().tolist()}")
                     print(f"[DFLASH DEBUG]   current_predict={current_predict.cpu().tolist()}")
 
@@ -556,7 +541,7 @@ class DFlashVerifyInput(SpecInput):
                 req.spec_verify_tokens += vlen
 
                 if hidden_flat is not None:
-                    segments_hidden.append(hidden_flat[offset : offset + appended])
+                    segments_hidden.append(hidden_flat[logit_off : logit_off + appended])
 
                 # Update k-online stats if present
                 if hasattr(self, "_k_online_token_nll") and getattr(self, "_k_online_token_nll") is not None:

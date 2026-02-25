@@ -551,7 +551,7 @@ class DFlashWorker:
             # In this mode, `seq_lens` stores the prefix lengths; attention backends
             # derive kv_len by adding `draft_token_num`.
             draft_spec_info = self._draft_block_spec_info
-            draft_spec_info.positions = positions
+            # draft_spec_info.positions = positions
             seq_lens = prefix_lens
             seq_lens_sum = int(batch.seq_lens_sum)
             forward_batch = ForwardBatch(
@@ -662,7 +662,7 @@ class DFlashWorker:
 
         # ===== ragged verify (DFLASH_VERIFY) =====
         # Optional: explicitly pass positions (old behavior) to avoid relying on ForwardBatchInfo
-        explicit_pos = os.environ.get("SGLANG_DFLASH_RAGGED_EXPLICIT_POS", "1") == "1"
+        explicit_pos = os.environ.get("SGLANG_DFLASH_RAGGED_EXPLICIT_POS", "0") == "1"
         # 3a) Determine per-request verify length
         if self._k_online_enabled and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
