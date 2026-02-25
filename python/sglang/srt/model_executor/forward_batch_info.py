@@ -164,6 +164,7 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DFLASH_VERIFY
             or self == ForwardMode.IDLE
             or self == ForwardMode.DLLM_EXTEND
         )
@@ -427,7 +428,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         device = model_runner.device
 
-
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
@@ -489,7 +489,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode == ForwardMode.TARGET_VERIFY:
+        if (
+            ret.forward_mode.is_decode()
+            or ret.forward_mode == ForwardMode.TARGET_VERIFY
+        ):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
@@ -513,8 +516,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
 
             # Record extend_start_loc for DFLASH_VERIFY to enable correct logits slicing in verify()
-            if ret.forward_mode == ForwardMode.DFLASH_VERIFY and ret.spec_info is not None:
+            if (
+                ret.forward_mode == ForwardMode.DFLASH_VERIFY
+                and ret.spec_info is not None
+            ):
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
                 if isinstance(ret.spec_info, DFlashVerifyInput):
                     ret.spec_info.verify_extend_start_loc = ret.extend_start_loc
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens

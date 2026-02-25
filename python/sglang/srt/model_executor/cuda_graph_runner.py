@@ -296,6 +296,49 @@ class CudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
+
+        # For DFlash, we need a special cuda graph capture strategy
+        # DFlash verify needs to capture two sets of shapes:
+        # 1. block_size * (1, 2, ..., max_concurrency) - fixed block_size, varying concurrency
+        # 2. max_concurrency * (1, 2, 3, ..., block_size) - fixed max_concurrency, varying block_size
+        if (
+            model_runner.spec_algorithm.is_dflash()
+            and not self.model_runner.is_draft_worker
+        ):
+            self._dflash_cuda_graph_mode = True
+            self._dflash_block_size = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
+            # Calculate max concurrency
+            self._dflash_max_concurrency = max(self.capture_bs)
+
+            # Add extra capture batch sizes for DFlash verify
+            # Second set of shapes: max_concurrency * (1, 2, 3, ..., block_size)
+            # The corresponding batch sizes are: max_concurrency * b / block_size (b = 1, 2, ..., block_size)
+            # Since our capture_bs is batch size not token count, we need to add extra batch sizes
+            # For ragged verify, we need to capture different token counts
+            # So we extend capture_bs to include extra batch sizes
+            # These batch sizes correspond to: max_concurrency * b / block_size rounded up
+            import math
+
+            max_conc = self._dflash_max_concurrency
+            block_size = self._dflash_block_size
+            extra_bs = set()
+            for b in range(1, block_size + 1):
+                # Calculate the corresponding batch size (rounded up)
+                extra_bs.add(math.ceil(max_conc * b / block_size))
+
+            # Merge and re-sort
+            self.capture_bs = sorted(set(self.capture_bs) | extra_bs)
+            self.capture_bs = [
+                bs
+                for bs in self.capture_bs
+                if bs <= model_runner.req_to_token_pool.size
+            ]
+        else:
+            self._dflash_cuda_graph_mode = False
+            self._dflash_block_size = 1
+            self._dflash_max_concurrency = 1
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -405,15 +448,21 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        # For DFlash verify, we need special cuda graph support check
+        if forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY:
+            # DFlash verify uses padding to the nearest cuda graph shape
+            # As long as batch_size <= max_bs, cuda graph can be used
+            is_bs_supported = cuda_graph_bs <= self.max_bs
+        else:
+            graph_key = cuda_graph_bs
+            if self.enable_pdmux:
+                graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
-        is_bs_supported = (
-            graph_key in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+            is_bs_supported = (
+                graph_key in self.graphs
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+            )
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -800,7 +849,17 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        # For DFlash verify, we need to use the actual token count instead of raw_bs * num_tokens_per_bs
+        # because ragged verify token count may be less than block_size * bs
+        if (
+            forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY
+            and forward_batch.spec_info is not None
+        ):
+            # Use the actual input_ids count as raw_num_token
+            raw_num_token = len(forward_batch.input_ids)
+        else:
+            raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
         if self.require_mlp_tp_gather:
@@ -962,10 +1021,22 @@ class CudaGraphRunner:
                 "TRTLLMHAAttnBackend",
                 "TRTLLMMLABackend",
             }
+
+            # For DFlash, we need to compute cuda graph shapes
+            # Note: num_tokens here is the total token count (bs * num_tokens_per_bs)
+            # For ragged verify, we need to capture multiple shapes
+            block_size = self.model_runner.server_args.speculative_num_draft_tokens
+            max_concurrency = num_tokens // block_size if block_size > 0 else 1
+
+            # Compute cuda graph shapes and store in spec_info for later use
+            cuda_graph_shapes = DFlashVerifyInput.get_cuda_graph_verify_shapes(
+                block_size, max_concurrency
+            )
+
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=block_size,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or skip_custom_mask)
@@ -976,7 +1047,15 @@ class CudaGraphRunner:
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
+                # Store cuda graph shapes for runtime use
+                verify_token_lens=torch.empty(
+                    (0,), dtype=torch.int32, device=self.device
+                ),
             )
+            # Attach cuda_graph_shapes to spec_info for runtime access
+            spec_info._cuda_graph_shapes = cuda_graph_shapes
+            spec_info._block_size = block_size
+            spec_info._max_concurrency = max_concurrency
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -1023,3 +1102,4 @@ class DeepEPCudaGraphRunnerAdapter:
             return
         assert self._captured_deepep_mode is not None
         DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
+        # Record DeepEP mode used during capture to ensure replay consistency

@@ -437,9 +437,7 @@ def main() -> None:
         help="Write a markdown report to this file (disabled by default).",
     )
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
-    parser.add_argument(
-        "--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16"
-    )
+    parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
     parser.add_argument(
         "--skip-baseline",
         action="store_true",
@@ -503,6 +501,11 @@ def main() -> None:
         default="flashinfer,fa3",
         help="Comma-separated list. Will auto-skip fa3 on Blackwell/SM<90.",
     )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help="Disable CUDA graph optimization.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -551,7 +554,7 @@ def main() -> None:
         raise ValueError("Either --data-name or --data-names must be provided.")
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model)
-    
+
     # Pre-load all datasets and prompts
     dataset_prompts = {}
     for dname in data_names:
@@ -580,7 +583,6 @@ def main() -> None:
             port_base = find_available_port(20000)
 
             common_server_args: list[str] = [
-                # "--disable-cuda-graph",
                 "--trust-remote-code",
                 "--attention-backend",
                 backend,
@@ -593,14 +595,17 @@ def main() -> None:
                 "--max-running-requests",
                 str(args.max_running_requests),
             ]
-            common_server_args.extend(
-                [
-                    "--cuda-graph-bs",
-                    *[str(i) for i in range(1, 129)],
-                    "--cuda-graph-max-bs",
-                    "128",
-                ]
-            )
+            if args.disable_cuda_graph:
+                common_server_args.append("--disable-cuda-graph")
+            else:
+                common_server_args.extend(
+                    [
+                        "--cuda-graph-bs",
+                        *[str(i) for i in range(1, 129)],
+                        "--cuda-graph-max-bs",
+                        "128",
+                    ]
+                )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
 
@@ -641,7 +646,9 @@ def main() -> None:
                                 timeout_s=int(args.timeout_s),
                                 expect_dflash=False,
                             )
-                            baseline_toks[(backend, tp, dname, conc)] = metrics.output_toks_per_s
+                            baseline_toks[(backend, tp, dname, conc)] = (
+                                metrics.output_toks_per_s
+                            )
                             baseline_acc[(backend, tp, dname, conc)] = metrics.accuracy
                             print(
                                 f"[{dname} baseline] conc={conc:>2} n={n:<4} "
@@ -695,9 +702,15 @@ def main() -> None:
                             timeout_s=int(args.timeout_s),
                             expect_dflash=True,
                         )
-                        dflash_toks[(backend, tp, dname, conc)] = metrics.output_toks_per_s
-                        dflash_accept_len[(backend, tp, dname, conc)] = metrics.spec_accept_length
-                        dflash_verify_tokens[(backend, tp, dname, conc)] = metrics.spec_verify_tokens_sum
+                        dflash_toks[(backend, tp, dname, conc)] = (
+                            metrics.output_toks_per_s
+                        )
+                        dflash_accept_len[(backend, tp, dname, conc)] = (
+                            metrics.spec_accept_length
+                        )
+                        dflash_verify_tokens[(backend, tp, dname, conc)] = (
+                            metrics.spec_verify_tokens_sum
+                        )
                         dflash_acc[(backend, tp, dname, conc)] = metrics.accuracy
                         print(
                             f"[{dname} DFLASH]   conc={conc:>2} n={n:<4} "
@@ -803,7 +816,9 @@ def main() -> None:
                     tp_sizes=tp_sizes,
                     concurrencies=concurrencies,
                     values={
-                        (tp, conc): dflash_accept_len.get((backend, tp, dname, conc), None)
+                        (tp, conc): dflash_accept_len.get(
+                            (backend, tp, dname, conc), None
+                        )
                         for tp in tp_sizes
                         for conc in concurrencies
                     },
@@ -846,7 +861,9 @@ def main() -> None:
                 tp_sizes=tp_sizes,
                 concurrencies=concurrencies,
                 values={
-                    (tp, conc): dflash_verify_tokens.get((backend, tp, dname, conc), None)
+                    (tp, conc): dflash_verify_tokens.get(
+                        (backend, tp, dname, conc), None
+                    )
                     for tp in tp_sizes
                     for conc in concurrencies
                 },

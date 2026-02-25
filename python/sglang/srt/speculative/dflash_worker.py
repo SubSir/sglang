@@ -28,7 +28,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
 
-def _predict_acc_len_from_nll(token_nll: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
+def _predict_acc_len_from_nll(
+    token_nll: torch.Tensor, thresholds: torch.Tensor
+) -> torch.Tensor:
     """Vectorized version of k_online._predict_acc_len_from_nll.
 
     Args:
@@ -42,7 +44,9 @@ def _predict_acc_len_from_nll(token_nll: torch.Tensor, thresholds: torch.Tensor)
     gt = token_nll > thresholds
     any_gt = gt.any(dim=1)
     first_idx = gt.to(torch.int64).argmax(dim=1)
-    return torch.where(any_gt, first_idx, torch.full_like(first_idx, token_nll.shape[1]))
+    return torch.where(
+        any_gt, first_idx, torch.full_like(first_idx, token_nll.shape[1])
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -233,15 +237,23 @@ class DFlashWorker:
 
         # --- K-online verify length prediction (batch-max verify for simplicity).
         # Enable via env var to keep backwards compatibility.
-        self._k_online_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0")))
-        self._k_online_offset: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_OFFSET", "2"))
-        self._k_online_warmup_steps: int = int(os.environ.get("SGLANG_DFLASH_K_ONLINE_WARMUP", "0"))
+        self._k_online_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0"))
+        )
+        self._k_online_offset: int = int(
+            os.environ.get("SGLANG_DFLASH_K_ONLINE_OFFSET", "2")
+        )
+        self._k_online_warmup_steps: int = int(
+            os.environ.get("SGLANG_DFLASH_K_ONLINE_WARMUP", "0")
+        )
 
         # --- Block verify vs ragged verify mode selection
         # SGLANG_DFLASH_BLOCK_VERIFY=1: use original block verify (TARGET_VERIFY + custom_mask)
         # SGLANG_DFLASH_BLOCK_VERIFY=0: use ragged verify (DFLASH_VERIFY)
         # Note: k_online=1 implies ragged verify, so block_verify must be 0
-        self._block_verify_enabled: bool = bool(int(os.environ.get("SGLANG_DFLASH_BLOCK_VERIFY", "1")))
+        self._block_verify_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_BLOCK_VERIFY", "1"))
+        )
 
         # Mutual exclusion check: k_online=1 and block_verify=1 are contradictory
         if self._k_online_enabled and self._block_verify_enabled:
@@ -590,12 +602,12 @@ class DFlashWorker:
                 #         pl_max = int(prefix_lens.max().item()) if prefix_lens.numel() > 0 else -1
                 #         oc_min = int(block_cache_loc.min().item()) if block_cache_loc.numel() > 0 else -1
                 #         oc_max = int(block_cache_loc.max().item()) if block_cache_loc.numel() > 0 else -1
-                        
+
                 #         # Check req_to_token mapping for one req
                 #         req_idx = 0
                 #         token_pool = self.draft_model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[req_idx]]
                 #         relevant_tokens = token_pool[block_start[req_idx]:block_end[req_idx]]
-                        
+
                 #         raise RuntimeError(
                 #             "DFLASH_NAN_GUARD: NaN/Inf in draft_hidden. "
                 #             f"bs={bs}, block_size={int(self.block_size)}, seq_lens_sum={seq_lens_sum}, "
@@ -610,17 +622,27 @@ class DFlashWorker:
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
         # --- 2.5) Sample draft tokens (and optionally token NLL for k-online)
-        if self._use_ragged_verify and self._k_online_enabled and int(self.block_size) > 1:
-            draft_next_flat, draft_nll_flat = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-                lm_head=lm_head,
-                return_nll=True,
+        if (
+            self._use_ragged_verify
+            and self._k_online_enabled
+            and int(self.block_size) > 1
+        ):
+            draft_next_flat, draft_nll_flat = (
+                self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                    return_nll=True,
+                )
             )
             draft_next = draft_next_flat.view(bs, self.block_size - 1)
             draft_token_nll = draft_nll_flat.view(bs, self.block_size - 1)
         else:
             draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
                 lm_head=lm_head,
             ).view(bs, self.block_size - 1)
             draft_token_nll = None
@@ -669,29 +691,45 @@ class DFlashWorker:
             dtype = draft_hidden.dtype
 
             # Ensure per-req running stats exist, then build thresholds batch
-            thresholds_batch = torch.full((bs, num_pos), float("inf"), device=self.device, dtype=dtype)
+            thresholds_batch = torch.full(
+                (bs, num_pos), float("inf"), device=self.device, dtype=dtype
+            )
             warmup_mask = torch.zeros((bs,), dtype=torch.bool, device=self.device)
 
             for i, req in enumerate(batch.reqs):
                 if getattr(req, "k_online_sum_by_acc", None) is None:
-                    req.k_online_sum_by_acc = torch.zeros((num_pos + 1, num_pos), device=self.device, dtype=dtype)
-                    req.k_online_count_by_acc = torch.zeros((num_pos + 1,), device=self.device, dtype=torch.int64)
+                    req.k_online_sum_by_acc = torch.zeros(
+                        (num_pos + 1, num_pos), device=self.device, dtype=dtype
+                    )
+                    req.k_online_count_by_acc = torch.zeros(
+                        (num_pos + 1,), device=self.device, dtype=torch.int64
+                    )
                     req.k_online_step = 0
 
-                if int(getattr(req, "k_online_step", 0)) < int(self._k_online_warmup_steps):
+                if int(getattr(req, "k_online_step", 0)) < int(
+                    self._k_online_warmup_steps
+                ):
                     warmup_mask[i] = True
 
                 c = req.k_online_count_by_acc[:num_pos].to(dtype)
                 has = c > 0
                 if bool(has.any().item()):
-                    diag = torch.diagonal(req.k_online_sum_by_acc[:num_pos, :num_pos]).to(dtype)
-                    thresholds_batch[i] = torch.where(has, diag / c.clamp_min(1.0), thresholds_batch[i])
+                    diag = torch.diagonal(
+                        req.k_online_sum_by_acc[:num_pos, :num_pos]
+                    ).to(dtype)
+                    thresholds_batch[i] = torch.where(
+                        has, diag / c.clamp_min(1.0), thresholds_batch[i]
+                    )
 
             if draft_token_nll is None:
-                raise RuntimeError("DFLASH k-online expected draft_token_nll, but got None.")
+                raise RuntimeError(
+                    "DFLASH k-online expected draft_token_nll, but got None."
+                )
             token_nll = draft_token_nll.to(dtype)
 
-            acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(torch.int64)
+            acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(
+                torch.int64
+            )
             k = torch.minimum(
                 acc_pred + int(self._k_online_offset),
                 torch.full_like(acc_pred, num_pos, dtype=torch.int64),
@@ -707,8 +745,67 @@ class DFlashWorker:
             )
             token_nll = None
 
+        # --- CUDA Graph 支持：为 ragged verify 进行 padding ---
+        # 检查是否需要使用 cuda graph（通过 batch 的 forward_mode 判断）
+        # DFLASH_VERIFY 模式支持 cuda graph
+        _use_cuda_graph = batch.forward_mode == ForwardMode.DFLASH_VERIFY
+
+        # 先处理原始的 verify_len_per_req（在 cuda graph 模式下可能需要 padding）
         verify_len_cpu = verify_len_per_req.to(torch.int32).cpu()
         vlen_list = verify_len_cpu.tolist()
+
+        # 在 cuda graph 模式下，需要 padding 到最近的 cuda graph shape
+        padding_tokens = 0
+        if _use_cuda_graph:
+            # 计算实际 token 总数
+            total_verify_tokens_actual = sum(vlen_list)
+
+            # 获取 cuda graph shapes
+            cuda_graph_shapes = DFlashVerifyInput.get_cuda_graph_verify_shapes(
+                block_size=int(self.block_size),
+                max_concurrency=bs,  # 使用当前 batch size 作为 max_concurrency 的参考
+            )
+
+            # 找到最近的 cuda graph shape
+            nearest_shape, padding_tokens = (
+                DFlashVerifyInput.find_nearest_cuda_graph_shape(
+                    total_verify_tokens_actual, cuda_graph_shapes
+                )
+            )
+
+            # 如果需要 padding，将额外的 token 分配给某些 requests
+            if padding_tokens > 0:
+                # 轮询分配 padding tokens：每个 request 轮流加 1 个 token
+                for i in range(padding_tokens):
+                    vlen_list[i % bs] += 1
+
+        # 先创建 verify_input 对象
+        verify_input = DFlashVerifyInput(
+            draft_token=None,  # 稍后设置
+            positions=None,  # 稍后设置
+            draft_token_num=int(self.block_size),
+            verify_token_lens=None,  # 稍后设置
+            verify_start_offsets_cpu=None,  # 稍后设置
+        )
+
+        # 保存实际的 verify_token_lens（用于 verify 阶段）
+        verify_input.verify_token_lens_actual = torch.tensor(
+            (
+                verify_len_cpu.tolist()
+                if not _use_cuda_graph
+                else verify_len_per_req.to(torch.int32).cpu().tolist()
+            ),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        verify_input.use_cuda_graph = _use_cuda_graph
+        verify_input.num_tokens_padded = sum(vlen_list) if _use_cuda_graph else -1
+
+        # 更新 verify_len_cpu 为 padded 后的值（如果需要）
+        if _use_cuda_graph and padding_tokens > 0:
+            verify_len_cpu = torch.tensor(
+                vlen_list, dtype=torch.int32, device=self.device
+            )
 
         # Defensive clamp: a verify length of 0 would create empty segments and may
         # later lead to invalid position/rope kernels. Always verify at least 1 token
@@ -726,9 +823,21 @@ class DFlashWorker:
             raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
 
         # 3b) Flatten tokens and build per-req offsets (CPU)
-        if self._verify_tokens_flat_buf is None or int(self._verify_flat_cap) < total_verify_tokens:
-            new_cap = max(total_verify_tokens, int(self._verify_flat_cap) * 2 if int(self._verify_flat_cap) > 0 else total_verify_tokens)
-            self._verify_tokens_flat_buf = torch.empty((new_cap,), dtype=torch.long, device=self.device)
+        if (
+            self._verify_tokens_flat_buf is None
+            or int(self._verify_flat_cap) < total_verify_tokens
+        ):
+            new_cap = max(
+                total_verify_tokens,
+                (
+                    int(self._verify_flat_cap) * 2
+                    if int(self._verify_flat_cap) > 0
+                    else total_verify_tokens
+                ),
+            )
+            self._verify_tokens_flat_buf = torch.empty(
+                (new_cap,), dtype=torch.long, device=self.device
+            )
             self._verify_flat_cap = new_cap
 
         verify_tokens_flat = self._verify_tokens_flat_buf[:total_verify_tokens]
@@ -750,10 +859,17 @@ class DFlashWorker:
         if explicit_pos:
             # Old behavior: explicitly flatten positions to avoid relying on ForwardBatchInfo.
             total_vlen = int(sum(vlen_list))
-            if self._verify_positions_flat_buf is None or self._verify_positions_flat_buf.shape[0] < total_vlen:
+            if (
+                self._verify_positions_flat_buf is None
+                or self._verify_positions_flat_buf.shape[0] < total_vlen
+            ):
                 new_cap = max(
                     total_vlen,
-                    self._verify_positions_flat_buf.shape[0] * 2 if self._verify_positions_flat_buf is not None else total_vlen,
+                    (
+                        self._verify_positions_flat_buf.shape[0] * 2
+                        if self._verify_positions_flat_buf is not None
+                        else total_vlen
+                    ),
                 )
                 self._verify_positions_flat_buf = torch.empty(
                     (new_cap,), dtype=torch.int64, device=self.device
@@ -769,7 +885,9 @@ class DFlashWorker:
                 pt2 += v
             verify_positions = verify_positions_flat
         else:
-            verify_positions = None  # Let ForwardBatchInfo compute positions from extend_*.
+            verify_positions = (
+                None  # Let ForwardBatchInfo compute positions from extend_*.
+            )
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_tokens_flat,
@@ -779,11 +897,12 @@ class DFlashWorker:
             verify_start_offsets_cpu=verify_start_offsets_cpu,
         )
         # stash k-online nll for stats update in verify()
-        verify_input._k_online_token_nll = token_nll.detach() if token_nll is not None else None
+        verify_input._k_online_token_nll = (
+            token_nll.detach() if token_nll is not None else None
+        )
 
         # 3c) Prepare batch for EXTEND-style ragged verify
         verify_input.prepare_for_verify(batch, self.page_size)
-
 
         batch.forward_mode = ForwardMode.DFLASH_VERIFY
         # ScheduleBatch.get_model_worker_batch() expects extend metadata in
@@ -812,7 +931,9 @@ class DFlashWorker:
         if hidden_states.numel() == 0:
             token_ids = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
             if return_nll:
-                return token_ids, torch.empty((0,), dtype=torch.float32, device=hidden_states.device)
+                return token_ids, torch.empty(
+                    (0,), dtype=torch.float32, device=hidden_states.device
+                )
             return token_ids
 
         tp_group = get_tp_group()
@@ -861,7 +982,9 @@ class DFlashWorker:
             # Fast path return - need to handle return_nll
             if return_nll:
                 # Compute NLL for fast path (tp_size==1 && num_added==0)
-                out_nlls = torch.empty((num_tokens,), dtype=weight_dtype, device=hidden_states.device)
+                out_nlls = torch.empty(
+                    (num_tokens,), dtype=weight_dtype, device=hidden_states.device
+                )
                 for start in range(0, num_tokens, int(chunk_size)):
                     end = min(num_tokens, start + int(chunk_size))
                     hs = _cast_hs(hidden_states[start:end])
@@ -869,7 +992,9 @@ class DFlashWorker:
                         base_logits = torch.matmul(hs, weight[:num_org].T)
                         local_max = torch.max(base_logits, dim=-1).values
                         local_lse = torch.logsumexp(base_logits, dim=-1)
-                        out_nlls[start:end] = -(local_max.to(weight_dtype) - local_lse.to(weight_dtype))
+                        out_nlls[start:end] = -(
+                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
+                        )
                     else:
                         out_nlls[start:end] = 0.0
                 return out_token_ids, out_nlls
@@ -989,7 +1114,9 @@ class DFlashWorker:
         if return_nll:
             # We need LSE (log sum exp) to compute NLL = -(max - LSE)
             # Re-compute logits to get LSE (this is a bit wasteful but cleaner)
-            out_nlls = torch.empty((num_tokens,), dtype=weight_dtype, device=hidden_states.device)
+            out_nlls = torch.empty(
+                (num_tokens,), dtype=weight_dtype, device=hidden_states.device
+            )
 
             # Fast path: recompute base logits for NLL
             if tp_size == 1 and num_added == 0:
@@ -1000,7 +1127,9 @@ class DFlashWorker:
                         base_logits = torch.matmul(hs, weight[:num_org].T)
                         local_max = torch.max(base_logits, dim=-1).values
                         local_lse = torch.logsumexp(base_logits, dim=-1)
-                        out_nlls[start:end] = -(local_max.to(weight_dtype) - local_lse.to(weight_dtype))
+                        out_nlls[start:end] = -(
+                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
+                        )
                     else:
                         out_nlls[start:end] = 0.0
             else:
@@ -1018,34 +1147,59 @@ class DFlashWorker:
                         local_max = torch.max(base_logits, dim=-1).values
                         local_lse = torch.logsumexp(base_logits, dim=-1)
                     else:
-                        local_max = torch.full((chunk_len,), torch.finfo(weight_dtype).min, dtype=weight_dtype, device=hs.device)
-                        local_lse = torch.full((chunk_len,), float("-inf"), dtype=weight_dtype, device=hs.device)
+                        local_max = torch.full(
+                            (chunk_len,),
+                            torch.finfo(weight_dtype).min,
+                            dtype=weight_dtype,
+                            device=hs.device,
+                        )
+                        local_lse = torch.full(
+                            (chunk_len,),
+                            float("-inf"),
+                            dtype=weight_dtype,
+                            device=hs.device,
+                        )
 
                     if num_added > 0:
-                        added_logits = torch.matmul(hs, weight[num_org_padded:num_org_padded + num_added].T)
+                        added_logits = torch.matmul(
+                            hs, weight[num_org_padded : num_org_padded + num_added].T
+                        )
                         added_lse = torch.logsumexp(added_logits, dim=-1)
                         # Combine LSE
-                        local_lse = torch.logsumexp(torch.stack([local_lse, added_lse.to(weight_dtype)], dim=0), dim=0)
+                        local_lse = torch.logsumexp(
+                            torch.stack([local_lse, added_lse.to(weight_dtype)], dim=0),
+                            dim=0,
+                        )
 
                     if tp_size == 1:
-                        out_nlls[start:end] = -(local_max.to(weight_dtype) - local_lse.to(weight_dtype))
+                        out_nlls[start:end] = -(
+                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
+                        )
                     else:
                         # Gather LSE across ranks
                         needed = tp_size * chunk_len
                         gathered_lse_flat = self._draft_greedy_gathered_lse_buf[:needed]
-                        tp_group.all_gather_into_tensor(gathered_lse_flat, local_lse.contiguous())
+                        tp_group.all_gather_into_tensor(
+                            gathered_lse_flat, local_lse.contiguous()
+                        )
                         gathered_lse = gathered_lse_flat.view(tp_size, chunk_len)
                         global_lse = torch.logsumexp(gathered_lse, dim=0)
 
                         # Get global max for NLL
                         gathered_max_flat = self._draft_greedy_gathered_max_buf[:needed]
-                        tp_group.all_gather_into_tensor(gathered_max_flat, local_max.contiguous())
+                        tp_group.all_gather_into_tensor(
+                            gathered_max_flat, local_max.contiguous()
+                        )
                         gathered_max = gathered_max_flat.view(tp_size, chunk_len)
                         best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
                         torch.argmax(gathered_max, dim=0, out=best_rank)
-                        global_max_val = gathered_max.gather(0, best_rank.unsqueeze(0)).view(-1)
+                        global_max_val = gathered_max.gather(
+                            0, best_rank.unsqueeze(0)
+                        ).view(-1)
 
-                        out_nlls[start:end] = -(global_max_val.to(weight_dtype) - global_lse)
+                        out_nlls[start:end] = -(
+                            global_max_val.to(weight_dtype) - global_lse
+                        )
 
             return out_token_ids, out_nlls
 
@@ -1358,7 +1512,10 @@ class DFlashWorker:
         self._prepare_for_speculative_decoding(batch, draft_input)
 
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.forward_mode.is_target_verify() or model_worker_batch.forward_mode == ForwardMode.DFLASH_VERIFY
+        assert (
+            model_worker_batch.forward_mode.is_target_verify()
+            or model_worker_batch.forward_mode == ForwardMode.DFLASH_VERIFY
+        )
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
         need_mamba_verify_commit = hasattr(

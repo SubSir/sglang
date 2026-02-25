@@ -116,20 +116,27 @@ class DFlashDraftInput(SpecInput):
 class DFlashVerifyInput(SpecInput):
     """Inputs for a target-model verify forward in DFlash (spec-v1).
 
-    支持两种 verify 形态：
-    - block verify（固定 block_size）：draft_token 是 [bs * block]
-    - ragged verify（每个 req 不同 verify_len）：draft_token 是 flatten 后的 [sum(verify_lens)]
+    Supports two verify modes:
+    - block verify (fixed block_size): draft_token is [bs * block]
+    - ragged verify (different verify_len per req): draft_token is flattened [sum(verify_lens)]
+
+    CUDA Graph support:
+    - When ragged verify uses cuda graph, tokens are padded to the nearest cuda graph shape
+    - The cuda graph shape set is the union of: block_size * (1, 2, ..., max_concurrency) and
+      max_concurrency * (1, 2, 3, ..., block_size)
+    - verify_token_lens stores the padded lengths, verify_token_lens_actual stores the actual lengths
     """
 
     draft_token: torch.Tensor
     draft_token_num: int
 
-    # 兼容旧路径（block verify）
+    # Compatible with legacy path (block verify)
     positions: Optional[torch.Tensor] = None
 
-    # ragged verify：每个 req 实际 verify 的 token 数（包含 verified_id 在内）
+    # ragged verify: actual verify token count per req (including verified_id)
+    # Note: in cuda graph mode, this value may be padded
     verify_token_lens: Optional[torch.Tensor] = None
-    # ragged verify：CPU 上的 per-req 起始 offset（len == bs）
+    # ragged verify: per-req start offset on CPU (len == bs)
     verify_start_offsets_cpu: Optional[List[int]] = None
 
     # ragged verify: the extend_start_loc calculated by ForwardBatchInfo, used to slice logits
@@ -143,22 +150,151 @@ class DFlashVerifyInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
-    # 对 block verify：= draft_token_num；对 ragged verify：可保持为 draft_token_num（DP padding 需要）
+    # For block verify: = draft_token_num; for ragged verify: can stay as draft_token_num (DP padding needs it)
     num_tokens_per_batch: int = -1
+
+    # CUDA Graph support fields
+    # ragged verify: actual verify token count per req (unpadded original value)
+    verify_token_lens_actual: Optional[torch.Tensor] = None
+    # ragged verify: padded total token count (for cuda graph)
+    num_tokens_padded: int = -1
+    # Whether using cuda graph
+    use_cuda_graph: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.verify_token_lens is None:
             self.verify_token_lens = torch.empty((0,), dtype=torch.int32)
         if self.num_tokens_per_batch == -1:
-            self.num_tokens_per_batch = int(self.draft_token_num) if int(self.draft_token_num) > 0 else 1
+            self.num_tokens_per_batch = (
+                int(self.draft_token_num) if int(self.draft_token_num) > 0 else 1
+            )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
     def _is_ragged_verify(self) -> bool:
-        """判断是否为 ragged verify（verify_token_lens 非空且长度 == bs）。"""
+        """Check if this is ragged verify (verify_token_lens is non-empty and length == bs)."""
         return self.verify_token_lens is not None and self.verify_token_lens.numel() > 0
+
+    @staticmethod
+    def get_cuda_graph_verify_shapes(
+        block_size: int, max_concurrency: int
+    ) -> List[int]:
+        """
+        Compute the cuda graph shapes set for DFlash verify.
+
+        The shape set is the union of two series:
+        1. block_size * (1, 2, ..., max_concurrency) - fixed block_size, varying concurrency
+        2. max_concurrency * (1, 2, 3, ..., block_size) - fixed max_concurrency, varying block_size
+
+        Args:
+            block_size: DFlash block size (max tokens to predict per request)
+            max_concurrency: max concurrent request count
+
+        Returns:
+            Sorted list of cuda graph shapes
+        """
+        shapes = set()
+
+        # Series 1: block_size * (1, 2, ..., max_concurrency)
+        for c in range(1, max_concurrency + 1):
+            shapes.add(block_size * c)
+
+        # Series 2: max_concurrency * (1, 2, 3, ..., block_size)
+        for b in range(1, block_size + 1):
+            shapes.add(max_concurrency * b)
+
+        return sorted(shapes)
+
+    @staticmethod
+    def find_nearest_cuda_graph_shape(
+        actual_token_num: int,
+        cuda_graph_shapes: List[int],
+    ) -> Tuple[int, int]:
+        """
+        Find the smallest cuda graph shape that is greater than or equal to actual_token_num.
+
+        Args:
+            actual_token_num: actual token count
+            cuda_graph_shapes: precomputed cuda graph shapes list
+
+        Returns:
+            (nearest_shape, padding_tokens) - nearest_shape is the found shape,
+            padding_tokens is the number of tokens that need to be padded
+        """
+        import bisect
+
+        idx = bisect.bisect_left(cuda_graph_shapes, actual_token_num)
+        if idx >= len(cuda_graph_shapes):
+            # If actual token count exceeds the maximum shape, return the maximum shape.
+            # This situation should be avoided, but needs to be handled in extreme cases.
+            return cuda_graph_shapes[-1], 0
+
+        nearest_shape = cuda_graph_shapes[idx]
+        padding_tokens = nearest_shape - actual_token_num
+        return nearest_shape, padding_tokens
+
+    def pad_for_cuda_graph(
+        self,
+        block_size: int,
+        max_concurrency: int,
+        cuda_graph_shapes: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Perform padding for cuda graph.
+
+        Args:
+            block_size: DFlash block size
+            max_concurrency: maximum concurrency
+            cuda_graph_shapes: precomputed cuda graph shapes (optional, recomputed if None)
+        """
+        if not self._is_ragged_verify():
+            return
+
+        if cuda_graph_shapes is None:
+            cuda_graph_shapes = self.get_cuda_graph_verify_shapes(
+                block_size, max_concurrency
+            )
+
+        # Save the actual verify_token_lens
+        self.verify_token_lens_actual = self.verify_token_lens.clone()
+
+        # Calculate the actual total token count
+        actual_token_num = int(self.verify_token_lens.sum().item())
+
+        # Find the nearest cuda graph shape
+        nearest_shape, padding_tokens = self.find_nearest_cuda_graph_shape(
+            actual_token_num, cuda_graph_shapes
+        )
+
+        self.num_tokens_padded = nearest_shape
+        self.use_cuda_graph = True
+
+        # If padding is needed, distribute extra tokens to some requests
+        if padding_tokens > 0:
+            # Simple strategy: evenly distribute extra tokens to requests
+            # Each request gets at most 1 extra token until padding is exhausted
+            vlen_cpu = self.verify_token_lens_actual.cpu().tolist()
+            bs = len(vlen_cpu)
+
+            # Round-robin distribution of padding tokens
+            for i in range(padding_tokens):
+                vlen_cpu[i % bs] += 1
+
+            self.verify_token_lens = torch.tensor(
+                vlen_cpu, dtype=torch.int32, device=self.verify_token_lens.device
+            )
+
+            # Extend draft_token to include padding tokens
+            # Padding tokens can use any value (e.g., 0) since they won't be used
+            if padding_tokens > 0:
+                padding_tokens_tensor = torch.zeros(
+                    (padding_tokens,),
+                    dtype=self.draft_token.dtype,
+                    device=self.draft_token.device,
+                )
+                self.draft_token = torch.cat([self.draft_token, padding_tokens_tensor])
 
     def prepare_for_verify(
         self,
@@ -170,14 +306,16 @@ class DFlashVerifyInput(SpecInput):
         if batch.forward_mode.is_idle():
             return
 
-        # ragged verify 目前只支持 page_size == 1
+        # ragged verify currently only supports page_size == 1
         if self._is_ragged_verify() and page_size != 1:
-            raise NotImplementedError("DFLASH ragged verify currently supports page_size==1 only.")
+            raise NotImplementedError(
+                "DFLASH ragged verify currently supports page_size==1 only."
+            )
 
         bs = batch.batch_size()
         batch.input_ids = self.draft_token
 
-        # ragged verify：不覆盖 batch.positions，让 ForwardBatchInfo 用 extend_* 字段计算
+        # ragged verify: do not override batch.positions, let ForwardBatchInfo compute using extend_* fields
         if self.positions is not None:
             batch.positions = self.positions
 
@@ -188,7 +326,10 @@ class DFlashVerifyInput(SpecInput):
                     "DFLASH_VERIFY forward requires ragged metadata, but verify_token_lens is empty. "
                     "This can lead to invalid attention indices and GPU faults."
                 )
-            if self.verify_start_offsets_cpu is None or len(self.verify_start_offsets_cpu) != bs:
+            if (
+                self.verify_start_offsets_cpu is None
+                or len(self.verify_start_offsets_cpu) != bs
+            ):
                 raise RuntimeError(
                     "DFLASH_VERIFY forward requires verify_start_offsets_cpu with length == batch_size."
                 )
@@ -199,9 +340,13 @@ class DFlashVerifyInput(SpecInput):
                 raise RuntimeError(
                     f"DFLASH verify_token_lens shape mismatch: got {self.verify_token_lens.numel()} for bs={bs}."
                 )
-            batch.out_cache_loc = alloc_token_slots(batch.tree_cache, len(batch.input_ids))
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache, len(batch.input_ids)
+            )
             prefix_lens = batch.seq_lens
-            end_offset = prefix_lens + self.verify_token_lens.to(prefix_lens.device, dtype=prefix_lens.dtype)
+            end_offset = prefix_lens + self.verify_token_lens.to(
+                prefix_lens.device, dtype=prefix_lens.dtype
+            )
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
                 batch.req_to_token_pool.req_to_token,
@@ -210,11 +355,11 @@ class DFlashVerifyInput(SpecInput):
                 batch.out_cache_loc,
                 bs,
             )
-            # ragged verify 不构建 custom_mask（flashinfer/flashattention 后端不需要）
+            # ragged verify does not build custom_mask (not needed for flashinfer/flashattention backends)
             self.custom_mask = None
             return
 
-        # --- block verify path（原有逻辑）
+        # --- block verify path (original logic)
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
@@ -295,7 +440,7 @@ class DFlashVerifyInput(SpecInput):
                 None,
             )
 
-        # ragged verify：qo_indptr / kv_indices 按 verify_token_lens 构造
+        # ragged verify: construct qo_indptr / kv_indices based on verify_token_lens
         if self._is_ragged_verify():
             vlens = self.verify_token_lens
             if vlens is None or vlens.numel() != bs:
@@ -326,7 +471,7 @@ class DFlashVerifyInput(SpecInput):
             )
             return kv_indices, cum_kv_seq_len, qo_indptr, None
 
-        # --- block verify（原逻辑）
+        # --- block verify (original logic)
         qo_indptr = torch.arange(
             0,
             (bs + 1) * self.draft_token_num,
@@ -400,10 +545,20 @@ class DFlashVerifyInput(SpecInput):
 
         # --- ragged verify path
         if self._is_ragged_verify():
-            vlen_list = self.verify_token_lens.tolist() if self.verify_token_lens is not None else []
+            # In cuda graph mode, use actual verify_token_lens instead of padded lengths
+            if self.use_cuda_graph and self.verify_token_lens_actual is not None:
+                vlen_list = self.verify_token_lens_actual.tolist()
+            else:
+                vlen_list = (
+                    self.verify_token_lens.tolist()
+                    if self.verify_token_lens is not None
+                    else []
+                )
             start_offsets = self.verify_start_offsets_cpu
             if start_offsets is None or len(start_offsets) != bs:
-                raise RuntimeError("DFLASH ragged verify requires verify_start_offsets_cpu.")
+                raise RuntimeError(
+                    "DFLASH ragged verify requires verify_start_offsets_cpu."
+                )
 
             logits_flat = logits_output.next_token_logits
             hidden_flat = logits_output.hidden_states
@@ -413,9 +568,18 @@ class DFlashVerifyInput(SpecInput):
             new_verified_cpu: List[int] = []
             segments_hidden: List[torch.Tensor] = []
 
+            # In cuda graph mode, need to recompute start_offsets (based on actual vlen_list)
+            if self.use_cuda_graph and self.verify_token_lens_actual is not None:
+                # Recompute start_offsets since padded start_offsets no longer apply
+                actual_start_offsets = [0]
+                for vlen in vlen_list[:-1]:
+                    actual_start_offsets.append(actual_start_offsets[-1] + vlen)
+            else:
+                actual_start_offsets = start_offsets
+
             for i, req in enumerate(batch.reqs):
                 vlen = int(vlen_list[i])
-                logit_off = int(start_offsets[i])
+                logit_off = int(actual_start_offsets[i])
 
                 current_candidates = self.draft_token[logit_off : logit_off + vlen]
                 current_logits = logits_flat[logit_off : logit_off + vlen]
@@ -428,7 +592,7 @@ class DFlashVerifyInput(SpecInput):
                 #         vlens = self.verify_token_lens.tolist() if self.verify_token_lens is not None else []
                 #         oc_min = int(batch.out_cache_loc.min().item()) if batch.out_cache_loc.numel() > 0 else -1
                 #         oc_max = int(batch.out_cache_loc.max().item()) if batch.out_cache_loc.numel() > 0 else -1
-                        
+
                 #         # Add positions info if available
                 #         pos_info = ""
                 #         if self.positions is not None:
@@ -474,16 +638,24 @@ class DFlashVerifyInput(SpecInput):
                     and not req.sampling_params.stop_strs
                     and not req.sampling_params.stop_regex_strs
                 ):
-                    remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
+                    remaining = int(req.sampling_params.max_new_tokens) - len(
+                        req.output_ids
+                    )
                     if remaining > 0:
                         tokens = proposed[:remaining]
                         if not req.sampling_params.ignore_eos:
                             stop_token_ids = req.sampling_params.stop_token_ids
                             eos_token_ids = req.eos_token_ids
                             tokenizer = req.tokenizer
-                            tokenizer_eos = tokenizer.eos_token_id if tokenizer is not None else None
+                            tokenizer_eos = (
+                                tokenizer.eos_token_id
+                                if tokenizer is not None
+                                else None
+                            )
                             additional_stop = (
-                                tokenizer.additional_stop_token_ids if tokenizer is not None else None
+                                tokenizer.additional_stop_token_ids
+                                if tokenizer is not None
+                                else None
                             )
                             vocab_size = getattr(req, "vocab_size", None)
                             for j, token_id in enumerate(tokens):
@@ -498,7 +670,9 @@ class DFlashVerifyInput(SpecInput):
                                 if eos_token_ids and token_id in eos_token_ids:
                                     tokens = tokens[: j + 1]
                                     break
-                                if tokenizer_eos is not None and int(token_id) == int(tokenizer_eos):
+                                if tokenizer_eos is not None and int(token_id) == int(
+                                    tokenizer_eos
+                                ):
                                     tokens = tokens[: j + 1]
                                     break
                                 if additional_stop and token_id in additional_stop:
@@ -533,10 +707,15 @@ class DFlashVerifyInput(SpecInput):
                 req.spec_verify_tokens += vlen
 
                 if hidden_flat is not None:
-                    segments_hidden.append(hidden_flat[logit_off : logit_off + appended])
+                    segments_hidden.append(
+                        hidden_flat[logit_off : logit_off + appended]
+                    )
 
                 # Update k-online stats if present
-                if hasattr(self, "_k_online_token_nll") and getattr(self, "_k_online_token_nll") is not None:
+                if (
+                    hasattr(self, "_k_online_token_nll")
+                    and getattr(self, "_k_online_token_nll") is not None
+                ):
                     if getattr(req, "k_online_sum_by_acc", None) is not None:
                         token_nll_i = self._k_online_token_nll[i]
                         num_pos = int(token_nll_i.shape[0])
@@ -545,7 +724,9 @@ class DFlashVerifyInput(SpecInput):
                         req.k_online_count_by_acc[acc_idx] += 1
                         req.k_online_step += 1
 
-            commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+            commit_lens = torch.tensor(
+                commit_lens_cpu, dtype=torch.int32, device=device
+            )
             # clear cache
             if hasattr(self, "_k_online_token_nll"):
                 self._k_online_token_nll = None
@@ -567,14 +748,20 @@ class DFlashVerifyInput(SpecInput):
                     committed = commit_lens_cpu[i]
                     kept_chunks.append(out_cache_loc[curr : curr + committed])
                     if vlen > committed:
-                        to_free_chunks.append(out_cache_loc[curr + committed : curr + vlen])
+                        to_free_chunks.append(
+                            out_cache_loc[curr + committed : curr + vlen]
+                        )
                     curr += vlen
-                
+
                 if to_free_chunks:
                     batch.token_to_kv_pool_allocator.free(torch.cat(to_free_chunks))
-                batch.out_cache_loc = torch.cat(kept_chunks) if kept_chunks else out_cache_loc[:0]
+                batch.out_cache_loc = (
+                    torch.cat(kept_chunks) if kept_chunks else out_cache_loc[:0]
+                )
             else:
-                raise NotImplementedError("DFLASH ragged verify page_size > 1 not supported.")
+                raise NotImplementedError(
+                    "DFLASH ragged verify page_size > 1 not supported."
+                )
 
             for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
                 req.kv_committed_len += commit_len
@@ -599,15 +786,18 @@ class DFlashVerifyInput(SpecInput):
             next_target_hidden = (
                 torch.cat(segments_hidden, dim=0)
                 if segments_hidden
-                else (
-                    hidden_flat[:0]
-                    if hidden_flat is not None
-                    else logits_flat[:0]
-                )
+                else (hidden_flat[:0] if hidden_flat is not None else logits_flat[:0])
             )
             logits_output.hidden_states = None
-            new_verified_id = torch.tensor(new_verified_cpu, dtype=torch.int64, device=device)
-            return new_verified_id, commit_lens, next_target_hidden, accept_length_per_req_cpu
+            new_verified_id = torch.tensor(
+                new_verified_cpu, dtype=torch.int64, device=device
+            )
+            return (
+                new_verified_id,
+                commit_lens,
+                next_target_hidden,
+                accept_length_per_req_cpu,
+            )
 
         # --- block verify path
         candidates = self.draft_token.view(bs, self.draft_token_num)
