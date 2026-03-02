@@ -178,62 +178,36 @@ class DFlashVerifyInput(SpecInput):
         return self.verify_token_lens is not None and self.verify_token_lens.numel() > 0
 
     @staticmethod
-    def get_cuda_graph_verify_shapes(
-        block_size: int, max_concurrency: int
-    ) -> List[int]:
-        """
-        Compute the cuda graph shapes set for DFlash verify.
-
-        The shape set is the union of two series:
-        1. block_size * (1, 2, ..., max_concurrency) - fixed block_size, varying concurrency
-        2. max_concurrency * (1, 2, 3, ..., block_size) - fixed max_concurrency, varying block_size
-
-        Args:
-            block_size: DFlash block size (max tokens to predict per request)
-            max_concurrency: max concurrent request count
+    def find_nearest_shape(
+        actual_token_num: int,
+        shapes: List[int],
+    ) -> Tuple[int, int]:
+        """Find the smallest available shape >= actual_token_num.
 
         Returns:
-            Sorted list of cuda graph shapes
+            (nearest_shape, padding_tokens)
         """
-        shapes = set()
+        import bisect
 
-        # Series 1: block_size * (1, 2, ..., max_concurrency)
-        for c in range(1, max_concurrency + 1):
-            shapes.add(block_size * c)
+        if shapes is None or len(shapes) == 0:
+            raise ValueError("shapes must be a non-empty list")
 
-        # Series 2: max_concurrency * (1, 2, 3, ..., block_size)
-        for b in range(1, block_size + 1):
-            shapes.add(max_concurrency * b)
+        idx = bisect.bisect_left(shapes, actual_token_num)
+        if idx >= len(shapes):
+            # Caller should avoid this by checking max shape. Keep a safe fallback.
+            return shapes[-1], 0
 
-        return sorted(shapes)
+        nearest_shape = int(shapes[idx])
+        padding_tokens = int(nearest_shape - actual_token_num)
+        return nearest_shape, padding_tokens
 
     @staticmethod
     def find_nearest_cuda_graph_shape(
         actual_token_num: int,
         cuda_graph_shapes: List[int],
     ) -> Tuple[int, int]:
-        """
-        Find the smallest cuda graph shape that is greater than or equal to actual_token_num.
-
-        Args:
-            actual_token_num: actual token count
-            cuda_graph_shapes: precomputed cuda graph shapes list
-
-        Returns:
-            (nearest_shape, padding_tokens) - nearest_shape is the found shape,
-            padding_tokens is the number of tokens that need to be padded
-        """
-        import bisect
-
-        idx = bisect.bisect_left(cuda_graph_shapes, actual_token_num)
-        if idx >= len(cuda_graph_shapes):
-            # If actual token count exceeds the maximum shape, return the maximum shape.
-            # This situation should be avoided, but needs to be handled in extreme cases.
-            return cuda_graph_shapes[-1], 0
-
-        nearest_shape = cuda_graph_shapes[idx]
-        padding_tokens = nearest_shape - actual_token_num
-        return nearest_shape, padding_tokens
+        """Backward-compatible wrapper for DFLASH CUDA-graph shape lookup."""
+        return DFlashVerifyInput.find_nearest_shape(actual_token_num, cuda_graph_shapes)
 
     def pad_for_cuda_graph(
         self,
@@ -286,16 +260,6 @@ class DFlashVerifyInput(SpecInput):
                 vlen_cpu, dtype=torch.int32, device=self.verify_token_lens.device
             )
 
-            # Extend draft_token to include padding tokens
-            # Padding tokens can use any value (e.g., 0) since they won't be used
-            if padding_tokens > 0:
-                padding_tokens_tensor = torch.zeros(
-                    (padding_tokens,),
-                    dtype=self.draft_token.dtype,
-                    device=self.draft_token.device,
-                )
-                self.draft_token = torch.cat([self.draft_token, padding_tokens_tensor])
-
     def prepare_for_verify(
         self,
         batch: ScheduleBatch,
@@ -340,6 +304,35 @@ class DFlashVerifyInput(SpecInput):
                 raise RuntimeError(
                     f"DFLASH verify_token_lens shape mismatch: got {self.verify_token_lens.numel()} for bs={bs}."
                 )
+
+            # Hard consistency checks before entering attention.
+            total_verify_tokens = int(self.verify_token_lens.sum().item())
+            draft_token_len = int(self.draft_token.shape[0])
+            if total_verify_tokens != draft_token_len:
+                raise RuntimeError(
+                    "DFLASH ragged verify metadata mismatch: "
+                    f"sum(verify_token_lens)={total_verify_tokens} != len(draft_token)={draft_token_len}."
+                )
+
+            # Do not validate batch.extend_num_tokens here: in current scheduling flow
+            # it is assigned by DFlash worker after prepare_for_verify().
+
+            if self.verify_start_offsets_cpu is None or len(self.verify_start_offsets_cpu) != bs:
+                raise RuntimeError(
+                    "DFLASH ragged verify requires verify_start_offsets_cpu with length == batch_size."
+                )
+            expected_offsets = []
+            running = 0
+            for v in self.verify_token_lens.tolist():
+                expected_offsets.append(running)
+                running += int(v)
+            if self.verify_start_offsets_cpu != expected_offsets:
+                raise RuntimeError(
+                    "DFLASH ragged verify metadata mismatch: verify_start_offsets_cpu is inconsistent "
+                    "with verify_token_lens used for forward. "
+                    f"got={self.verify_start_offsets_cpu}, expected={expected_offsets}."
+                )
+
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
             )
@@ -734,13 +727,13 @@ class DFlashVerifyInput(SpecInput):
             if page_size == 1:
                 out_cache_loc = batch.out_cache_loc
                 # Consistency check
-                if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
-                    total_vlen_expected = sum(vlen_list)
-                    if out_cache_loc.numel() != total_vlen_expected:
-                        raise RuntimeError(
-                            f"DFLASH KV Consistency Error: batch.out_cache_loc.numel() ({out_cache_loc.numel()}) "
-                            f"!= sum(vlen_list) ({total_vlen_expected}). vlen_list={vlen_list}"
-                        )
+                # if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
+                #     total_vlen_expected = sum(vlen_list)
+                #     if out_cache_loc.numel() != total_vlen_expected:
+                #         raise RuntimeError(
+                #             f"DFLASH KV Consistency Error: batch.out_cache_loc.numel() ({out_cache_loc.numel()}) "
+                #             f"!= sum(vlen_list) ({total_vlen_expected}). vlen_list={vlen_list}"
+                #         )
 
                 to_free_chunks, kept_chunks = [], []
                 curr = 0

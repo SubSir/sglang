@@ -157,6 +157,11 @@ class PiecewiseCudaGraphRunner:
             "eager",
             "inductor",
         ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
+        self._capture_dflash_verify_only = (
+            self.model_runner.spec_algorithm.is_dflash()
+            and not self.model_runner.is_draft_worker
+        )
+
         self.compile_config = CompilationConfig(
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
@@ -235,6 +240,12 @@ class PiecewiseCudaGraphRunner:
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
 
+        self.capture_forward_mode = (
+            ForwardMode.DFLASH_VERIFY
+            if self._capture_dflash_verify_only
+            else ForwardMode.EXTEND
+        )
+
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
@@ -297,6 +308,7 @@ class PiecewiseCudaGraphRunner:
             if self.out_cache_loc_swa is not None
             else None
         )
+
         mamba_track_indices = (
             self.mamba_track_indices[:1]
             if self.mamba_track_indices is not None
@@ -311,8 +323,39 @@ class PiecewiseCudaGraphRunner:
             else None
         )
         with torch.device(self.device):
+            capture_mode = (
+                ForwardMode.DFLASH_VERIFY
+                if self._capture_dflash_verify_only
+                else ForwardMode.EXTEND
+            )
+            capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self._capture_dflash_verify_only
+                else CaptureHiddenMode.NULL
+            )
+
+            spec_info = None
+            spec_algorithm = None
+            if self._capture_dflash_verify_only:
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                block_size = int(self.model_runner.server_args.speculative_num_draft_tokens)
+                if block_size <= 0:
+                    raise ValueError(
+                        "DFLASH piecewise verify capture requires speculative_num_draft_tokens > 0."
+                    )
+                spec_info = DFlashVerifyInput(
+                    draft_token=input_ids,
+                    positions=positions,
+                    draft_token_num=block_size,
+                    verify_token_lens=torch.tensor([num_tokens], dtype=torch.int32, device=self.device),
+                    verify_start_offsets_cpu=[0],
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                spec_algorithm = self.model_runner.spec_algorithm
+
             forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.EXTEND,
+                forward_mode=capture_mode,
                 batch_size=1,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
@@ -345,11 +388,11 @@ class PiecewiseCudaGraphRunner:
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
                 mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_algorithm=spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=capture_hidden_mode,
                 num_token_non_padded=None,
-                global_forward_mode=ForwardMode.EXTEND,
+                global_forward_mode=capture_mode,
                 lora_ids=None,
             )
 
@@ -375,6 +418,12 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self._capture_dflash_verify_only:
+            if not forward_batch.forward_mode.is_target_verify():
+                return False
+        elif forward_batch.forward_mode.is_target_verify():
+            return False
+
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -462,8 +511,39 @@ class PiecewiseCudaGraphRunner:
             lora_ids = None
 
         with torch.device(self.device):
+            capture_mode = (
+                ForwardMode.DFLASH_VERIFY
+                if self._capture_dflash_verify_only
+                else ForwardMode.EXTEND
+            )
+            capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self._capture_dflash_verify_only
+                else CaptureHiddenMode.NULL
+            )
+
+            spec_info = None
+            spec_algorithm = None
+            if self._capture_dflash_verify_only:
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                block_size = int(self.model_runner.server_args.speculative_num_draft_tokens)
+                if block_size <= 0:
+                    raise ValueError(
+                        "DFLASH piecewise verify capture requires speculative_num_draft_tokens > 0."
+                    )
+                spec_info = DFlashVerifyInput(
+                    draft_token=input_ids,
+                    positions=positions,
+                    draft_token_num=block_size,
+                    verify_token_lens=torch.tensor([num_tokens], dtype=torch.int32, device=self.device),
+                    verify_start_offsets_cpu=[0],
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                spec_algorithm = self.model_runner.spec_algorithm
+
             forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.EXTEND,
+                forward_mode=capture_mode,
                 batch_size=bs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
@@ -496,11 +576,11 @@ class PiecewiseCudaGraphRunner:
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
                 mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_algorithm=spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=capture_hidden_mode,
                 num_token_non_padded=None,
-                global_forward_mode=ForwardMode.EXTEND,
+                global_forward_mode=capture_mode,
                 lora_ids=None,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)

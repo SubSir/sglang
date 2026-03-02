@@ -506,6 +506,17 @@ def main() -> None:
         action="store_true",
         help="Disable CUDA graph optimization.",
     )
+    parser.add_argument(
+        "--enable-piecewise-cuda-graph",
+        action="store_true",
+        help="Enable piecewise CUDA graph for target prefill/extend path.",
+    )
+    parser.add_argument(
+        "--piecewise-cuda-graph-max-tokens",
+        type=int,
+        default=None,
+        help="Maximum token bucket for piecewise CUDA graph capture.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -606,6 +617,15 @@ def main() -> None:
                         "128",
                     ]
                 )
+                if args.enable_piecewise_cuda_graph:
+                    common_server_args.append("--enable-piecewise-cuda-graph")
+                    if args.piecewise_cuda_graph_max_tokens is not None:
+                        common_server_args.extend(
+                            [
+                                "--piecewise-cuda-graph-max-tokens",
+                                str(args.piecewise_cuda_graph_max_tokens),
+                            ]
+                        )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
 

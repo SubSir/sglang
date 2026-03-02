@@ -2456,13 +2456,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Prefer piecewise runner for DFLASH_VERIFY only when piecewise CUDA graph
+        # is actually enabled/initialized. This avoids hard-coding behavior and keeps
+        # fallback behavior unchanged when piecewise is unavailable.
+        prefer_piecewise_dflash_verify = (
+            forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY
+            and self.piecewise_cuda_graph_runner is not None
+        )
+        # Keep decode cuda-graph runner for TARGET_VERIFY warmup/capture.
+        use_device_graph_runner = not prefer_piecewise_dflash_verify
+
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            use_device_graph_runner
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )

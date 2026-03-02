@@ -3,7 +3,7 @@ import math
 import os
 
 from copy import deepcopy
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Dict
 
 import torch
 
@@ -38,12 +38,12 @@ def _predict_acc_len_from_nll(
         thresholds: [bs, num_pos]
 
     Returns:
-        acc_pred: [bs] int64 in [0, num_pos]
+        acc_pred: [bs] int32 in [0, num_pos]
     """
 
     gt = token_nll > thresholds
     any_gt = gt.any(dim=1)
-    first_idx = gt.to(torch.int64).argmax(dim=1)
+    first_idx = gt.to(torch.int32).argmax(dim=1)
     return torch.where(
         any_gt, first_idx, torch.full_like(first_idx, token_nll.shape[1])
     )
@@ -212,6 +212,7 @@ class DFlashWorker:
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_lse_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
         self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
@@ -234,6 +235,7 @@ class DFlashWorker:
         self._verify_tokens_flat_buf: Optional[torch.Tensor] = None
         self._verify_positions_flat_buf: Optional[torch.Tensor] = None
         self._verify_flat_cap: int = 0
+        self._verify_start_offsets_cache: Dict[int, torch.Tensor] = {}
 
         # --- K-online verify length prediction (batch-max verify for simplicity).
         # Enable via env var to keep backwards compatibility.
@@ -684,7 +686,8 @@ class DFlashWorker:
 
         # ===== ragged verify (DFLASH_VERIFY) =====
         # Optional: explicitly pass positions (old behavior) to avoid relying on ForwardBatchInfo
-        explicit_pos = os.environ.get("SGLANG_DFLASH_RAGGED_EXPLICIT_POS", "0") == "1"
+        explicit_pos = False
+        # explicit_pos = os.environ.get("SGLANG_DFLASH_RAGGED_EXPLICIT_POS", "0") == "1"
         # 3a) Determine per-request verify length
         if self._k_online_enabled and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
@@ -702,7 +705,7 @@ class DFlashWorker:
                         (num_pos + 1, num_pos), device=self.device, dtype=dtype
                     )
                     req.k_online_count_by_acc = torch.zeros(
-                        (num_pos + 1,), device=self.device, dtype=torch.int64
+                        (num_pos + 1,), device=self.device, dtype=torch.int32
                     )
                     req.k_online_step = 0
 
@@ -728,101 +731,86 @@ class DFlashWorker:
             token_nll = draft_token_nll.to(dtype)
 
             acc_pred = _predict_acc_len_from_nll(token_nll, thresholds_batch).to(
-                torch.int64
+                torch.int32
             )
             k = torch.minimum(
                 acc_pred + int(self._k_online_offset),
-                torch.full_like(acc_pred, num_pos, dtype=torch.int64),
+                torch.full_like(acc_pred, num_pos, dtype=torch.int32),
             )
             verify_len_per_req = torch.where(
                 warmup_mask,
-                torch.full_like(k, int(self.block_size), dtype=torch.int64),
+                torch.full_like(k, int(self.block_size), dtype=torch.int32),
                 k + 1,
             )
         else:
             verify_len_per_req = torch.full(
-                (bs,), int(self.block_size), device=self.device, dtype=torch.int64
+                (bs,), int(self.block_size), device=self.device, dtype=torch.int32
             )
             token_nll = None
 
-        # --- CUDA Graph 支持：为 ragged verify 进行 padding ---
-        # 检查是否需要使用 cuda graph（通过 batch 的 forward_mode 判断）
-        # DFLASH_VERIFY 模式支持 cuda graph
-        _use_cuda_graph = batch.forward_mode == ForwardMode.DFLASH_VERIFY
-
-        # 先处理原始的 verify_len_per_req（在 cuda graph 模式下可能需要 padding）
-        verify_len_cpu = verify_len_per_req.to(torch.int32).cpu()
-        vlen_list = verify_len_cpu.tolist()
-
-        # 在 cuda graph 模式下，需要 padding 到最近的 cuda graph shape
-        padding_tokens = 0
-        if _use_cuda_graph:
-            # 计算实际 token 总数
-            total_verify_tokens_actual = sum(vlen_list)
-
-            # 获取 cuda graph shapes
-            cuda_graph_shapes = DFlashVerifyInput.get_cuda_graph_verify_shapes(
-                block_size=int(self.block_size),
-                max_concurrency=bs,  # 使用当前 batch size 作为 max_concurrency 的参考
-            )
-
-            # 找到最近的 cuda graph shape
-            nearest_shape, padding_tokens = (
-                DFlashVerifyInput.find_nearest_cuda_graph_shape(
-                    total_verify_tokens_actual, cuda_graph_shapes
-                )
-            )
-
-            # 如果需要 padding，将额外的 token 分配给某些 requests
-            if padding_tokens > 0:
-                # 轮询分配 padding tokens：每个 request 轮流加 1 个 token
-                for i in range(padding_tokens):
-                    vlen_list[i % bs] += 1
-
-        # 先创建 verify_input 对象
-        verify_input = DFlashVerifyInput(
-            draft_token=None,  # 稍后设置
-            positions=None,  # 稍后设置
-            draft_token_num=int(self.block_size),
-            verify_token_lens=None,  # 稍后设置
-            verify_start_offsets_cpu=None,  # 稍后设置
+        _is_dflash_verify_mode = batch.forward_mode == ForwardMode.DFLASH_VERIFY
+        _can_use_piecewise_graph = (
+            _is_dflash_verify_mode
+            and self.model_runner.piecewise_cuda_graph_runner is not None
         )
-
-        # 保存实际的 verify_token_lens（用于 verify 阶段）
-        verify_input.verify_token_lens_actual = torch.tensor(
-            (
-                verify_len_cpu.tolist()
-                if not _use_cuda_graph
-                else verify_len_per_req.to(torch.int32).cpu().tolist()
-            ),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        verify_input.use_cuda_graph = _use_cuda_graph
-        verify_input.num_tokens_padded = sum(vlen_list) if _use_cuda_graph else -1
-
-        # 更新 verify_len_cpu 为 padded 后的值（如果需要）
-        if _use_cuda_graph and padding_tokens > 0:
-            verify_len_cpu = torch.tensor(
-                vlen_list, dtype=torch.int32, device=self.device
-            )
-
-        # Defensive clamp: a verify length of 0 would create empty segments and may
-        # later lead to invalid position/rope kernels. Always verify at least 1 token
-        # (the current verified token), and never exceed block_size.
         block_size_i = int(self.block_size)
-        for i in range(len(vlen_list)):
-            v = int(vlen_list[i])
-            if v <= 0:
-                vlen_list[i] = 1
-            elif v > block_size_i:
-                vlen_list[i] = block_size_i
 
-        total_verify_tokens = int(sum(vlen_list))
+        # Keep verify length computations on GPU; move to CPU only where Python lists
+        # are required by scheduler metadata.
+        verify_len_i32_actual = verify_len_per_req.to(torch.int32)
+        verify_len_i32 = verify_len_i32_actual.clamp(min=1, max=block_size_i)
+
+        padding_tokens = 0
+        if _can_use_piecewise_graph:
+            total_verify_tokens_actual = int(verify_len_i32_actual.sum().item())
+
+            # DFLASH verify shape padding is only needed for piecewise cuda graph buckets.
+            cuda_graph_shapes = list(self.server_args.piecewise_cuda_graph_tokens)
+
+            nearest_shape, padding_tokens = DFlashVerifyInput.find_nearest_shape(
+                total_verify_tokens_actual,
+                cuda_graph_shapes,
+            )
+
+            if padding_tokens > 0:
+                # Round-robin pad on GPU with "skip-when-full" semantics.
+                # This preserves the original behavior where leftover padding keeps
+                # flowing to other requests when earlier ones hit block_size.
+                room = (block_size_i - verify_len_i32).clamp_min(0)
+                total_room = int(room.sum().item())
+                to_assign = min(int(padding_tokens), total_room)
+
+                if to_assign > 0:
+                    inc_counts = torch.zeros_like(verify_len_i32)
+                    remaining = to_assign
+
+                    # At each pass, each non-full request can take at most one token,
+                    # matching the original i % bs round-robin behavior.
+                    while remaining > 0:
+                        can_take = (verify_len_i32 + inc_counts) < block_size_i
+                        avail_idx = torch.nonzero(can_take, as_tuple=False).flatten()
+                        if avail_idx.numel() == 0:
+                            break
+
+                        take_n = min(remaining, int(avail_idx.numel()))
+                        sel = avail_idx[:take_n]
+                        inc_counts.index_add_(
+                            0,
+                            sel,
+                            torch.ones((take_n,), dtype=inc_counts.dtype, device=self.device),
+                        )
+                        remaining -= take_n
+
+                    verify_len_i32 = verify_len_i32 + inc_counts
+
+        total_verify_tokens = int(verify_len_i32.sum().item())
         if total_verify_tokens <= 0:
             raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
 
-        # 3b) Flatten tokens and build per-req offsets (CPU)
+        # Build once for Python-side metadata; flatten path still runs on GPU buffers.
+        vlen_list = verify_len_i32.tolist()
+
+        # 3b) Flatten tokens and build per-req offsets
         if (
             self._verify_tokens_flat_buf is None
             or int(self._verify_flat_cap) < total_verify_tokens
@@ -841,15 +829,25 @@ class DFlashWorker:
             self._verify_flat_cap = new_cap
 
         verify_tokens_flat = self._verify_tokens_flat_buf[:total_verify_tokens]
-        verify_start_offsets_cpu = [0] * bs
+
+        # Cache per-bs start offsets tensor on GPU, and materialize list only at boundary.
+        verify_start_offsets_t = self._verify_start_offsets_cache.get(bs)
+        if verify_start_offsets_t is None:
+            verify_start_offsets_t = torch.empty(
+                (bs,), dtype=torch.int32, device=self.device
+            )
+            self._verify_start_offsets_cache[bs] = verify_start_offsets_t
+
         pt = 0
         for i, vlen in enumerate(vlen_list):
-            verify_start_offsets_cpu[i] = pt
+            verify_start_offsets_t[i] = pt
             v = int(vlen)
             if v <= 0:
                 continue
             verify_tokens_flat[pt : pt + v].copy_(draft_tokens[i, :v])
             pt += v
+
+        verify_start_offsets_cpu = verify_start_offsets_t.tolist()
 
         # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
         #     print(f"[DFLASH DEBUG] verify_flat: total={total_verify_tokens}, head={verify_tokens_flat[:min(32, total_verify_tokens)].cpu().tolist()}")
@@ -893,8 +891,11 @@ class DFlashWorker:
             draft_token=verify_tokens_flat,
             positions=verify_positions,
             draft_token_num=int(self.block_size),
-            verify_token_lens=verify_len_cpu,
+            verify_token_lens=verify_len_i32,
             verify_start_offsets_cpu=verify_start_offsets_cpu,
+            verify_token_lens_actual=verify_len_i32_actual,
+            use_cuda_graph=_can_use_piecewise_graph,
+            num_tokens_padded=total_verify_tokens if _can_use_piecewise_graph else -1,
         )
         # stash k-online nll for stats update in verify()
         verify_input._k_online_token_nll = (
@@ -1061,8 +1062,11 @@ class DFlashWorker:
                 self._draft_greedy_gather_cap < needed
                 or self._draft_greedy_gathered_max_buf is None
                 or self._draft_greedy_gathered_ids_buf is None
+                or self._draft_greedy_gathered_lse_buf is None
                 or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
                 or self._draft_greedy_gathered_max_buf.device != hs.device
+                or self._draft_greedy_gathered_lse_buf.dtype != local_max.dtype
+                or self._draft_greedy_gathered_lse_buf.device != hs.device
             ):
                 # Allocate enough space for the max chunk size to avoid reallocations.
                 cap = tp_size * chunk_cap
@@ -1071,6 +1075,9 @@ class DFlashWorker:
                 )
                 self._draft_greedy_gathered_ids_buf = torch.empty(
                     (cap,), dtype=global_ids.dtype, device=hs.device
+                )
+                self._draft_greedy_gathered_lse_buf = torch.empty(
+                    (cap,), dtype=local_max.dtype, device=hs.device
                 )
                 self._draft_greedy_gather_cap = cap
 
