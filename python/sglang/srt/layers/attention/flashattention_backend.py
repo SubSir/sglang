@@ -493,21 +493,41 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
-                ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item()
-                    + self.speculative_num_draft_tokens
+                verify_token_lens = getattr(forward_batch.spec_info, "verify_token_lens", None)
+                use_ragged_verify = (
+                    verify_token_lens is not None
+                    and verify_token_lens.numel() == batch_size
+                    and verify_token_lens.numel() > 0
                 )
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
+
+                if use_ragged_verify:
+                    verify_token_lens = verify_token_lens.to(torch.int32)
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens.to(torch.int32) + verify_token_lens
+                    )
+                    metadata.max_seq_len_q = verify_token_lens.max().item()
+                    metadata.max_seq_len_k = metadata.cache_seqlens_int32.max().item()
+                    metadata.cu_seqlens_q = torch.nn.functional.pad(
+                        torch.cumsum(verify_token_lens, dim=0, dtype=torch.int32),
+                        (1, 0),
+                    )
+                else:
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    ).to(torch.int32)
+                    metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                    metadata.max_seq_len_k = (
+                        forward_batch.seq_lens_cpu.max().item()
+                        + self.speculative_num_draft_tokens
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * self.speculative_num_draft_tokens + 1,
+                        self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
