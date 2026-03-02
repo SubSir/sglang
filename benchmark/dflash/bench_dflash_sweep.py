@@ -586,6 +586,7 @@ def main() -> None:
     dflash_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_verify_tokens: dict[tuple[str, int, str, int], Optional[int]] = {}
+    dflash_forward_ct: dict[tuple[str, int, str, int], Optional[int]] = {}
     baseline_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
 
@@ -731,13 +732,17 @@ def main() -> None:
                         dflash_verify_tokens[(backend, tp, dname, conc)] = (
                             metrics.spec_verify_tokens_sum
                         )
+                        dflash_forward_ct[(backend, tp, dname, conc)] = (
+                            metrics.spec_verify_ct_sum
+                        )
                         dflash_acc[(backend, tp, dname, conc)] = metrics.accuracy
                         print(
                             f"[{dname} DFLASH]   conc={conc:>2} n={n:<4} "
                             f"toks/s={metrics.output_toks_per_s:,.2f} "
                             f"latency={metrics.latency_s:.1f}s "
                             f"accept_len={metrics.spec_accept_length if metrics.spec_accept_length is not None else float('nan'):.3f} "
-                            f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
+                            f"forward_ct={metrics.spec_verify_ct_sum} "
+                            f"spec_verify_tokens_sum={metrics.spec_verify_tokens_sum}"
                         )
             finally:
                 kill_process_tree(dflash_proc.pid)
@@ -871,6 +876,23 @@ def main() -> None:
                     for conc in concurrencies
                 },
                 float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH total forward count")
+        md_lines.append(
+            _format_table(
+                tp_sizes=tp_sizes,
+                concurrencies=concurrencies,
+                values={
+                    (tp, conc): dflash_forward_ct.get(
+                        (backend, tp, dname, conc), None
+                    )
+                    for tp in tp_sizes
+                    for conc in concurrencies
+                },
+                float_fmt="d",
             )
         )
         md_lines.append("")
