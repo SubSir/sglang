@@ -748,11 +748,12 @@ class DFlashWorker:
             )
             token_nll = None
 
-        _is_dflash_verify_mode = batch.forward_mode == ForwardMode.DFLASH_VERIFY
-        _can_use_piecewise_graph = (
-            _is_dflash_verify_mode
-            and self.model_runner.piecewise_cuda_graph_runner is not None
-        )
+        # We are in ragged verify construction path right now. Do not rely on the
+        # incoming batch.forward_mode (it is usually DECODE here and will be set to
+        # DFLASH_VERIFY later in this function), otherwise piecewise CUDA graph is
+        # spuriously disabled.
+        _pcg_runner = self.model_runner.piecewise_cuda_graph_runner
+        _can_use_piecewise_graph = _pcg_runner is not None
         block_size_i = int(self.block_size)
 
         # Keep verify length computations on GPU; move to CPU only where Python lists

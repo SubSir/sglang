@@ -538,15 +538,23 @@ class DFlashVerifyInput(SpecInput):
 
         # --- ragged verify path
         if self._is_ragged_verify():
-            # In cuda graph mode, use actual verify_token_lens instead of padded lengths
-            if self.use_cuda_graph and self.verify_token_lens_actual is not None:
-                vlen_list = self.verify_token_lens_actual.tolist()
-            else:
-                vlen_list = (
+            # For ragged verify under cuda-graph padding, we must distinguish:
+            # - actual_vlen_list: used for logits slicing / acceptance stats
+            # - alloc_vlen_list: used for KV slot accounting/free (allocated out_cache_loc layout)
+            actual_vlen_list = (
+                self.verify_token_lens_actual.tolist()
+                if (self.use_cuda_graph and self.verify_token_lens_actual is not None)
+                else (
                     self.verify_token_lens.tolist()
                     if self.verify_token_lens is not None
                     else []
                 )
+            )
+            alloc_vlen_list = (
+                self.verify_token_lens.tolist()
+                if self.verify_token_lens is not None
+                else actual_vlen_list
+            )
             start_offsets = self.verify_start_offsets_cpu
             if start_offsets is None or len(start_offsets) != bs:
                 raise RuntimeError(
@@ -561,18 +569,13 @@ class DFlashVerifyInput(SpecInput):
             new_verified_cpu: List[int] = []
             segments_hidden: List[torch.Tensor] = []
 
-            # In cuda graph mode, need to recompute start_offsets (based on actual vlen_list)
-            if self.use_cuda_graph and self.verify_token_lens_actual is not None:
-                # Recompute start_offsets since padded start_offsets no longer apply
-                actual_start_offsets = [0]
-                for vlen in vlen_list[:-1]:
-                    actual_start_offsets.append(actual_start_offsets[-1] + vlen)
-            else:
-                actual_start_offsets = start_offsets
-
+            # Logits layout always follows the flattened verify input layout used at
+            # forward time (which may be padded for cuda graph), so offsets must come
+            # from that allocation layout. We only use actual_vlen_list to truncate
+            # per-request logits/candidates when computing acceptance.
             for i, req in enumerate(batch.reqs):
-                vlen = int(vlen_list[i])
-                logit_off = int(actual_start_offsets[i])
+                vlen = int(actual_vlen_list[i])
+                logit_off = int(start_offsets[i])
 
                 current_candidates = self.draft_token[logit_off : logit_off + vlen]
                 current_logits = logits_flat[logit_off : logit_off + vlen]
@@ -726,25 +729,18 @@ class DFlashVerifyInput(SpecInput):
 
             if page_size == 1:
                 out_cache_loc = batch.out_cache_loc
-                # Consistency check
-                # if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
-                #     total_vlen_expected = sum(vlen_list)
-                #     if out_cache_loc.numel() != total_vlen_expected:
-                #         raise RuntimeError(
-                #             f"DFLASH KV Consistency Error: batch.out_cache_loc.numel() ({out_cache_loc.numel()}) "
-                #             f"!= sum(vlen_list) ({total_vlen_expected}). vlen_list={vlen_list}"
-                #         )
-
+                # KV slots were allocated using padded verify_token_lens layout in
+                # prepare_for_verify(), so freeing/compaction must follow alloc_vlen_list.
                 to_free_chunks, kept_chunks = [], []
                 curr = 0
-                for i, vlen in enumerate(vlen_list):
+                for i, vlen_alloc in enumerate(alloc_vlen_list):
                     committed = commit_lens_cpu[i]
                     kept_chunks.append(out_cache_loc[curr : curr + committed])
-                    if vlen > committed:
+                    if vlen_alloc > committed:
                         to_free_chunks.append(
-                            out_cache_loc[curr + committed : curr + vlen]
+                            out_cache_loc[curr + committed : curr + vlen_alloc]
                         )
-                    curr += vlen
+                    curr += vlen_alloc
 
                 if to_free_chunks:
                     batch.token_to_kv_pool_allocator.free(torch.cat(to_free_chunks))
