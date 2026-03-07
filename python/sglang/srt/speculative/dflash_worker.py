@@ -1002,6 +1002,12 @@ class DFlashWorker:
                 return out_token_ids, out_nlls
             return out_token_ids
 
+        out_nlls: Optional[torch.Tensor] = None
+        if return_nll:
+            out_nlls = torch.empty(
+                (num_tokens,), dtype=weight_dtype, device=hidden_states.device
+            )
+
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
             hs = _cast_hs(hidden_states[start:end])
@@ -1011,6 +1017,8 @@ class DFlashWorker:
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
                 local_max, local_arg = torch.max(base_logits, dim=-1)
+                if return_nll:
+                    local_lse = torch.logsumexp(base_logits, dim=-1)
             else:
                 local_max = torch.full(
                     (chunk_len,),
@@ -1021,6 +1029,13 @@ class DFlashWorker:
                 local_arg = torch.zeros(
                     (chunk_len,), dtype=torch.int64, device=hs.device
                 )
+                if return_nll:
+                    local_lse = torch.full(
+                        (chunk_len,),
+                        float("-inf"),
+                        dtype=weight_dtype,
+                        device=hs.device,
+                    )
 
             # Added vocab logits (e.g., LoRA-added embeddings), if present.
             if num_added > 0:
@@ -1037,6 +1052,12 @@ class DFlashWorker:
                 local_arg = torch.where(
                     use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
                 )
+                if return_nll:
+                    added_lse = torch.logsumexp(added_logits, dim=-1)
+                    local_lse = torch.logsumexp(
+                        torch.stack([local_lse, added_lse.to(weight_dtype)], dim=0),
+                        dim=0,
+                    )
 
             # Convert local argmax indices to global token ids.
             if num_added == 0:
@@ -1054,6 +1075,10 @@ class DFlashWorker:
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                if return_nll:
+                    out_nlls[start:end] = -(
+                        local_max.to(weight_dtype) - local_lse.to(weight_dtype)
+                    )
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -1118,97 +1143,16 @@ class DFlashWorker:
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
-        # Compute NLL if requested (for k-online prediction)
+            if return_nll:
+                gathered_lse_flat = self._draft_greedy_gathered_lse_buf[:needed]
+                tp_group.all_gather_into_tensor(gathered_lse_flat, local_lse.contiguous())
+                gathered_lse = gathered_lse_flat.view(tp_size, chunk_len)
+                global_lse = torch.logsumexp(gathered_lse, dim=0)
+                global_max_val = gathered_max.gather(0, best_rank.unsqueeze(0)).view(-1)
+                out_nlls[start:end] = -(global_max_val.to(weight_dtype) - global_lse)
+
         if return_nll:
-            # We need LSE (log sum exp) to compute NLL = -(max - LSE)
-            # Re-compute logits to get LSE (this is a bit wasteful but cleaner)
-            out_nlls = torch.empty(
-                (num_tokens,), dtype=weight_dtype, device=hidden_states.device
-            )
-
-            # Fast path: recompute base logits for NLL
-            if tp_size == 1 and num_added == 0:
-                for start in range(0, num_tokens, int(chunk_size)):
-                    end = min(num_tokens, start + int(chunk_size))
-                    hs = _cast_hs(hidden_states[start:end])
-                    if num_org > 0:
-                        base_logits = torch.matmul(hs, weight[:num_org].T)
-                        local_max = torch.max(base_logits, dim=-1).values
-                        local_lse = torch.logsumexp(base_logits, dim=-1)
-                        out_nlls[start:end] = -(
-                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
-                        )
-                    else:
-                        out_nlls[start:end] = 0.0
-            else:
-                # Slow path: need to gather LSE across ranks
-                # Already have gathered_max (local_max) and gathered_ids, we need gathered_lse
-                # Re-use the gather buffers
-                for start in range(0, num_tokens, int(chunk_size)):
-                    end = min(num_tokens, start + int(chunk_size))
-                    hs = _cast_hs(hidden_states[start:end])
-                    chunk_len = int(hs.shape[0])
-
-                    # Re-compute local logits for LSE
-                    if num_org > 0:
-                        base_logits = torch.matmul(hs, weight[:num_org].T)
-                        local_max = torch.max(base_logits, dim=-1).values
-                        local_lse = torch.logsumexp(base_logits, dim=-1)
-                    else:
-                        local_max = torch.full(
-                            (chunk_len,),
-                            torch.finfo(weight_dtype).min,
-                            dtype=weight_dtype,
-                            device=hs.device,
-                        )
-                        local_lse = torch.full(
-                            (chunk_len,),
-                            float("-inf"),
-                            dtype=weight_dtype,
-                            device=hs.device,
-                        )
-
-                    if num_added > 0:
-                        added_logits = torch.matmul(
-                            hs, weight[num_org_padded : num_org_padded + num_added].T
-                        )
-                        added_lse = torch.logsumexp(added_logits, dim=-1)
-                        # Combine LSE
-                        local_lse = torch.logsumexp(
-                            torch.stack([local_lse, added_lse.to(weight_dtype)], dim=0),
-                            dim=0,
-                        )
-
-                    if tp_size == 1:
-                        out_nlls[start:end] = -(
-                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
-                        )
-                    else:
-                        # Gather LSE across ranks
-                        needed = tp_size * chunk_len
-                        gathered_lse_flat = self._draft_greedy_gathered_lse_buf[:needed]
-                        tp_group.all_gather_into_tensor(
-                            gathered_lse_flat, local_lse.contiguous()
-                        )
-                        gathered_lse = gathered_lse_flat.view(tp_size, chunk_len)
-                        global_lse = torch.logsumexp(gathered_lse, dim=0)
-
-                        # Get global max for NLL
-                        gathered_max_flat = self._draft_greedy_gathered_max_buf[:needed]
-                        tp_group.all_gather_into_tensor(
-                            gathered_max_flat, local_max.contiguous()
-                        )
-                        gathered_max = gathered_max_flat.view(tp_size, chunk_len)
-                        best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
-                        torch.argmax(gathered_max, dim=0, out=best_rank)
-                        global_max_val = gathered_max.gather(
-                            0, best_rank.unsqueeze(0)
-                        ).view(-1)
-
-                        out_nlls[start:end] = -(
-                            global_max_val.to(weight_dtype) - global_lse
-                        )
-
+            assert out_nlls is not None
             return out_token_ids, out_nlls
 
         return out_token_ids
