@@ -707,25 +707,9 @@ class DFlashVerifyInput(SpecInput):
                         hidden_flat[logit_off : logit_off + appended]
                     )
 
-                # Update k-online stats if present
-                if (
-                    hasattr(self, "_k_online_token_nll")
-                    and getattr(self, "_k_online_token_nll") is not None
-                ):
-                    if getattr(req, "k_online_sum_by_acc", None) is not None:
-                        token_nll_i = self._k_online_token_nll[i]
-                        num_pos = int(token_nll_i.shape[0])
-                        acc_idx = min(int(acc_true), num_pos)
-                        req.k_online_sum_by_acc[acc_idx, :] += token_nll_i
-                        req.k_online_count_by_acc[acc_idx] += 1
-                        req.k_online_step += 1
-
             commit_lens = torch.tensor(
                 commit_lens_cpu, dtype=torch.int32, device=device
             )
-            # clear cache
-            if hasattr(self, "_k_online_token_nll"):
-                self._k_online_token_nll = None
 
             if page_size == 1:
                 out_cache_loc = batch.out_cache_loc
