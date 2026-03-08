@@ -210,21 +210,47 @@ class DFlashWorker:
         self._verify_start_offsets_cache: Dict[int, torch.Tensor] = {}
 
         # Verify-length prediction offset on top of expected accepted length.
+        # Keep using the original env key.
         self._verify_len_offset: int = int(
-            os.environ.get("SGLANG_DFLASH_VERIFY_LEN_OFFSET", "2")
+            os.environ.get("SGLANG_DFLASH_VERIFY_LEN_OFFSET", "4")
+        )
+
+        # --- K-online vs block verify mode selection
+        # SGLANG_DFLASH_K_ONLINE=1: must use ragged verify (cannot use block verify)
+        # SGLANG_DFLASH_K_ONLINE=0: block verify can be enabled/disabled by SGLANG_DFLASH_BLOCK_VERIFY
+        self._k_online_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0"))
         )
 
         # --- Block verify vs ragged verify mode selection
         # SGLANG_DFLASH_BLOCK_VERIFY=1: use original block verify (TARGET_VERIFY + custom_mask)
-        # SGLANG_DFLASH_BLOCK_VERIFY=0: use ragged verify (DFLASH_VERIFY)
+        # SGLANG_DFLASH_BLOCK_VERIFY=0: use ragged verify (DFLASH_VERIFY / extend-style verify path)
         self._block_verify_enabled: bool = bool(
             int(os.environ.get("SGLANG_DFLASH_BLOCK_VERIFY", "1"))
         )
-        self._use_ragged_verify = not self._block_verify_enabled
+
+        # Mutual exclusion: k-online requires ragged verify.
+        if self._k_online_enabled and self._block_verify_enabled:
+            raise ValueError(
+                "Invalid DFlash config: SGLANG_DFLASH_K_ONLINE=1 and "
+                "SGLANG_DFLASH_BLOCK_VERIFY=1 are contradictory. "
+                "k-online mode requires ragged verify "
+                "(set SGLANG_DFLASH_BLOCK_VERIFY=0)."
+            )
+
+        # Effective verify mode:
+        # - k_online=1 -> ragged verify
+        # - k_online=0, block_verify=1 -> block verify
+        # - k_online=0, block_verify=0 -> ragged verify (extend-style verify path)
+        if self._k_online_enabled:
+            self._use_ragged_verify = True
+        else:
+            self._use_ragged_verify = not self._block_verify_enabled
 
         if self.tp_rank == 0:
             logger.info(
-                "DFLASH verify mode: block_verify=%s -> %s (verify_len_offset=%s)",
+                "DFLASH verify mode: k_online=%s, block_verify=%s -> %s (verify_len_offset=%s)",
+                self._k_online_enabled,
                 self._block_verify_enabled,
                 "ragged" if self._use_ragged_verify else "block",
                 self._verify_len_offset,
@@ -637,7 +663,8 @@ class DFlashWorker:
         # accepted length with conditional probabilities:
         #   E[acc] = sum_j P(acc >= j+1) = sum_j prod_{t<=j} confidence[t]
         # Then set verify length as: verify_len = 1 + min(E[acc] + offset, block_size-1).
-        if draft_token_confidence is not None and int(self.block_size) > 1:
+        # k_online is the gate for enabling this confidence-based adaptive verify length.
+        if self._k_online_enabled and draft_token_confidence is not None and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
             confidence = draft_token_confidence.to(torch.float32).clamp_(0.0, 1.0)
             survive_prefix = torch.cumprod(confidence, dim=1)
@@ -804,7 +831,6 @@ class DFlashWorker:
             use_cuda_graph=_can_use_piecewise_graph,
             num_tokens_padded=total_verify_tokens if _can_use_piecewise_graph else -1,
         )
-
         # 3c) Prepare batch for EXTEND-style ragged verify
         verify_input.prepare_for_verify(batch, self.page_size)
 
