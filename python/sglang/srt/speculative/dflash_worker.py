@@ -22,6 +22,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
+    build_tree_verify_tokens,
 )
 from sglang.srt.utils import is_cuda
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -222,6 +223,21 @@ class DFlashWorker:
             int(os.environ.get("SGLANG_DFLASH_K_ONLINE", "0"))
         )
 
+        # --- EAGLE-style tree verify mode (TARGET_VERIFY with tree mask)
+        # SGLANG_DFLASH_TREE_VERIFY=1: enable eagle-style tree verify (uses TARGET_VERIFY mode)
+        # This is different from topk_tree: tree_verify uses full tree attention mask like EAGLE,
+        # while topk_tree only changes token selection but still uses linear verify
+        self._tree_verify_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0"))
+        )
+        # SGLANG_DFLASH_TREE_VERIFY_TOPK: topk for tree construction (default=8)
+        self._tree_verify_topk: int = int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY_TOPK", "4"))
+        # SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS: number of draft tokens (default=block_size)
+        self._tree_num_draft_tokens: int = int(self.block_size)
+        _tree_nums_env = os.environ.get("SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS")
+        if _tree_nums_env is not None:
+            self._tree_num_draft_tokens = int(_tree_nums_env)
+
         # --- Block verify vs ragged verify mode selection
         # SGLANG_DFLASH_BLOCK_VERIFY=1: use original block verify (TARGET_VERIFY + custom_mask)
         # SGLANG_DFLASH_BLOCK_VERIFY=0: use ragged verify (DFLASH_VERIFY / extend-style verify path)
@@ -237,6 +253,11 @@ class DFlashWorker:
                 "k-online mode requires ragged verify "
                 "(set SGLANG_DFLASH_BLOCK_VERIFY=0)."
             )
+        if self._tree_verify_enabled and not self._block_verify_enabled:
+            raise ValueError(
+                "Invalid DFlash config: SGLANG_DFLASH_TREE_VERIFY=1 requires "
+                "block verify (set SGLANG_DFLASH_BLOCK_VERIFY=1)."
+            )
 
         # Effective verify mode:
         # - k_online=1 -> ragged verify
@@ -247,11 +268,20 @@ class DFlashWorker:
         else:
             self._use_ragged_verify = not self._block_verify_enabled
 
+        tp_size = int(get_tp_group().world_size)
+        if self._tree_verify_enabled and tp_size > 1:
+            raise ValueError(
+                "DFLASH tree-verify mode currently requires tp_size==1; "
+                "disabling tree-verify for tp_size=%s.",
+                tp_size,
+            )
+
         if self.tp_rank == 0:
             logger.info(
-                "DFLASH verify mode: k_online=%s, block_verify=%s -> %s (verify_len_offset=%s)",
+                "DFLASH verify mode: k_online=%s, block_verify=%s, tree_verify=%s -> %s (verify_len_offset=%s)",
                 self._k_online_enabled,
                 self._block_verify_enabled,
+                self._tree_verify_enabled,
                 "ragged" if self._use_ragged_verify else "block",
                 self._verify_len_offset,
             )
@@ -567,31 +597,7 @@ class DFlashWorker:
                     forward_batch
                 ).logits_output
 
-                # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-                #     print(f"[DFLASH DEBUG] draft_hidden: mean={draft_hidden.mean().item():.4f}, std={draft_hidden.std().item():.4f}, has_nan={torch.isnan(draft_hidden).any().item()}")
 
-                # if os.environ.get("SGLANG_DFLASH_NAN_GUARD", "1") == "1":
-                #     if torch.isnan(draft_hidden).any().item() or torch.isinf(draft_hidden).any().item():
-                #         # Dump minimal metadata to diagnose position/KV-index issues.
-                #         pos_min = int(positions.min().item()) if positions.numel() > 0 else -1
-                #         pos_max = int(positions.max().item()) if positions.numel() > 0 else -1
-                #         pl_min = int(prefix_lens.min().item()) if prefix_lens.numel() > 0 else -1
-                #         pl_max = int(prefix_lens.max().item()) if prefix_lens.numel() > 0 else -1
-                #         oc_min = int(block_cache_loc.min().item()) if block_cache_loc.numel() > 0 else -1
-                #         oc_max = int(block_cache_loc.max().item()) if block_cache_loc.numel() > 0 else -1
-
-                #         # Check req_to_token mapping for one req
-                #         req_idx = 0
-                #         token_pool = self.draft_model_runner.req_to_token_pool.req_to_token[batch.req_pool_indices[req_idx]]
-                #         relevant_tokens = token_pool[block_start[req_idx]:block_end[req_idx]]
-
-                #         raise RuntimeError(
-                #             "DFLASH_NAN_GUARD: NaN/Inf in draft_hidden. "
-                #             f"bs={bs}, block_size={int(self.block_size)}, seq_lens_sum={seq_lens_sum}, "
-                #             f"prefix_lens=[{pl_min},{pl_max}], positions=[{pos_min},{pos_max}], "
-                #             f"block_cache_loc=[{oc_min},{oc_max}], "
-                #             f"req0_pool_sample={relevant_tokens.cpu().tolist()}"
-                #         )
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -599,7 +605,7 @@ class DFlashWorker:
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
         # --- 2.5) Sample draft tokens and per-token confidence.
-        if self._use_ragged_verify and int(self.block_size) > 1:
+        if self._block_verify_enabled:
             draft_next_flat, draft_nll_flat = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
                 lm_head=lm_head,
@@ -610,7 +616,7 @@ class DFlashWorker:
             draft_token_confidence = torch.exp(-draft_nll_flat).view(
                 bs, self.block_size - 1
             )
-        else:
+        elif not self._topk_tree_enabled:
             draft_next = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(
                     -1, draft_hidden.shape[-1]
@@ -619,25 +625,61 @@ class DFlashWorker:
             ).view(bs, self.block_size - 1)
             draft_token_confidence = None
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
 
-        # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-        #     print(f"[DFLASH DEBUG] draft_next: min={draft_next.min().item()}, max={draft_next.max().item()}, zero_ratio={(draft_next == 0).float().mean().item():.4f}")
-        #     print(f"[DFLASH DEBUG] block_ids[:,0]: min={block_ids[:,0].min().item()}, max={block_ids[:,0].max().item()}")
-        #     for i in range(min(3, bs)):
-        #         print(f"[DFLASH DEBUG] draft_tokens[{i}] = {draft_tokens[i].cpu().tolist()}")
+
 
         # --- 3) Choose verify path based on env
         if not self._use_ragged_verify:
-            # ===== block verify (original) =====
+            # ===== block verify (original or tree verify) =====
             positions = positions_2d.reshape(-1)
-            verify_input = DFlashVerifyInput(
-                draft_token=draft_tokens.reshape(-1),
-                positions=positions,
-                draft_token_num=self.block_size,
-            )
+            
+            if self._tree_verify_enabled and int(self.block_size) > 1:
+                # ===== EAGLE-style tree verify =====
+                # Compute draft logits for tree construction
+                tree_topk = int(self._tree_verify_topk)
+                tree_num_draft_tokens = int(self._tree_num_draft_tokens)
+                
+                # Compute logits from draft hidden states
+                draft_logits = torch.matmul(
+                    draft_hidden[:, 1:, :],  # [bs, block_size-1, hidden]
+                    lm_head.weight[: lm_head.shard_indices.num_org_elements].T,
+                )  # [bs, block_size-1, vocab]
+                
+                # Build tree tokens using heap-based approach
+                # Only limit total number of tokens, no restriction on tree depth/steps
+                (
+                    tree_draft_tokens,
+                    tree_parent_list,
+                    tree_top_scores_index,
+                    tree_probs,
+                ) = build_tree_verify_tokens(
+                    verified_id=block_ids[:, 0],  # [bs]
+                    draft_logits=draft_logits,
+                    topk=tree_topk,
+                    num_draft_tokens=tree_num_draft_tokens,
+                )
+                # For tree verify, we use TARGET_VERIFY mode with tree structure
+                # The attention backend will build the tree mask based on parent_list
+                verify_input = DFlashVerifyInput(
+                    draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
+                    positions=None,  # Will be computed by attention backend
+                    draft_token_num=tree_num_draft_tokens,
+                    # Tree metadata for eagle-style verify
+                    tree_parent_list=tree_parent_list,
+                    tree_topk=tree_topk,
+                )
+
+            else:
+                draft_tokens = self._draft_block_tokens_buf[:bs]
+                draft_tokens[:, 0].copy_(block_ids[:, 0])
+                draft_tokens[:, 1:].copy_(draft_next)
+                # ===== Original linear block verify =====
+                verify_input = DFlashVerifyInput(
+                    draft_token=draft_tokens.reshape(-1),
+                    positions=positions,
+                    draft_token_num=self.block_size,
+                )
+            
             _, build_custom_mask = self._resolve_verify_mask_policy()
             verify_input.prepare_for_verify(
                 batch,

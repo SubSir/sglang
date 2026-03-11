@@ -4,6 +4,7 @@ import logging
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
+import heapq
 import torch
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -275,3 +276,225 @@ def compute_dflash_accept_len_and_bonus(
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)
+
+def compute_dflash_tree_accept_len_and_bonus(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    parent_list: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute DFlash accept lengths and bonus tokens (tree verify rule).
+
+    Args:
+        candidates: Token ids proposed by the DFlash draft, including the current token.
+            Shape: [bs, block_size]. candidates[:, 0] is the current token.
+        target_predict: Token ids predicted by the target model for each position in the block.
+            Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
+        parent_list: Parent indices for each token, shape [bs, block_size]. parent_list[b, i] is the parent of the i-th token in request b.
+
+    Returns:
+        accept_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
+        bonus: int64 tensor [bs], the target-predicted token for the last accepted node (the "bonus" token to append).
+        path_tokens: int64 tensor [bs, block_size - 1], tokens along the longest accepted path (excluding root),
+            padded with -1 beyond accept_len.
+        path_indices: int64 tensor [bs, block_size], node indices along the longest accepted path (including root),
+            padded with -1 beyond accept_len.
+
+    Notes:
+        For each request, we walk all paths from the root and accept the longest path
+        where each node's candidate matches the target prediction of its parent.
+    """
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if target_predict.shape != candidates.shape:
+        raise ValueError(
+            "target_predict must have the same shape as candidates. "
+            f"candidates.shape={tuple(candidates.shape)}, target_predict.shape={tuple(target_predict.shape)}"
+        )
+    if parent_list.shape != candidates.shape:
+        raise ValueError(
+            "parent_list must have the same shape as candidates. "
+            f"parent_list.shape={tuple(parent_list.shape)}"
+        )
+
+    bs, block_size = candidates.shape
+    if bs <= 0:
+        raise ValueError(f"batch size must be positive, got {bs}.")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+
+    device = candidates.device
+    accepted = torch.zeros((bs, block_size), dtype=torch.bool, device=device)
+    accepted[:, 0] = True
+
+    safe_parents = parent_list.clamp(min=0)
+    parent_targets = target_predict.gather(1, safe_parents)
+    accepted[:, 1:] = candidates[:, 1:] == parent_targets[:, 1:]
+
+    depth_accept = torch.full((bs, block_size), -1, dtype=torch.int32, device=device)
+    depth_accept[:, 0] = 0
+
+    for idx in range(1, block_size):
+        parent = parent_list[:, idx]
+        safe_parent = parent.clamp(min=0)
+        parent_depth = depth_accept.gather(1, safe_parent.unsqueeze(1)).squeeze(1)
+        depth_accept[:, idx] = torch.where(
+            accepted[:, idx] & (parent >= 0) & (parent_depth >= 0),
+            parent_depth + 1,
+            torch.tensor(-1, dtype=torch.int32, device=device),
+        )
+
+    accept_len, best_idx = depth_accept.max(dim=1)
+    bonus = target_predict[torch.arange(bs, device=device), best_idx]
+
+    path_indices = torch.full((bs, block_size), -1, dtype=torch.long, device=device)
+    current = best_idx.to(torch.long)
+    accept_len_long = accept_len.to(torch.long)
+
+    for step in range(block_size):
+        position = accept_len_long - step
+        active = position >= 0
+        if not active.any():
+            break
+        batch_idx = torch.arange(bs, device=device)
+        path_indices[batch_idx[active], position[active]] = current[active]
+        current_safe = current.clamp(min=0)
+        next_parent = parent_list.gather(1, current_safe.unsqueeze(1)).squeeze(1)
+        current = torch.where(active, next_parent, current)
+
+    selected_indices = path_indices[:, 1:].clamp(min=0)
+    gathered_tokens = candidates.gather(1, selected_indices)
+    positions = torch.arange(1, block_size, device=device).unsqueeze(0)
+    path_mask = positions <= accept_len_long.unsqueeze(1)
+    path_tokens = torch.where(path_mask, gathered_tokens, torch.full_like(gathered_tokens, -1))
+
+    return (
+        accept_len,
+        bonus.to(torch.int64),
+        path_tokens.to(torch.int64),
+        path_indices.to(torch.int64),
+    )
+
+
+def build_tree_verify_tokens(
+    *,
+    verified_id: torch.Tensor,
+    draft_logits: torch.Tensor,
+    topk: int,
+    num_draft_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build tree verify tokens for DFlash eagle-style tree verify (TARGET_VERIFY mode).
+
+    This function constructs a tree of draft tokens similar to EAGLE, where:
+    - Position 0: verified_id (current token)
+    - Positions 1..topk: top-k candidates from position 0
+    - Positions topk+1..: children of previous candidates based on tree structure
+
+    Args:
+        verified_id: Current token per request, shape [bs]
+        draft_logits: Draft model logits, shape [bs, num_steps, vocab_size]
+        topk: Number of top candidates to select at each node
+        num_draft_tokens: Total number of tokens in the tree
+
+    Returns:
+        draft_tokens: Flattened tree tokens, shape [bs * num_draft_tokens]
+        parent_list: Parent indices for each token, shape [bs, num_draft_tokens - 1]
+        top_scores_index: Top-k indices sorted by score, shape [bs, num_draft_tokens - 1]
+        tree_mask: Attention mask for tree structure (optional, can be built by backend)
+    """
+    bs = draft_logits.shape[0]
+    device = draft_logits.device
+
+    # Compute softmax probabilities
+    draft_probs = torch.softmax(draft_logits, dim=-1)  # [bs, num_steps, vocab]
+
+    # Select top-k tokens at each position
+    topk_probs, topk_ids = torch.topk(draft_probs, k=topk, dim=-1)  # [bs, num_steps, topk]
+
+    num_pos = topk_probs.shape[1]  # Number of positions (num_steps)
+    if num_pos == 0:
+        # No positions to sample from, return just verified_id
+        draft_tokens = verified_id.unsqueeze(1).expand(bs, num_draft_tokens).flatten()
+        parent_list = torch.full((bs, num_draft_tokens), -1, dtype=torch.long, device=device)
+        top_scores_index = torch.full((bs, num_draft_tokens), -1, dtype=torch.long, device=device)
+        return draft_tokens, parent_list, top_scores_index, topk_probs
+
+    if topk == 1:
+        # Linear chain: top-1 at each position.
+        tokens = torch.cat([verified_id[:, None], topk_ids[:, :, 0]], dim=1)
+        if num_draft_tokens < tokens.shape[1]:
+            tokens = tokens[:, :num_draft_tokens]
+        elif num_draft_tokens > tokens.shape[1]:
+            pad_count = num_draft_tokens - tokens.shape[1]
+            pad_tokens = tokens[:, -1:].expand(bs, pad_count)
+            tokens = torch.cat([tokens, pad_tokens], dim=1)
+
+        parent = torch.arange(num_draft_tokens, device=device).unsqueeze(0).expand(bs, -1) - 1
+        top_scores_index = torch.arange(num_draft_tokens, device=device).unsqueeze(0).expand(bs, -1) - 1
+        draft_tokens = tokens.flatten()
+        return draft_tokens, parent, top_scores_index, topk_probs
+
+    # Build tree using heap-based approach (similar to dflash_transformers.py)
+    # For each request, build paths through the tree
+    draft_tokens_list = []
+    parent_list_list = []
+    top_scores_index_list = []
+
+    for b in range(bs):
+        # Heap: (-joint_prob, path, prob, parent_idx)
+        heap: list[tuple[float, list[int], float, int]] = []
+
+        # Initialize with position 0's top-k candidates
+        for r in range(topk):
+            p = float(topk_probs[b, 0, r].item())
+            token_id = int(topk_ids[b, 0, r].item())
+            heapq.heappush(heap, (-p, [token_id], p, -1))  # parent=-1 for root children
+
+        selected_paths: list[tuple[list[int], float, int]] = []
+        i = 0
+
+        # Only limit by total number of tokens (matching dflash_transformers.py logic)
+        while heap and i < num_draft_tokens - 1:
+            neg_prob, path, prob, parent_idx = heapq.heappop(heap)
+            i += 1
+            selected_paths.append((path, prob, parent_idx))
+
+            # Expand to next position
+            pos = len(path) - 1
+            next_pos = pos + 1
+
+            # Only expand if there are more positions available
+            if next_pos < num_pos:
+                for r in range(topk):
+                    next_p = float(topk_probs[b, next_pos, r].item())
+                    next_token = int(topk_ids[b, next_pos, r].item())
+                    joint_prob = prob * next_p
+                    heapq.heappush(heap, (-joint_prob, path + [next_token], joint_prob, len(selected_paths) - 1))
+
+        # Build draft tokens for this request
+        # Note: tokens[0] is verified_id (root), tokens[1:] are tree candidates
+        tokens = [int(verified_id[b].item())]
+        parents = [-1]  # Root has no parent
+        score_indices = [-1]  # Root has no score index
+
+        for idx, (path, _, parent_idx) in enumerate(selected_paths):
+            tokens.append(path[-1])
+            # parent_idx refers to index in selected_paths, need to offset by 1 for tokens list
+            parents.append(parent_idx + 1 if parent_idx >= 0 else 0)
+            score_indices.append(idx)
+
+        # Pad if needed
+        while len(tokens) < num_draft_tokens:
+            tokens.append(tokens[-1])
+            parents.append(-1)
+            score_indices.append(-1)
+
+        draft_tokens_list.append(torch.tensor(tokens, dtype=torch.long, device=device))
+        parent_list_list.append(torch.tensor(parents, dtype=torch.long, device=device))
+        top_scores_index_list.append(torch.tensor(score_indices, dtype=torch.long, device=device))
+
+    draft_tokens = torch.stack(draft_tokens_list, dim=0).flatten()  # [bs * num_draft_tokens]
+    parent_list = torch.stack(parent_list_list, dim=0)  # [bs, num_draft_tokens]
+    top_scores_index = torch.stack(top_scores_index_list, dim=0)  # [bs, num_draft_tokens]
+
+    return draft_tokens, parent_list, top_scores_index, topk_probs
