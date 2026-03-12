@@ -682,10 +682,15 @@ class DFlashWorker:
                 )
             
             _, build_custom_mask = self._resolve_verify_mask_policy()
+            tree_mask_buf, position_buf = (
+                self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+            )
             verify_input.prepare_for_verify(
                 batch,
                 self.page_size,
                 build_custom_mask=build_custom_mask,
+                tree_mask_buf=tree_mask_buf,
+                position_buf=position_buf,
             )
 
             batch.forward_mode = (

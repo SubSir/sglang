@@ -284,6 +284,8 @@ class DFlashVerifyInput(SpecInput):
         page_size: int,
         *,
         build_custom_mask: bool = True,
+        tree_mask_buf: Optional[torch.Tensor] = None,
+        position_buf: Optional[torch.Tensor] = None,
     ):
         if batch.forward_mode.is_idle():
             return
@@ -332,6 +334,8 @@ class DFlashVerifyInput(SpecInput):
                 spec_steps=depth,
                 num_verify_tokens=self.draft_token_num,
                 tree_mask_mode=TreeMaskMode.FULL_MASK,
+                tree_mask_buf=tree_mask_buf,
+                position_buf=position_buf,
             )
             self.custom_mask = tree_mask
             self.positions = positions
@@ -458,35 +462,6 @@ class DFlashVerifyInput(SpecInput):
             and self.tree_selected_index is not None
             and self.tree_selected_index.numel() > 0
         ):
-            if self.custom_mask is None or self.positions is None:
-                seq_lens = batch.seq_lens.to(torch.int32)
-                seq_lens_sum = int(seq_lens.sum().item())
-                depth = int(self.draft_token_num)
-                (
-                    tree_mask,
-                    positions,
-                    retrive_index,
-                    retrive_next_token,
-                    retrive_next_sibling,
-                    _,
-                ) = build_tree_kernel_efficient(
-                    verified_id=self.draft_token.view(bs, self.draft_token_num)[:, 0],
-                    parent_list=self.tree_parent_list,
-                    top_scores_index=self.tree_selected_index,
-                    draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
-                    seq_lens=seq_lens,
-                    seq_lens_sum=seq_lens_sum,
-                    topk=int(self.tree_topk),
-                    spec_steps=depth,
-                    num_verify_tokens=self.draft_token_num+1,
-                    tree_mask_mode=TreeMaskMode.FULL_MASK,
-                )
-                self.custom_mask = tree_mask
-                self.positions = positions
-                self.tree_retrive_index = retrive_index
-                self.tree_retrive_next_token = retrive_next_token
-                self.tree_retrive_next_sibling = retrive_next_sibling
-
             return
 
         if self.draft_token_num <= 0:
