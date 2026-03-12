@@ -14,7 +14,8 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus, compute_dflash_tree_accept_len_and_bonus
+from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient, verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -148,10 +149,14 @@ class DFlashVerifyInput(SpecInput):
 
     # Tree verify metadata (for EAGLE-style tree verify)
     # These fields are used when tree_verify is enabled
-    tree_parent_list: Optional[torch.Tensor] = None  # Parent indices for tree structure
+    tree_parent_list: Optional[torch.Tensor] = None  # Full topk-tree parent list
+    tree_selected_index: Optional[torch.Tensor] = None  # Selected indices inside full tree
     tree_topk: int = 0  # Topk used in tree construction
 
     custom_mask: Optional[torch.Tensor] = None
+    tree_retrive_index: Optional[torch.Tensor] = None
+    tree_retrive_next_token: Optional[torch.Tensor] = None
+    tree_retrive_next_sibling: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
@@ -296,32 +301,43 @@ class DFlashVerifyInput(SpecInput):
             self.positions is None
             and self.tree_parent_list is not None
             and self.tree_parent_list.numel() > 0
+            and self.tree_selected_index is not None
+            and self.tree_selected_index.numel() > 0
         ):
-            tree_parents = self.tree_parent_list
-            if tree_parents.shape[1] == self.draft_token_num - 1:
-                root_pad = torch.full(
-                    (bs, 1), -1, dtype=tree_parents.dtype, device=tree_parents.device
-                )
-                tree_parents = torch.cat([root_pad, tree_parents], dim=1)
-            if tree_parents.shape[1] != self.draft_token_num:
+            seq_lens = batch.seq_lens.to(torch.int64)
+            seq_lens_sum = int(seq_lens.sum().item())
+            depth = int(self.draft_token_num) - 1
+            expected_nodes = int(self.tree_topk) * (depth - 1) + 1
+            if self.tree_parent_list.size(1) != expected_nodes:
                 raise RuntimeError(
-                    "DFLASH tree verify expects tree_parent_list with shape "
-                    f"[bs, draft_token_num], got {tuple(tree_parents.shape)}."
+                    "DFLASH tree verify parent_list shape mismatch: "
+                    f"got {self.tree_parent_list.size(1)}, expected {expected_nodes} "
+                    f"(topk={int(self.tree_topk)}, depth={depth})."
                 )
-            depth = torch.zeros(
-                (bs, self.draft_token_num), dtype=torch.int32, device=batch.device
+            (
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                _,
+            ) = build_tree_kernel_efficient(
+                verified_id=self.draft_token.view(bs, self.draft_token_num)[:, 0],
+                parent_list=self.tree_parent_list,
+                top_scores_index=self.tree_selected_index,
+                draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                topk=int(self.tree_topk),
+                spec_steps=depth,
+                num_verify_tokens=self.draft_token_num,
+                tree_mask_mode=TreeMaskMode.FULL_MASK,
             )
-            for i in range(1, self.draft_token_num):
-                parent = tree_parents[:, i]
-                parent_valid = parent >= 0
-                parent_idx = parent.clamp(min=0)
-                parent_depth = depth.gather(1, parent_idx.unsqueeze(1)).squeeze(1)
-                depth[:, i] = torch.where(
-                    parent_valid, parent_depth + 1, torch.zeros_like(parent_depth)
-                )
-            positions_2d = batch.seq_lens.to(torch.int32).unsqueeze(1) + depth
-            self.positions = positions_2d.flatten()
-            
+            self.custom_mask = tree_mask
+            self.positions = positions
+            self.tree_retrive_index = retrive_index
+            self.tree_retrive_next_token = retrive_next_token
+            self.tree_retrive_next_sibling = retrive_next_sibling
 
         # ragged verify: do not override batch.positions, let ForwardBatchInfo compute using extend_* fields
         if self.positions is not None:
@@ -439,45 +455,37 @@ class DFlashVerifyInput(SpecInput):
         if (
             self.tree_parent_list is not None
             and self.tree_parent_list.numel() > 0
+            and self.tree_selected_index is not None
+            and self.tree_selected_index.numel() > 0
         ):
-            tree_parents = self.tree_parent_list
-            if tree_parents.shape[1] == self.draft_token_num - 1:
-                root_pad = torch.full(
-                    (bs, 1), -1, dtype=tree_parents.dtype, device=tree_parents.device
+            if self.custom_mask is None or self.positions is None:
+                seq_lens = batch.seq_lens.to(torch.int32)
+                seq_lens_sum = int(seq_lens.sum().item())
+                depth = int(self.draft_token_num)
+                (
+                    tree_mask,
+                    positions,
+                    retrive_index,
+                    retrive_next_token,
+                    retrive_next_sibling,
+                    _,
+                ) = build_tree_kernel_efficient(
+                    verified_id=self.draft_token.view(bs, self.draft_token_num)[:, 0],
+                    parent_list=self.tree_parent_list,
+                    top_scores_index=self.tree_selected_index,
+                    draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
+                    seq_lens=seq_lens,
+                    seq_lens_sum=seq_lens_sum,
+                    topk=int(self.tree_topk),
+                    spec_steps=depth,
+                    num_verify_tokens=self.draft_token_num+1,
+                    tree_mask_mode=TreeMaskMode.FULL_MASK,
                 )
-                tree_parents = torch.cat([root_pad, tree_parents], dim=1)
-            if tree_parents.shape[1] != self.draft_token_num:
-                raise RuntimeError(
-                    "DFLASH tree verify expects tree_parent_list with shape "
-                    f"[bs, draft_token_num], got {tuple(tree_parents.shape)}."
-                )
-
-            mask_chunks: List[torch.Tensor] = []
-            for i, prefix_len in enumerate(batch.seq_lens_cpu.tolist()):
-                prefix_len_i = int(prefix_len)
-                kv_len = prefix_len_i + self.draft_token_num
-
-                allow = torch.zeros(
-                    (self.draft_token_num, kv_len), dtype=torch.bool, device=device
-                )
-                if prefix_len_i > 0:
-                    allow[:, :prefix_len_i] = True
-
-                parents_row = tree_parents[i]
-                for q in range(self.draft_token_num):
-                    node = q
-                    while node >= 0:
-                        allow[q, prefix_len_i + node] = True
-                        node = int(parents_row[node].item())
-
-                mask_chunks.append(allow.flatten())
-
-            mask = (
-                torch.cat(mask_chunks, dim=0)
-                if mask_chunks
-                else torch.empty((0,), dtype=torch.bool, device=device)
-            )
-            self.custom_mask = mask
+                self.custom_mask = tree_mask
+                self.positions = positions
+                self.tree_retrive_index = retrive_index
+                self.tree_retrive_next_token = retrive_next_token
+                self.tree_retrive_next_sibling = retrive_next_sibling
 
             return
 
@@ -840,17 +848,48 @@ class DFlashVerifyInput(SpecInput):
             bs, self.draft_token_num
         )
         # Check if this is tree verify
-        is_tree_verify = self.tree_topk > 0 and self.tree_parent_list is not None
+        is_tree_verify = (
+            self.tree_topk > 0
+            and self.tree_parent_list is not None
+            and self.tree_selected_index is not None
+        )
         if is_tree_verify:
-            accept_len, bonus, path_tokens, path_indices = (
-                compute_dflash_tree_accept_len_and_bonus(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                    parent_list=self.tree_parent_list,
+            if (
+                self.tree_retrive_index is None
+                or self.tree_retrive_next_token is None
+                or self.tree_retrive_next_sibling is None
+            ):
+                raise RuntimeError(
+                    "DFLASH tree verify requires retrive_* buffers to be built by the tree kernel."
                 )
+            predicts = torch.empty(
+                (bs * self.draft_token_num,), device=device, dtype=torch.int32
             )
+            accept_index = torch.empty(
+                (bs, self.draft_token_num), device=device, dtype=torch.int32
+            )
+            accept_token_num = torch.zeros(
+                (bs,), device=device, dtype=torch.int32
+            )
+            verify_tree_greedy_func(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=self.tree_retrive_index,
+                retrive_next_token=self.tree_retrive_next_token,
+                retrive_next_sibling=self.tree_retrive_next_sibling,
+                target_predict=target_predict,
+            )
+            accept_len = accept_token_num
+            last_accept_idx = accept_index.gather(
+                1, accept_len.unsqueeze(1).to(torch.long)
+            ).squeeze(1)
+            bonus = target_predict[
+                torch.arange(bs, device=device), last_accept_idx
+            ]
             packed = torch.cat(
-                [path_tokens, accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+                [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
             ).cpu()
         else:
             accept_len, bonus = compute_dflash_accept_len_and_bonus(
@@ -965,7 +1004,7 @@ class DFlashVerifyInput(SpecInput):
                 for row in range(bs):
                     acc_len = int(commit_lens_cpu[row]) - 1
                     if acc_len > 0:
-                        keep_indices = path_indices[row, 1 : acc_len + 1]
+                        keep_indices = accept_index[row, 1 : acc_len + 1]
                         keep_mask[row, keep_indices] = True
             else:
                 keep_mask = (
@@ -1015,7 +1054,7 @@ class DFlashVerifyInput(SpecInput):
         for i, ln in enumerate(commit_lens_cpu):
             if ln > 0:
                 if is_tree_verify:
-                    indices = path_indices[i, : ln].to(hidden.device)
+                    indices = accept_index[i, : ln].to(hidden.device)
                     segments.append(hidden[i].index_select(0, indices))
                 else:
                     segments.append(hidden[i, :ln, :])

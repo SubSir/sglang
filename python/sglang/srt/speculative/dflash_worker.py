@@ -231,7 +231,7 @@ class DFlashWorker:
             int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0"))
         )
         # SGLANG_DFLASH_TREE_VERIFY_TOPK: topk for tree construction (default=8)
-        self._tree_verify_topk: int = int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY_TOPK", "4"))
+        self._tree_verify_topk: int = int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY_TOPK", "1"))
         # SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS: number of draft tokens (default=block_size)
         self._tree_num_draft_tokens: int = int(self.block_size)
         _tree_nums_env = os.environ.get("SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS")
@@ -650,7 +650,7 @@ class DFlashWorker:
                 (
                     tree_draft_tokens,
                     tree_parent_list,
-                    tree_top_scores_index,
+                    tree_selected_index,
                     tree_probs,
                 ) = build_tree_verify_tokens(
                     verified_id=block_ids[:, 0],  # [bs]
@@ -662,10 +662,11 @@ class DFlashWorker:
                 # The attention backend will build the tree mask based on parent_list
                 verify_input = DFlashVerifyInput(
                     draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
-                    positions=None,  # Will be computed by attention backend
+                    positions=None,
                     draft_token_num=tree_num_draft_tokens,
                     # Tree metadata for eagle-style verify
                     tree_parent_list=tree_parent_list,
+                    tree_selected_index=tree_selected_index,
                     tree_topk=tree_topk,
                 )
 

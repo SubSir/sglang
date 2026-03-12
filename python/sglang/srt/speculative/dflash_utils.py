@@ -385,22 +385,22 @@ def build_tree_verify_tokens(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build tree verify tokens for DFlash eagle-style tree verify (TARGET_VERIFY mode).
 
-    This function constructs a tree of draft tokens similar to EAGLE, where:
-    - Position 0: verified_id (current token)
-    - Positions 1..topk: top-k candidates from position 0
-    - Positions topk+1..: children of previous candidates based on tree structure
+    This function constructs a pruned tree of draft tokens and returns:
+      - The pruned tokens (including the root verified_id)
+      - A *full* topk-tree parent list compatible with the EAGLE kernel
+      - A selected_index list that encodes the pruned tree inside the full tree
 
     Args:
         verified_id: Current token per request, shape [bs]
         draft_logits: Draft model logits, shape [bs, num_steps, vocab_size]
         topk: Number of top candidates to select at each node
-        num_draft_tokens: Total number of tokens in the tree
+        num_draft_tokens: Total number of tokens in the pruned tree (including root)
 
     Returns:
-        draft_tokens: Flattened tree tokens, shape [bs * num_draft_tokens]
-        parent_list: Parent indices for each token, shape [bs, num_draft_tokens - 1]
-        top_scores_index: Top-k indices sorted by score, shape [bs, num_draft_tokens - 1]
-        tree_mask: Attention mask for tree structure (optional, can be built by backend)
+        draft_tokens: Flattened pruned tokens, shape [bs * num_draft_tokens]
+        parent_list: Full topk-tree parent list, shape [bs, topk * (depth - 1) + 1]
+        selected_index: Selected indices encoding the pruned tree, shape [bs, num_draft_tokens - 1]
+        tree_mask: Optional tree mask buffer (placeholder for compatibility)
     """
     bs = draft_logits.shape[0]
     device = draft_logits.device
@@ -412,15 +412,12 @@ def build_tree_verify_tokens(
     topk_probs, topk_ids = torch.topk(draft_probs, k=topk, dim=-1)  # [bs, num_steps, topk]
 
     num_pos = topk_probs.shape[1]  # Number of positions (num_steps)
-    if num_pos == 0:
-        # No positions to sample from, return just verified_id
-        draft_tokens = verified_id.unsqueeze(1).expand(bs, num_draft_tokens).flatten()
-        parent_list = torch.full((bs, num_draft_tokens), -1, dtype=torch.long, device=device)
-        top_scores_index = torch.full((bs, num_draft_tokens), -1, dtype=torch.long, device=device)
-        return draft_tokens, parent_list, top_scores_index, topk_probs
+    depth = num_draft_tokens - 1  # diffusion: single step, use full verify length
+
+    full_tree_nodes = topk * (depth - 1) + 1
 
     if topk == 1:
-        # Linear chain: top-1 at each position.
+        # Linear chain: only one candidate per level in the full tree.
         tokens = torch.cat([verified_id[:, None], topk_ids[:, :, 0]], dim=1)
         if num_draft_tokens < tokens.shape[1]:
             tokens = tokens[:, :num_draft_tokens]
@@ -429,35 +426,53 @@ def build_tree_verify_tokens(
             pad_tokens = tokens[:, -1:].expand(bs, pad_count)
             tokens = torch.cat([tokens, pad_tokens], dim=1)
 
-        parent = torch.arange(num_draft_tokens, device=device).unsqueeze(0).expand(bs, -1) - 1
-        top_scores_index = torch.arange(num_draft_tokens, device=device).unsqueeze(0).expand(bs, -1) - 1
-        draft_tokens = tokens.flatten()
-        return draft_tokens, parent, top_scores_index, topk_probs
+        # Full parent list is just a chain of length depth (offset by 1 for root).
+        parent = (
+            torch.arange(full_tree_nodes, device=device)
+            .unsqueeze(0)
+            .expand(bs, -1)
+            - 1
+        )
+        selected_index = torch.arange(0, num_draft_tokens, device=device).unsqueeze(0).expand(bs, -1)
+        draft_tokens = tokens[:, :num_draft_tokens].flatten()
+        return draft_tokens, parent, selected_index, topk_probs
+
+    # Build the full topk tree parent list (shared across batch).
+    parent_list_full = torch.full(
+        (bs, full_tree_nodes), -1, dtype=torch.long, device=device
+    )
+    for layer in range(1, depth):
+        layer_base = 1 + (layer - 1) * topk
+        if layer == 1:
+            parent_list_full[:, layer_base : layer_base + topk] = 0
+        else:
+            parent_list_full[:, layer_base : layer_base + topk] = 1 + (layer - 2) * topk
 
     # Build tree using heap-based approach (similar to dflash_transformers.py)
-    # For each request, build paths through the tree
     draft_tokens_list = []
-    parent_list_list = []
-    top_scores_index_list = []
+    selected_index_list = []
 
     for b in range(bs):
-        # Heap: (-joint_prob, path, prob, parent_idx)
-        heap: list[tuple[float, list[int], float, int]] = []
+        # Heap: (-joint_prob, path, prob, parent_idx, node_idx)
+        heap: list[tuple[float, list[int], float, int, int]] = []
 
         # Initialize with position 0's top-k candidates
         for r in range(topk):
             p = float(topk_probs[b, 0, r].item())
             token_id = int(topk_ids[b, 0, r].item())
-            heapq.heappush(heap, (-p, [token_id], p, -1))  # parent=-1 for root children
+            node_idx = 1 + r
+            heapq.heappush(heap, (-p, [token_id], p, -1, node_idx))
 
-        selected_paths: list[tuple[list[int], float, int]] = []
+        selected_nodes: list[tuple[int, int]] = []  # (node_idx, parent_selected_idx)
+        selected_tokens: list[int] = []
         i = 0
 
         # Only limit by total number of tokens (matching dflash_transformers.py logic)
         while heap and i < num_draft_tokens - 1:
-            neg_prob, path, prob, parent_idx = heapq.heappop(heap)
+            _neg_prob, path, prob, parent_idx, node_idx = heapq.heappop(heap)
             i += 1
-            selected_paths.append((path, prob, parent_idx))
+            selected_nodes.append((node_idx, parent_idx))
+            selected_tokens.append(path[-1])
 
             # Expand to next position
             pos = len(path) - 1
@@ -465,36 +480,48 @@ def build_tree_verify_tokens(
 
             # Only expand if there are more positions available
             if next_pos < num_pos:
+                layer_base = 1 + next_pos * topk
                 for r in range(topk):
                     next_p = float(topk_probs[b, next_pos, r].item())
                     next_token = int(topk_ids[b, next_pos, r].item())
                     joint_prob = prob * next_p
-                    heapq.heappush(heap, (-joint_prob, path + [next_token], joint_prob, len(selected_paths) - 1))
+                    child_node_idx = layer_base + r
+                    heapq.heappush(
+                        heap,
+                        (
+                            -joint_prob,
+                            path + [next_token],
+                            joint_prob,
+                            len(selected_nodes) - 1,
+                            child_node_idx,
+                        ),
+                    )
 
-        # Build draft tokens for this request
-        # Note: tokens[0] is verified_id (root), tokens[1:] are tree candidates
+        # Build pruned tokens and selected_index in original tree index space
         tokens = [int(verified_id[b].item())]
-        parents = [-1]  # Root has no parent
-        score_indices = [-1]  # Root has no score index
+        selected_index = []
 
-        for idx, (path, _, parent_idx) in enumerate(selected_paths):
-            tokens.append(path[-1])
-            # parent_idx refers to index in selected_paths, need to offset by 1 for tokens list
-            parents.append(parent_idx + 1 if parent_idx >= 0 else 0)
-            score_indices.append(idx)
+        for (node_idx, parent_idx), token in zip(selected_nodes, selected_tokens, strict=True):
+            tokens.append(int(token))
+            selected_index.append(int(node_idx))
 
-        # Pad if needed
+        # Pad pruned tokens / selected_index if needed
         while len(tokens) < num_draft_tokens:
             tokens.append(tokens[-1])
-            parents.append(-1)
-            score_indices.append(-1)
+        while len(selected_index) < num_draft_tokens - 1:
+            selected_index.append(selected_index[-1] if selected_index else 1)
+
+        # Ensure selected_index is within full_tree_nodes bounds
+        if any(idx <= 0 or idx >= full_tree_nodes for idx in selected_index):
+            raise RuntimeError(
+                f"Invalid selected_index for full tree: min={min(selected_index)}, max={max(selected_index)}, "
+                f"full_tree_nodes={full_tree_nodes}."
+            )
 
         draft_tokens_list.append(torch.tensor(tokens, dtype=torch.long, device=device))
-        parent_list_list.append(torch.tensor(parents, dtype=torch.long, device=device))
-        top_scores_index_list.append(torch.tensor(score_indices, dtype=torch.long, device=device))
+        selected_index_list.append(torch.tensor(selected_index, dtype=torch.long, device=device))
 
-    draft_tokens = torch.stack(draft_tokens_list, dim=0).flatten()  # [bs * num_draft_tokens]
-    parent_list = torch.stack(parent_list_list, dim=0)  # [bs, num_draft_tokens]
-    top_scores_index = torch.stack(top_scores_index_list, dim=0)  # [bs, num_draft_tokens]
+    draft_tokens = torch.stack(draft_tokens_list, dim=0).flatten()
+    selected_index = torch.stack(selected_index_list, dim=0)
 
-    return draft_tokens, parent_list, top_scores_index, topk_probs
+    return draft_tokens, parent_list_full, selected_index, topk_probs
