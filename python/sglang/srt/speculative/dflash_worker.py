@@ -605,7 +605,7 @@ class DFlashWorker:
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
         # --- 2.5) Sample draft tokens and per-token confidence.
-        if self._block_verify_enabled:
+        if not self._block_verify_enabled:
             draft_next_flat, draft_nll_flat = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
                 lm_head=lm_head,
@@ -616,7 +616,7 @@ class DFlashWorker:
             draft_token_confidence = torch.exp(-draft_nll_flat).view(
                 bs, self.block_size - 1
             )
-        elif not self._topk_tree_enabled:
+        elif not self._tree_verify_enabled:
             draft_next = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(
                     -1, draft_hidden.shape[-1]

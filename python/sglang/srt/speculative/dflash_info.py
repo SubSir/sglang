@@ -306,8 +306,6 @@ class DFlashVerifyInput(SpecInput):
             and self.tree_selected_index is not None
             and self.tree_selected_index.numel() > 0
         ):
-            seq_lens = batch.seq_lens.to(torch.int64)
-            seq_lens_sum = int(seq_lens.sum().item())
             depth = int(self.draft_token_num) - 1
             expected_nodes = int(self.tree_topk) * (depth - 1) + 1
             if self.tree_parent_list.size(1) != expected_nodes:
@@ -328,8 +326,8 @@ class DFlashVerifyInput(SpecInput):
                 parent_list=self.tree_parent_list,
                 top_scores_index=self.tree_selected_index,
                 draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
-                seq_lens=seq_lens,
-                seq_lens_sum=seq_lens_sum,
+                seq_lens=batch.seq_lens,
+                seq_lens_sum=batch.seq_lens_sum,
                 topk=int(self.tree_topk),
                 spec_steps=depth,
                 num_verify_tokens=self.draft_token_num,
@@ -856,6 +854,7 @@ class DFlashVerifyInput(SpecInput):
                 retrive_next_sibling=self.tree_retrive_next_sibling,
                 target_predict=target_predict,
             )
+            accept_index = accept_index % self.draft_token_num
             accept_len = accept_token_num
             last_accept_idx = accept_index.gather(
                 1, accept_len.unsqueeze(1).to(torch.long)
