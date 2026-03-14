@@ -17,12 +17,11 @@ Example usage:
 from __future__ import annotations
 
 import argparse
-import os
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 import requests
 import torch
@@ -671,10 +670,14 @@ def main() -> None:
                                 metrics.output_toks_per_s
                             )
                             baseline_acc[(backend, tp, dname, conc)] = metrics.accuracy
+                            token_info = (
+                                f" output_tokens={metrics.output_tokens}"
+                            )
                             print(
                                 f"[{dname} baseline] conc={conc:>2} n={n:<4} "
                                 f"toks/s={metrics.output_toks_per_s:,.2f} "
                                 f"latency={metrics.latency_s:.1f}s"
+                                f"{token_info}"
                             )
                 finally:
                     kill_process_tree(baseline_proc.pid)
@@ -736,6 +739,9 @@ def main() -> None:
                             metrics.spec_verify_ct_sum
                         )
                         dflash_acc[(backend, tp, dname, conc)] = metrics.accuracy
+                        token_info = (
+                            f" output_tokens={metrics.output_tokens}"
+                        )
                         print(
                             f"[{dname} DFLASH]   conc={conc:>2} n={n:<4} "
                             f"toks/s={metrics.output_toks_per_s:,.2f} "
@@ -743,6 +749,7 @@ def main() -> None:
                             f"accept_len={metrics.spec_accept_length if metrics.spec_accept_length is not None else float('nan'):.3f} "
                             f"forward_ct={metrics.spec_verify_ct_sum} "
                             f"spec_verify_tokens_sum={metrics.spec_verify_tokens_sum}"
+                            f"{token_info}"
                         )
             finally:
                 kill_process_tree(dflash_proc.pid)
