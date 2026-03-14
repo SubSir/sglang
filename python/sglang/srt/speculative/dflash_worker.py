@@ -631,8 +631,6 @@ class DFlashWorker:
         # --- 3) Choose verify path based on env
         if not self._use_ragged_verify:
             # ===== block verify (original or tree verify) =====
-            positions = positions_2d.reshape(-1)
-            
             if self._tree_verify_enabled and int(self.block_size) > 1:
                 # ===== EAGLE-style tree verify =====
                 # Compute draft logits for tree construction
@@ -946,6 +944,27 @@ class DFlashWorker:
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
+            if return_nll:
+                out_nlls = torch.empty(
+                    (num_tokens,), dtype=weight_dtype, device=hidden_states.device
+                )
+                for start in range(0, num_tokens, int(chunk_size)):
+                    end = min(num_tokens, start + int(chunk_size))
+                    hs = _cast_hs(hidden_states[start:end])
+                    if num_org > 0:
+                        base_logits = torch.matmul(hs, weight[:num_org].T)
+                        local_max, local_arg = torch.max(base_logits, dim=-1)
+                        out_token_ids[start:end] = (
+                            local_arg.to(torch.long) + org_vocab_start
+                        )
+                        local_lse = torch.logsumexp(base_logits, dim=-1)
+                        out_nlls[start:end] = -(
+                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
+                        )
+                    else:
+                        out_token_ids[start:end] = 0
+                        out_nlls[start:end] = 0.0
+                return out_token_ids, out_nlls
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
@@ -957,25 +976,6 @@ class DFlashWorker:
                     )
                 else:
                     out_token_ids[start:end] = 0
-            # Fast path return - need to handle return_nll
-            if return_nll:
-                # Compute NLL for fast path (tp_size==1 && num_added==0)
-                out_nlls = torch.empty(
-                    (num_tokens,), dtype=weight_dtype, device=hidden_states.device
-                )
-                for start in range(0, num_tokens, int(chunk_size)):
-                    end = min(num_tokens, start + int(chunk_size))
-                    hs = _cast_hs(hidden_states[start:end])
-                    if num_org > 0:
-                        base_logits = torch.matmul(hs, weight[:num_org].T)
-                        local_max = torch.max(base_logits, dim=-1).values
-                        local_lse = torch.logsumexp(base_logits, dim=-1)
-                        out_nlls[start:end] = -(
-                            local_max.to(weight_dtype) - local_lse.to(weight_dtype)
-                        )
-                    else:
-                        out_nlls[start:end] = 0.0
-                return out_token_ids, out_nlls
             return out_token_ids
 
         out_nlls: Optional[torch.Tensor] = None
