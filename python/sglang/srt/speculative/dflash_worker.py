@@ -700,16 +700,6 @@ class DFlashWorker:
             batch.return_hidden_states = False
             return
 
-        # ===== ragged verify (DFLASH_VERIFY) =====
-        # Optional: explicitly pass positions (old behavior) to avoid relying on ForwardBatchInfo
-        explicit_pos = False
-        # explicit_pos = os.environ.get("SGLANG_DFLASH_RAGGED_EXPLICIT_POS", "0") == "1"
-        # 3a) Determine per-request verify length.
-        # Use per-token confidence as acceptance probability, compute expected
-        # accepted length with conditional probabilities:
-        #   E[acc] = sum_j P(acc >= j+1) = sum_j prod_{t<=j} confidence[t]
-        # Then set verify length as: verify_len = 1 + min(E[acc] + offset, block_size-1).
-        # k_online is the gate for enabling this confidence-based adaptive verify length.
         if self._k_online_enabled and draft_token_confidence is not None and int(self.block_size) > 1:
             num_pos = int(self.block_size) - 1
             confidence = draft_token_confidence.to(torch.float32).clamp_(0.0, 1.0)
@@ -829,47 +819,9 @@ class DFlashWorker:
 
         verify_start_offsets_cpu = verify_start_offsets_t.tolist()
 
-        # if os.environ.get("SGLANG_DFLASH_DEBUG", "1") == "1":
-        #     print(f"[DFLASH DEBUG] verify_flat: total={total_verify_tokens}, head={verify_tokens_flat[:min(32, total_verify_tokens)].cpu().tolist()}")
-        #     for i in range(min(3, bs)):
-        #         print(f"[DFLASH DEBUG] verify vlen[{i}]={int(vlen_list[i])}, start={verify_start_offsets_cpu[i]}, draft_tokens[{i},:vlen] = {draft_tokens[i, :int(vlen_list[i])].cpu().tolist()}")
-
-        if explicit_pos:
-            # Old behavior: explicitly flatten positions to avoid relying on ForwardBatchInfo.
-            total_vlen = int(sum(vlen_list))
-            if (
-                self._verify_positions_flat_buf is None
-                or self._verify_positions_flat_buf.shape[0] < total_vlen
-            ):
-                new_cap = max(
-                    total_vlen,
-                    (
-                        self._verify_positions_flat_buf.shape[0] * 2
-                        if self._verify_positions_flat_buf is not None
-                        else total_vlen
-                    ),
-                )
-                self._verify_positions_flat_buf = torch.empty(
-                    (new_cap,), dtype=torch.int64, device=self.device
-                )
-
-            verify_positions_flat = self._verify_positions_flat_buf[:total_vlen]
-            pt2 = 0
-            for i, vlen in enumerate(vlen_list):
-                v = int(vlen)
-                if v <= 0:
-                    continue
-                verify_positions_flat[pt2 : pt2 + v].copy_(positions_2d[i, :v])
-                pt2 += v
-            verify_positions = verify_positions_flat
-        else:
-            verify_positions = (
-                None  # Let ForwardBatchInfo compute positions from extend_*.
-            )
-
         verify_input = DFlashVerifyInput(
             draft_token=verify_tokens_flat,
-            positions=verify_positions,
+            positions=None,
             draft_token_num=int(self.block_size),
             verify_token_lens=verify_len_i32,
             verify_start_offsets_cpu=verify_start_offsets_cpu,
