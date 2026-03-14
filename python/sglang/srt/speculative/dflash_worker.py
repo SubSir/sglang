@@ -3,7 +3,7 @@ import math
 import os
 
 from copy import deepcopy
-from typing import Optional, Union, Tuple, Dict
+from typing import Optional, Union, Tuple, Dict, cast
 
 import torch
 
@@ -606,10 +606,13 @@ class DFlashWorker:
 
         # --- 2.5) Sample draft tokens and per-token confidence.
         if not self._block_verify_enabled:
-            draft_next_flat, draft_nll_flat = self._greedy_sample_from_vocab_parallel_head(
+            draft_result = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
                 lm_head=lm_head,
                 return_nll=True,
+            )
+            draft_next_flat, draft_nll_flat = cast(
+                Tuple[torch.Tensor, torch.Tensor], draft_result
             )
             draft_next = draft_next_flat.view(bs, self.block_size - 1)
             # confidence = P(greedy token) = exp(-NLL)
@@ -617,12 +620,13 @@ class DFlashWorker:
                 bs, self.block_size - 1
             )
         elif not self._tree_verify_enabled:
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
+            draft_result = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(
                     -1, draft_hidden.shape[-1]
                 ),
                 lm_head=lm_head,
-            ).view(bs, self.block_size - 1)
+            )
+            draft_next = cast(torch.Tensor, draft_result).view(bs, self.block_size - 1)
             draft_token_confidence = None
 
 
@@ -633,26 +637,31 @@ class DFlashWorker:
             # ===== block verify (original or tree verify) =====
             if self._tree_verify_enabled and int(self.block_size) > 1:
                 # ===== EAGLE-style tree verify =====
-                # Compute draft logits for tree construction
                 tree_topk = int(self._tree_verify_topk)
                 tree_num_draft_tokens = int(self._tree_num_draft_tokens)
-                
-                # Compute logits from draft hidden states
-                draft_logits = torch.matmul(
-                    draft_hidden[:, 1:, :],  # [bs, block_size-1, hidden]
-                    lm_head.weight[: lm_head.shard_indices.num_org_elements].T,
-                )  # [bs, block_size-1, vocab]
-                
-                # Build tree tokens using heap-based approach
-                # Only limit total number of tokens, no restriction on tree depth/steps
+                num_steps = int(draft_hidden.shape[1]) - 1
+
+                topk_result = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                    return_topk=tree_topk,
+                )
+                _, draft_topk_ids, draft_topk_probs = cast(
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
+                )
+                draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
+                draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
+
                 (
                     tree_draft_tokens,
                     tree_parent_list,
                     tree_selected_index,
-                    tree_probs,
                 ) = build_tree_verify_tokens(
                     verified_id=block_ids[:, 0],  # [bs]
-                    draft_logits=draft_logits,
+                    topk_probs=draft_topk_probs,
+                    topk_ids=draft_topk_ids,
                     topk=tree_topk,
                     num_draft_tokens=tree_num_draft_tokens,
                 )
@@ -848,7 +857,12 @@ class DFlashWorker:
         lm_head,
         chunk_size: int = 256,
         return_nll: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_topk: Optional[int] = None,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
@@ -885,10 +899,28 @@ class DFlashWorker:
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
 
+        if return_nll and return_topk is not None:
+            raise ValueError("return_nll and return_topk cannot be enabled together")
+        if return_topk is not None and return_topk < 1:
+            raise ValueError("return_topk must be >= 1")
+
         num_tokens = int(hidden_states.shape[0])
         out_token_ids = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
+        out_topk_ids: Optional[torch.Tensor] = None
+        out_topk_probs: Optional[torch.Tensor] = None
+        if return_topk is not None:
+            out_topk_ids = torch.empty(
+                (num_tokens, int(return_topk)),
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            out_topk_probs = torch.empty(
+                (num_tokens, int(return_topk)),
+                dtype=weight_dtype,
+                device=hidden_states.device,
+            )
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
@@ -917,6 +949,29 @@ class DFlashWorker:
                         out_token_ids[start:end] = 0
                         out_nlls[start:end] = 0.0
                 return out_token_ids, out_nlls
+            if return_topk is not None:
+                assert out_topk_ids is not None
+                assert out_topk_probs is not None
+                for start in range(0, num_tokens, int(chunk_size)):
+                    end = min(num_tokens, start + int(chunk_size))
+                    hs = _cast_hs(hidden_states[start:end])
+                    if num_org > 0:
+                        base_logits = torch.matmul(hs, weight[:num_org].T)
+                        topk_vals, topk_idx = torch.topk(
+                            base_logits, k=int(return_topk), dim=-1
+                        )
+                        out_topk_probs[start:end] = torch.softmax(
+                            topk_vals, dim=-1
+                        ).to(weight_dtype)
+                        out_topk_ids[start:end] = (
+                            topk_idx.to(torch.long) + org_vocab_start
+                        )
+                        out_token_ids[start:end] = out_topk_ids[start:end, 0]
+                    else:
+                        out_token_ids[start:end] = 0
+                        out_topk_probs[start:end] = 0
+                        out_topk_ids[start:end] = 0
+                return out_token_ids, out_topk_ids, out_topk_probs
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
@@ -944,7 +999,15 @@ class DFlashWorker:
             # Base vocab logits.
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
-                local_max, local_arg = torch.max(base_logits, dim=-1)
+                if return_topk is not None:
+                    topk_vals, topk_idx = torch.topk(
+                        base_logits, k=int(return_topk), dim=-1
+                    )
+                    local_max = topk_vals[:, 0]
+                    local_arg = topk_idx[:, 0]
+                    topk_probs = _cast_hs(torch.softmax(topk_vals, dim=-1))
+                else:
+                    local_max, local_arg = torch.max(base_logits, dim=-1)
                 if return_nll:
                     local_lse = torch.logsumexp(base_logits, dim=-1)
             else:
@@ -964,9 +1027,24 @@ class DFlashWorker:
                         dtype=weight_dtype,
                         device=hs.device,
                     )
+                if return_topk is not None:
+                    topk_probs = torch.zeros(
+                        (chunk_len, int(return_topk)),
+                        dtype=weight_dtype,
+                        device=hs.device,
+                    )
+                    topk_idx = torch.zeros(
+                        (chunk_len, int(return_topk)),
+                        dtype=torch.long,
+                        device=hs.device,
+                    )
 
             # Added vocab logits (e.g., LoRA-added embeddings), if present.
             if num_added > 0:
+                if return_topk is not None:
+                    raise RuntimeError(
+                        "return_topk is not supported with added vocab shards"
+                    )
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
                 added_logits = torch.matmul(
@@ -991,6 +1069,8 @@ class DFlashWorker:
             if num_added == 0:
                 local_arg.add_(org_vocab_start)
                 global_ids = local_arg
+                if return_topk is not None:
+                    topk_idx = topk_idx + org_vocab_start
             else:
                 global_ids = torch.empty(
                     (chunk_len,), dtype=torch.int64, device=hs.device
@@ -1000,14 +1080,26 @@ class DFlashWorker:
                 global_ids[~is_base] = added_vocab_start + (
                     local_arg[~is_base] - num_org_padded
                 )
+                if return_topk is not None:
+                    raise RuntimeError(
+                        "return_topk is not supported with added vocab shards"
+                    )
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                if return_topk is not None:
+                    assert out_topk_ids is not None
+                    assert out_topk_probs is not None
+                    out_topk_ids[start:end] = topk_idx.to(torch.long)
+                    out_topk_probs[start:end] = topk_probs.to(weight_dtype)
                 if return_nll:
                     out_nlls[start:end] = -(
                         local_max.to(weight_dtype) - local_lse.to(weight_dtype)
                     )
                 continue
+
+            if return_topk is not None:
+                raise RuntimeError("return_topk is only supported with tp_size == 1")
 
             # Gather per-rank maxima and associated global ids, then select the global max.
             needed = tp_size * chunk_len
@@ -1082,6 +1174,11 @@ class DFlashWorker:
         if return_nll:
             assert out_nlls is not None
             return out_token_ids, out_nlls
+
+        if return_topk is not None:
+            assert out_topk_ids is not None
+            assert out_topk_probs is not None
+            return out_token_ids, out_topk_ids, out_topk_probs
 
         return out_token_ids
 

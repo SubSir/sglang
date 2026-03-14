@@ -417,10 +417,11 @@ def _select_top_k_tokens_no_hidden(
 def build_tree_verify_tokens(
     *,
     verified_id: torch.Tensor,
-    draft_logits: torch.Tensor,
+    topk_probs: torch.Tensor,
+    topk_ids: torch.Tensor,
     topk: int,
     num_draft_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build tree verify tokens for DFlash eagle-style tree verify (TARGET_VERIFY mode).
 
     This function constructs a pruned tree of draft tokens and returns:
@@ -430,7 +431,8 @@ def build_tree_verify_tokens(
 
     Args:
         verified_id: Current token per request, shape [bs]
-        draft_logits: Draft model logits, shape [bs, num_steps, vocab_size]
+        topk_probs: Draft topk probabilities, shape [bs, num_steps, topk]
+        topk_ids: Draft topk token ids, shape [bs, num_steps, topk]
         topk: Number of top candidates to select at each node
         num_draft_tokens: Total number of tokens in the pruned tree (including root)
 
@@ -438,15 +440,30 @@ def build_tree_verify_tokens(
         draft_tokens: Flattened pruned tokens, shape [bs * num_draft_tokens]
         parent_list: Full topk-tree parent list, shape [bs, topk * (depth - 1) + 1]
         selected_index: Selected indices encoding the pruned tree, shape [bs, num_draft_tokens - 1]
-        tree_mask: Optional tree mask buffer (placeholder for compatibility)
     """
-    bs = draft_logits.shape[0]
-    device = draft_logits.device
-
-    draft_probs = torch.softmax(draft_logits, dim=-1)  # [bs, num_steps, vocab]
-    topk_probs, topk_ids = fast_topk(draft_probs, topk, dim=-1)  # [bs, num_steps, topk]
-
+    bs = topk_probs.shape[0]
     num_steps = topk_probs.shape[1]
+    device = topk_probs.device
+
+    if topk == 1:
+        max_candidates = num_steps
+        if num_draft_tokens - 1 > max_candidates:
+            raise ValueError(
+                "num_draft_tokens exceeds available candidates: "
+                f"requested={num_draft_tokens - 1}, available={max_candidates}."
+            )
+
+        linear_tokens = topk_ids[:, : num_draft_tokens - 1, 0]
+        draft_tokens = torch.cat([verified_id[:, None], linear_tokens], dim=1).flatten()
+        parent_ids = torch.arange(
+            -1, num_steps - 1, dtype=torch.long, device=device
+        ).unsqueeze(0)
+        parent_list = parent_ids.repeat(bs, 1)
+        selected_index = torch.arange(
+            num_draft_tokens - 1, dtype=torch.long, device=device
+        ).unsqueeze(0)
+        selected_index = selected_index.repeat(bs, 1)
+        return draft_tokens, parent_list, selected_index
 
     score_list: list[torch.Tensor] = []
     token_list: list[torch.Tensor] = []
@@ -490,4 +507,4 @@ def build_tree_verify_tokens(
     else:
         parent_list = torch.empty((bs, 0), dtype=torch.long, device=device)
 
-    return draft_tokens, parent_list, top_scores_index, topk_probs
+    return draft_tokens, parent_list, top_scores_index
