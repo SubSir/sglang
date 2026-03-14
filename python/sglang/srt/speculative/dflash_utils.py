@@ -445,37 +445,41 @@ def build_tree_verify_tokens(
     num_steps = topk_probs.shape[1]
     device = topk_probs.device
 
-    if topk == 1:
-        max_candidates = num_steps
-        if num_draft_tokens - 1 > max_candidates:
-            raise ValueError(
-                "num_draft_tokens exceeds available candidates: "
-                f"requested={num_draft_tokens - 1}, available={max_candidates}."
-            )
+    # if topk == 1:
+    #     max_candidates = num_steps
+    #     if num_draft_tokens - 1 > max_candidates:
+    #         raise ValueError(
+    #             "num_draft_tokens exceeds available candidates: "
+    #             f"requested={num_draft_tokens - 1}, available={max_candidates}."
+    #         )
 
-        linear_tokens = topk_ids[:, : num_draft_tokens - 1, 0]
-        draft_tokens = torch.cat([verified_id[:, None], linear_tokens], dim=1).flatten()
-        parent_ids = torch.arange(
-            -1, num_steps - 1, dtype=torch.long, device=device
-        ).unsqueeze(0)
-        parent_list = parent_ids.repeat(bs, 1)
-        selected_index = torch.arange(
-            num_draft_tokens - 1, dtype=torch.long, device=device
-        ).unsqueeze(0)
-        selected_index = selected_index.repeat(bs, 1)
-        return draft_tokens, parent_list, selected_index
+    #     linear_tokens = topk_ids[:, : num_draft_tokens - 1, 0]
+    #     draft_tokens = torch.cat([verified_id[:, None], linear_tokens], dim=1).flatten()
+    #     parent_ids = torch.arange(
+    #         -1, num_steps - 1, dtype=torch.long, device=device
+    #     ).unsqueeze(0)
+    #     parent_list = parent_ids.repeat(bs, 1)
+    #     selected_index = torch.arange(
+    #         num_draft_tokens - 1, dtype=torch.long, device=device
+    #     ).unsqueeze(0)
+    #     selected_index = selected_index.repeat(bs, 1)
+    #     return draft_tokens, parent_list, selected_index
 
     score_list: list[torch.Tensor] = []
     token_list: list[torch.Tensor] = []
     parents_list: list[torch.Tensor] = []
 
     scores = None
+    expanded_topk_probs = topk_probs[:, 1:].repeat_interleave(topk, dim=0)
+    expanded_topk_ids = topk_ids[:, 1:].repeat_interleave(topk, dim=0)
+
     for i in range(num_steps):
-        step_topk_p = topk_probs[:, i]
-        step_topk_ids = topk_ids[:, i]
-        if i > 0:
-            step_topk_p = step_topk_p.repeat_interleave(topk, dim=0)
-            step_topk_ids = step_topk_ids.repeat_interleave(topk, dim=0)
+        if i == 0:
+            step_topk_p = topk_probs[:, 0]
+            step_topk_ids = topk_ids[:, 0]
+        else:
+            step_topk_p = expanded_topk_probs[:, i - 1]
+            step_topk_ids = expanded_topk_ids[:, i - 1]
 
         scores, tree_info = _select_top_k_tokens_no_hidden(
             i,
