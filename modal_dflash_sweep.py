@@ -12,8 +12,8 @@ base_image = (
 local_image = (
     base_image
     .run_commands(
-        "echo 21 > /tmp/build_time",
-        "git clone -b fa2_correct https://github.com/SubSir/sglang.git /root/sglang_local",
+        "echo 43 > /tmp/build_time",
+        "git clone  https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
     )
 )
@@ -42,6 +42,8 @@ def run_dataset_sweep(
     k_online_offset: int = 2,
     k_online_warmup: int = 100,
     block_verify: bool = False,
+    tree_verify: bool = False,
+    tree_verify_topk: int = 1,
     disable_cuda_graph: bool = False,
 ):
     """
@@ -55,27 +57,28 @@ def run_dataset_sweep(
     data_tag = data_name.replace(",", "-")
     run_tag = "k_online" if k_online else "no_k_online"
     block_verify_tag = "block_verify" if block_verify else "no_block_verify"
+    tree_verify_tag = "tree_verify" if tree_verify else "no_tree_verify"
     output_file = f"results_{data_tag}_{target_model.split('/')[-1]}"
     if draft_model:
         output_file += f"_draft_{draft_model.split('/')[-1]}"
     if k_online:
         output_file += f"_k_online_off{k_online_offset}_w{k_online_warmup}"
-    output_file += f"_{run_tag}_{block_verify_tag}.md"
-    
+    output_file += f"_{run_tag}_{block_verify_tag}_{tree_verify_tag}_topk{tree_verify_topk}.md"
+
     output_path = f"/root/sglang_local/{output_file}"
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 128
+    max_concurrency = 32
     # DFLASH b16 * max_concurrency(5) => 80
-    piecewise_cuda_graph_max_tokens = 8 * max_concurrency
+    piecewise_cuda_graph_max_tokens = 10 * max_concurrency
 
     args = [
         "bench_dflash_sweep.py",
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "32,64,128",
+        "--concurrencies", "1,8,32",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         # "--samples-per-concurrency-base", "8",
@@ -95,14 +98,20 @@ def run_dataset_sweep(
     if disable_cuda_graph:
         args.append("--disable-cuda-graph")
 
-    print(f"Executing with args: {args}, k_online={k_online}, disable_cuda_graph={disable_cuda_graph}")
-    
+    print(
+        f"Executing with args: {args}, k_online={k_online}, "
+        f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}"
+    )
+
     # Setup environment
     env = os.environ.copy()
     env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
     env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
     env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
+    env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
+    env["SGLANG_DFLASH_TREE_VERIFY_TOPK"] = str(tree_verify_topk)
+    env["SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS"] = str(1 + tree_verify_topk * 9)
     
     sglang_path = "/root/sglang_local/python"
     if sglang_path not in sys.path:
@@ -148,29 +157,30 @@ def run_dataset_sweep(
 @app.local_entrypoint()
 def main(
     data_names: str = "gsm8k,math500,humaneval,mt-bench",
-    target_model: str = "openai/gpt-oss-20b",
-    draft_model: str = "z-lab/gpt-oss-20b-DFlash",
+    target_model: str = "openai/gpt-oss-120b",
+    draft_model: str = "z-lab/gpt-oss-120b-DFlash",
     offset: int = 2,
     warmup: int = 0,
 ):
     """\
     Local entrypoint for Modal.
 
-    Runs the same dataset sweep for different k_online & block_verify combinations.
-    Results are saved with clear tags including block_verify status.
+    Runs the same dataset sweep for different tree_verify settings.
+    Results are saved with clear tags including tree_verify status.
     """
 
     combinations = [
         (target_model, draft_model),
     ]
 
+    dataset_list = [d.strip() for d in data_names.split(",") if d.strip()]
     base_results_dir = f"gptoss_{data_names.replace(',', '_')}"
 
     # Ensure output directories exist before writing markdown files.
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
     os.makedirs("cuda_graph_" + base_results_dir, exist_ok=True)
 
-    for disable_cuda_graph in [False, True]:
+    for disable_cuda_graph in [False]:
         if disable_cuda_graph:
             results_dir = "no_cuda_graph_" + base_results_dir
         else:
@@ -178,40 +188,54 @@ def main(
 
         for target, draft in combinations:
             skip_baseline = True
+            k_online = False
+            block_verify = True
 
-            for k_online, block_verify in [(True, False),(False, False), (False, True)]:
-                print(
-                    f"\n>>> Starting benchmark [{data_names}] "
-                    f"k_online={k_online}, disable_cuda_graph={disable_cuda_graph}: "
-                    f"Target={target}, Draft={draft}..."
-                )
+            tasks: list[tuple[str, bool, int, str, str]] = []
+            calls = []
 
-                try:
-                    res_content = run_dataset_sweep.remote(
-                        target,
-                        data_names,
-                        draft,
-                        skip_baseline=skip_baseline,
-                        k_online=k_online,
-                        k_online_offset=offset,
-                        k_online_warmup=warmup,
-                        block_verify=block_verify,
-                        disable_cuda_graph=disable_cuda_graph,
+            for dataset in dataset_list:
+                for tree_verify in [True]:
+                    print(
+                        f"\n>>> Spawning benchmark [{dataset}] "
+                        f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}: "
+                        f"Target={target}, Draft={draft}..."
                     )
 
-                    run_tag = "k_online" if k_online else "no_k_online"
-                    block_verify_tag = "block_verify" if block_verify else "no_block_verify"
+                    topks = [2, 4, 6] if tree_verify else [1]
+                    for topk in topks:
+                        call = run_dataset_sweep.spawn(
+                            target,
+                            dataset,
+                            draft,
+                            skip_baseline=skip_baseline,
+                            k_online=k_online,
+                            k_online_offset=offset,
+                            k_online_warmup=warmup,
+                            block_verify=block_verify,
+                            tree_verify=tree_verify,
+                            tree_verify_topk=topk,
+                            disable_cuda_graph=disable_cuda_graph,
+                        )
 
-                    filename = f"res_{data_names.replace(',', '-')}_{target.split('/')[-1]}"
+                        tasks.append((dataset, tree_verify, topk, target, draft))
+                        calls.append(call)
+
+            for (dataset, tree_verify, topk, target, draft), call in zip(tasks, calls):
+                try:
+                    res_content = call.get()
+
+                    run_tag = "no_k_online"
+                    block_verify_tag = "block_verify"
+                    tree_verify_tag = "tree_verify" if tree_verify else "no_tree_verify"
+
+                    filename = f"res_{dataset.replace(',', '-')}_{target.split('/')[-1]}"
                     if draft:
                         filename += f"_vs_{draft.split('/')[-1]}"
                     else:
                         filename += "_baseline"
 
-                    if k_online:
-                        filename += f"_k_online_off{offset}_w{warmup}"
-
-                    filename += f"_{run_tag}_{block_verify_tag}.md"
+                    filename += f"_{run_tag}_{block_verify_tag}_{tree_verify_tag}_topk{topk}.md"
 
                     local_path = os.path.join(results_dir, filename)
 
@@ -221,9 +245,8 @@ def main(
                     print(f">>> Completed: {filename}")
                 except Exception as e:
                     print(
-                        f">>> Failed: data_names={data_names}, "
-                        f"k_online={k_online}, block_verify={block_verify}, "
-                        f"Target={target}, Draft={draft}. Error: {e}"
+                        f">>> Failed: dataset={dataset}, "
+                        f"Target={target}, Draft={draft}, tree_verify={tree_verify}. Error: {e}"
                     )
 
     print(f"\nAll benchmarks for '{data_names}' finished.")

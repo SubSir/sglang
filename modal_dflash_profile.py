@@ -19,8 +19,8 @@ base_image = (
 
 local_image = (
     base_image.run_commands(
-        "echo 21 > /tmp/build_time",
-        "git clone -b fa2_correct https://github.com/SubSir/sglang.git /root/sglang_local",
+        "echo 43 > /tmp/build_time",
+        "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
     )
 )
@@ -42,10 +42,8 @@ def run_profile_once(
     random_input_len: int = 64,
     random_output_len: int = 256,
     profile_dir: str = "/root/sglang/profile_log",
-    k_online: bool = False,
-    k_online_offset: int = 2,
-    k_online_warmup: int = 0,
-    block_verify: bool = False,
+    tree_verify: bool = False,
+    disable_cuda_graph: bool = True,
 ) -> dict:
     """
     Start sglang server with DFLASH config aligned with modal_dflash_sweep.py,
@@ -55,10 +53,8 @@ def run_profile_once(
 
     env = os.environ.copy()
     env["SGLANG_TORCH_PROFILER_DIR"] = profile_dir
-    env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
-    env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
-    env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
-    env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
+    env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1"
+    env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
 
     server_cmd = [
         "python",
@@ -81,10 +77,15 @@ def run_profile_once(
         "--max-running-requests",
         "32",
         "--mem-fraction-static", "0.7",
-        "--enable-piecewise-cuda-graph",
-        "--piecewise-cuda-graph-max-tokens",
-        str(16 * 32),
     ]
+    if disable_cuda_graph:
+        server_cmd.append("--disable-cuda-graph")
+    else:
+        server_cmd.extend([
+            "--enable-piecewise-cuda-graph",
+            "--piecewise-cuda-graph-max-tokens",
+            str(16 * 32),
+        ])
 
     bench_cmd = [
         "python",
@@ -243,41 +244,33 @@ def run_profile_once(
 
 @app.local_entrypoint()
 def main(
-    target_model: str = "openai/gpt-oss-20b",
-    draft_model: str = "z-lab/gpt-oss-20b-DFlash",
+    target_model: str = "openai/gpt-oss-120b",
+    draft_model: str = "z-lab/gpt-oss-120b-DFlash",
     output_dir: str = "profile_logs",
-    offset: int = 2,
-    warmup: int = 0,
+    disable_cuda_graph: bool = True,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
-    combinations = [
-        (True, False),
-        (False, False),
-        (False, True),
-    ]
+    combinations = [True, False]
 
-    for k_online, block_verify in combinations:
-        run_tag = "k_online" if k_online else "no_k_online"
-        block_verify_tag = "block_verify" if block_verify else "no_block_verify"
+    for tree_verify in combinations:
+        tree_verify_tag = "tree_verify" if tree_verify else "no_tree_verify"
         output_tar = os.path.join(
             output_dir,
             f"profile_{target_model.split('/')[-1]}_vs_{draft_model.split('/')[-1]}"
-            f"_off{offset}_w{warmup}_{run_tag}_{block_verify_tag}.tar.gz",
+            f"_{tree_verify_tag}.tar.gz",
         )
 
         print(
-            f"\n>>> Starting profile: k_online={k_online}, block_verify={block_verify}, "
+            f"\n>>> Starting profile: tree_verify={tree_verify}, "
             f"target={target_model}, draft={draft_model}"
         )
 
         ret = run_profile_once.remote(
             target_model=target_model,
             draft_model=draft_model,
-            k_online=k_online,
-            k_online_offset=offset,
-            k_online_warmup=warmup,
-            block_verify=block_verify,
+            tree_verify=tree_verify,
+            disable_cuda_graph=disable_cuda_graph,
         )
 
         with open(output_tar, "wb") as f:
