@@ -4,10 +4,10 @@ import logging
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
-import heapq
 import torch
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.utils.common import fast_topk
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 logger = logging.getLogger(__name__)
@@ -394,10 +394,12 @@ def _select_top_k_tokens_no_hidden(
             .repeat(topk_p.shape[0], 1),
         )
     else:
+        if scores is None:
+            raise ValueError("scores must be initialized before expanding scores")
         expand_scores = torch.mul(
             scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
         )
-        topk_cs_p, topk_cs_index = torch.topk(
+        topk_cs_p, topk_cs_index = fast_topk(
             expand_scores.flatten(start_dim=1), topk, dim=-1
         )
         scores = topk_cs_p
@@ -442,7 +444,7 @@ def build_tree_verify_tokens(
     device = draft_logits.device
 
     draft_probs = torch.softmax(draft_logits, dim=-1)  # [bs, num_steps, vocab]
-    topk_probs, topk_ids = torch.topk(draft_probs, k=topk, dim=-1)  # [bs, num_steps, topk]
+    topk_probs, topk_ids = fast_topk(draft_probs, topk, dim=-1)  # [bs, num_steps, topk]
 
     num_steps = topk_probs.shape[1]
 
@@ -477,7 +479,7 @@ def build_tree_verify_tokens(
             f"requested={num_draft_tokens - 1}, available={max_candidates}."
         )
 
-    top_scores = torch.topk(score_list_cat, num_draft_tokens - 1, dim=-1)
+    top_scores = fast_topk(score_list_cat, num_draft_tokens - 1, dim=-1)
     top_scores_index = torch.sort(top_scores.indices).values
     ss_token_list = torch.cat(token_list, dim=1)
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
