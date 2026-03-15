@@ -670,7 +670,8 @@ class DFlashWorker:
                 verify_input = DFlashVerifyInput(
                     draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
                     positions=None,
-                    draft_token_num=tree_num_draft_tokens,
+                    draft_token_num=self.block_size,
+                    num_tokens_per_batch=tree_num_draft_tokens,
                     # Tree metadata for eagle-style verify
                     tree_parent_list=tree_parent_list,
                     tree_selected_index=tree_selected_index,
@@ -689,15 +690,10 @@ class DFlashWorker:
                 )
             
             _, build_custom_mask = self._resolve_verify_mask_policy()
-            tree_mask_buf, position_buf = (
-                self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-            )
             verify_input.prepare_for_verify(
                 batch,
                 self.page_size,
-                build_custom_mask=build_custom_mask,
-                tree_mask_buf=tree_mask_buf,
-                position_buf=position_buf,
+                build_custom_mask=build_custom_mask
             )
 
             batch.forward_mode = (
@@ -1246,7 +1242,7 @@ class DFlashWorker:
             if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
                 max_ctx = int(ctx_lens.max().item())
             else:
-                max_ctx = int(self.block_size)
+                max_ctx = int(self.block_size) if not self._tree_verify_enabled else int(self._tree_num_draft_tokens)
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 
@@ -1358,6 +1354,8 @@ class DFlashWorker:
 
     def _resolve_verify_mask_policy(self) -> tuple[str, bool]:
         backend_name = self._resolve_verify_mask_backend_name()
+        if self._tree_verify_enabled:
+            return backend_name, True
         return backend_name, (
             backend_name not in self._VERIFY_SKIP_CUSTOM_MASK_BACKENDS
         )
