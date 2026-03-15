@@ -276,6 +276,14 @@ class DFlashWorker:
                 tp_size,
             )
 
+        if (
+            self._tree_verify_enabled
+            and int(self._tree_num_draft_tokens) != int(self.block_size)
+        ):
+            self.target_worker.model_runner.server_args.speculative_num_draft_tokens = (
+                int(self._tree_num_draft_tokens)
+            )
+
         if self.tp_rank == 0:
             logger.info(
                 "DFLASH verify mode: k_online=%s, block_verify=%s, tree_verify=%s -> %s (verify_len_offset=%s)",
@@ -687,12 +695,12 @@ class DFlashWorker:
                     positions=positions,
                     draft_token_num=self.block_size,
                 )
-            
+
             _, build_custom_mask = self._resolve_verify_mask_policy()
             verify_input.prepare_for_verify(
                 batch,
                 self.page_size,
-                build_custom_mask=build_custom_mask
+                build_custom_mask=build_custom_mask,
             )
 
             batch.forward_mode = (
@@ -1503,6 +1511,7 @@ class DFlashWorker:
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
+
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
