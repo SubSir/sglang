@@ -670,8 +670,7 @@ class DFlashWorker:
                 verify_input = DFlashVerifyInput(
                     draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
                     positions=None,
-                    draft_token_num=self.block_size,
-                    num_tokens_per_batch=tree_num_draft_tokens,
+                    draft_token_num=tree_num_draft_tokens,
                     # Tree metadata for eagle-style verify
                     tree_parent_list=tree_parent_list,
                     tree_selected_index=tree_selected_index,
