@@ -278,15 +278,11 @@ class DFlashWorker:
 
         if self._tree_verify_enabled:
             # Ensure target verify uses tree-topk so FlashAttention can build custom_mask.
-            self.target_worker.model_runner.server_args.speculative_eagle_topk = (
+            assert self.target_worker.model_runner.server_args.speculative_eagle_topk == (
                 int(self._tree_verify_topk)
             )
-
-        if (
-            self._tree_verify_enabled
-            and int(self._tree_num_draft_tokens) != int(self.block_size)
-        ):
-            self.target_worker.model_runner.server_args.speculative_num_draft_tokens = (
+            
+            assert self.target_worker.model_runner.server_args.speculative_num_draft_tokens == (
                 int(self._tree_num_draft_tokens)
             )
 
