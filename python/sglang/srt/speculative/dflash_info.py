@@ -977,7 +977,6 @@ class DFlashVerifyInput(SpecInput):
                         keep_mask[row, keep_indices] = True
                     else:
                         keep_indices = 0
-                    print("KEEP", candidates[row, keep_indices])
             else:
                 keep_mask = (
                     torch.arange(self.draft_token_num, device=device)[None, :]
