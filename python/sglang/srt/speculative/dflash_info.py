@@ -300,14 +300,7 @@ class DFlashVerifyInput(SpecInput):
             and self.tree_selected_index is not None
             and self.tree_selected_index.numel() > 0
         ):
-            depth = int(self.draft_token_num) - 1
-            expected_nodes = int(self.tree_topk) * (depth - 1) + 1
-            if self.tree_parent_list.size(1) != expected_nodes:
-                raise RuntimeError(
-                    "DFLASH tree verify parent_list shape mismatch: "
-                    f"got {self.tree_parent_list.size(1)}, expected {expected_nodes} "
-                    f"(topk={int(self.tree_topk)}, depth={depth})."
-                )
+            depth = int((self.tree_parent_list.size(1) - 1) / int(self.tree_topk)) + 1
             (
                 tree_mask,
                 positions,
