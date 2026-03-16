@@ -118,6 +118,12 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # Draft worker still uses DFLASH block size for drafting.
+        if server_args.speculative_dflash_block_size is not None:
+            draft_server_args.speculative_num_draft_tokens = int(
+                server_args.speculative_dflash_block_size
+            )
+        draft_server_args.speculative_eagle_topk = 1
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
@@ -132,20 +138,21 @@ class DFlashWorker:
         )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
-        if server_args.speculative_num_draft_tokens is None:
+        if server_args.speculative_dflash_block_size is not None:
+            self.block_size = int(server_args.speculative_dflash_block_size)
+        elif server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(getattr(self.draft_model, "block_size", 16))
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
-            ):
-                logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
-                    model_block_size,
-                )
+
+        model_block_size = getattr(self.draft_model, "block_size", None)
+        if model_block_size is not None and int(model_block_size) != int(self.block_size):
+            logger.warning(
+                "DFLASH block size mismatch: using block_size=%s but draft config block_size=%s.",
+                self.block_size,
+                model_block_size,
+            )
 
         self._mask_token = resolve_dflash_mask_token(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -231,12 +238,17 @@ class DFlashWorker:
             int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0"))
         )
         # SGLANG_DFLASH_TREE_VERIFY_TOPK: topk for tree construction (default=8)
-        self._tree_verify_topk: int = int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY_TOPK", "1"))
-        # SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS: number of draft tokens (default=block_size)
-        self._tree_num_draft_tokens: int = int(self.block_size)
-        _tree_nums_env = os.environ.get("SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS")
-        if _tree_nums_env is not None:
-            self._tree_num_draft_tokens = int(_tree_nums_env)
+        self._tree_verify_topk: int = int(
+            server_args.speculative_eagle_topk
+            if server_args.speculative_eagle_topk is not None
+            else 1
+        )
+        # Tree verify uses the same draft token count as speculative_num_draft_tokens.
+        self._tree_num_draft_tokens: int = int(
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_num_draft_tokens is not None
+            else self.block_size
+        )
 
         # --- Block verify vs ragged verify mode selection
         # SGLANG_DFLASH_BLOCK_VERIFY=1: use original block verify (TARGET_VERIFY + custom_mask)
@@ -276,15 +288,6 @@ class DFlashWorker:
                 tp_size,
             )
 
-        if self._tree_verify_enabled:
-            # Ensure target verify uses tree-topk so FlashAttention can build custom_mask.
-            assert self.target_worker.model_runner.server_args.speculative_eagle_topk == (
-                int(self._tree_verify_topk)
-            )
-            
-            assert self.target_worker.model_runner.server_args.speculative_num_draft_tokens == (
-                int(self._tree_num_draft_tokens)
-            )
 
         if self.tp_rank == 0:
             logger.info(

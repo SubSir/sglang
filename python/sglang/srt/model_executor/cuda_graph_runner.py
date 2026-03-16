@@ -291,23 +291,6 @@ class CudaGraphRunner:
             self.num_tokens_per_bs = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and not self.model_runner.is_draft_worker
-                and int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0")) == 1
-            ):
-                tree_tokens_env = os.environ.get(
-                    "SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS"
-                )
-                if tree_tokens_env is not None:
-                    tree_tokens = int(tree_tokens_env)
-                else:
-                    tree_tokens = int(self.num_tokens_per_bs)
-                if tree_tokens <= 0:
-                    raise ValueError(
-                        "DFLASH tree verify cuda graph requires positive token count."
-                    )
-                self.num_tokens_per_bs = tree_tokens
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size

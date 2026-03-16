@@ -471,6 +471,18 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--max-running-requests", type=int, default=128)
     parser.add_argument(
+        "--speculative-eagle-topk",
+        type=int,
+        default=None,
+        help="Override speculative_eagle_topk for DFLASH server.",
+    )
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=None,
+        help="Override speculative_num_draft_tokens for DFLASH server.",
+    )
+    parser.add_argument(
         "--tp-sizes",
         type=str,
         default="1,2,4,8",
@@ -690,17 +702,32 @@ def main() -> None:
             print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
             dflash_port = find_available_port(port_base + 1)
             dflash_url = f"http://127.0.0.1:{dflash_port}"
+            dflash_other_args = [
+                *common_server_args,
+                "--speculative-algorithm",
+                "DFLASH",
+                "--speculative-draft-model-path",
+                args.draft_model,
+            ]
+            if args.speculative_num_draft_tokens is not None:
+                dflash_other_args.extend(
+                    [
+                        "--speculative-num-draft-tokens",
+                        str(args.speculative_num_draft_tokens),
+                    ]
+                )
+            if args.speculative_eagle_topk is not None:
+                dflash_other_args.extend(
+                    [
+                        "--speculative-eagle-topk",
+                        str(args.speculative_eagle_topk),
+                    ]
+                )
             dflash_proc = popen_launch_server(
                 args.target_model,
                 dflash_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    *common_server_args,
-                    "--speculative-algorithm",
-                    "DFLASH",
-                    "--speculative-draft-model-path",
-                    args.draft_model,
-                ],
+                other_args=dflash_other_args,
             )
             try:
                 _send_generate(

@@ -21,7 +21,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from copy import deepcopy
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -501,7 +500,7 @@ class Scheduler(
         from sglang.srt.managers.tp_worker import TpModelWorker
 
         self.tp_worker = TpModelWorker(
-            server_args=self._server_args_with_dflash_tree_verify(self.server_args),
+            server_args=self.server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,
@@ -510,24 +509,6 @@ class Scheduler(
             nccl_port=self.nccl_port,
         )
 
-    def _server_args_with_dflash_tree_verify(self, server_args: "ServerArgs") -> "ServerArgs":
-        if server_args.speculative_algorithm != "DFLASH":
-            return server_args
-
-        if os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") != "1":
-            return server_args
-
-        tree_topk_env = os.environ.get("SGLANG_DFLASH_TREE_VERIFY_TOPK")
-        tree_num_tokens_env = os.environ.get("SGLANG_DFLASH_TREE_VERIFY_NUM_TOKENS")
-        if tree_topk_env is None and tree_num_tokens_env is None:
-            return server_args
-
-        patched_args = deepcopy(server_args)
-        if tree_topk_env is not None:
-            patched_args.speculative_eagle_topk = int(tree_topk_env)
-        if tree_num_tokens_env is not None:
-            patched_args.speculative_num_draft_tokens = int(tree_num_tokens_env)
-        return patched_args
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
@@ -535,7 +516,7 @@ class Scheduler(
             return
 
         # Launch a draft worker for speculative decoding
-        draft_server_args = deepcopy(self.server_args)
+        draft_server_args = self.server_args
         draft_runner_cache_size = getattr(
             self.tp_worker.server_args, "draft_runner_cache_size", None
         )

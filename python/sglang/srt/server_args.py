@@ -2327,34 +2327,13 @@ class ServerArgs:
                     self.speculative_num_steps,
                 )
                 self.speculative_num_steps = 1
-
-            if self.speculative_eagle_topk is None:
-                self.speculative_eagle_topk = 1
-            elif int(self.speculative_eagle_topk) != 1:
-                logger.warning(
-                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
-                    self.speculative_eagle_topk,
-                )
-                self.speculative_eagle_topk = 1
-
+           
             if self.speculative_dflash_block_size is not None:
                 if int(self.speculative_dflash_block_size) <= 0:
                     raise ValueError(
                         "DFLASH requires --speculative-dflash-block-size to be positive, "
                         f"got {self.speculative_dflash_block_size}."
                     )
-                if self.speculative_num_draft_tokens is not None and int(
-                    self.speculative_num_draft_tokens
-                ) != int(self.speculative_dflash_block_size):
-                    raise ValueError(
-                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                        "but they differ. For DFLASH they must match. "
-                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
-                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
-                    )
-                self.speculative_num_draft_tokens = int(
-                    self.speculative_dflash_block_size
-                )
 
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
@@ -2420,6 +2399,9 @@ class ServerArgs:
                         inferred_block_size,
                     )
                 self.speculative_num_draft_tokens = inferred_block_size
+
+            if self.speculative_dflash_block_size is None:
+                self.speculative_dflash_block_size = self.speculative_num_draft_tokens
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
