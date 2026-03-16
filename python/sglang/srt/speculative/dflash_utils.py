@@ -488,8 +488,18 @@ def build_tree_verify_tokens(
             scores,
             topk,
         )
-        score_list.append(tree_info[0])
-        token_list.append(tree_info[1])
+
+        if i == 0:
+            beam_scores = step_topk_p
+            beam_tokens = step_topk_ids
+        else:
+            offset = topk**2 * (i - 1) + topk
+            selected_index = tree_info[2] - offset
+            beam_scores = scores
+            beam_tokens = tree_info[1].gather(1, selected_index)
+
+        score_list.append(beam_scores)
+        token_list.append(beam_tokens)
         parents_list.append(tree_info[2])
 
     score_list_cat = torch.cat(score_list, dim=1).flatten(1)

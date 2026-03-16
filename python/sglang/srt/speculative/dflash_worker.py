@@ -1254,7 +1254,11 @@ class DFlashWorker:
             if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
                 max_ctx = int(ctx_lens.max().item())
             else:
-                max_ctx = int(self.block_size) if not self._tree_verify_enabled else int(self._tree_num_draft_tokens)
+                max_ctx = (
+                    int(self.block_size)
+                    if not self._tree_verify_enabled
+                    else int(self._tree_num_draft_tokens)
+                )
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 
