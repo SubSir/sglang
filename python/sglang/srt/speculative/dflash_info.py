@@ -17,7 +17,12 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient, verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    get_src_tgt_cache_loc,
+    get_target_cache_loc,
+)
+from sglang.srt.utils import next_power_of_2
 
 
 @dataclass
@@ -57,7 +62,10 @@ class DFlashDraftInput(SpecInput):
         # Draft state does not change token accounting.
         return (1, 1)
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self, new_indices: torch.Tensor, has_been_filtered: bool = True
+    ):
+        _ = has_been_filtered
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 
@@ -811,6 +819,7 @@ class DFlashVerifyInput(SpecInput):
             and self.tree_parent_list is not None
             and self.tree_selected_index is not None
         )
+        accept_index_abs = None
         if is_tree_verify:
             if (
                 self.tree_retrive_index is None
@@ -844,8 +853,9 @@ class DFlashVerifyInput(SpecInput):
                 torch.arange(bs, device=device, dtype=accept_index.dtype)
                 * self.draft_token_num
             ).unsqueeze(1)
-            accept_index_local = accept_index - batch_offsets
-            last_accept_abs = accept_index.gather(
+            accept_index_abs = accept_index
+            accept_index_local = accept_index_abs - batch_offsets
+            last_accept_abs = accept_index_abs.gather(
                 1, accept_len.unsqueeze(1).to(torch.long)
             ).squeeze(1)
             bonus = predicts[last_accept_abs.to(torch.long)]
@@ -985,10 +995,65 @@ class DFlashVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
             batch.out_cache_loc = out_cache_loc[keep_mask]
         else:
-            # Page-size > 1 is not supported in the initial DFlash implementation.
-            raise NotImplementedError(
-                "DFLASH verify with page_size > 1 is not supported yet."
-            )
+            if not is_tree_verify:
+                out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
+                row_offsets = torch.arange(
+                    self.draft_token_num, device=device
+                )[None, :]
+                keep_slots = _compute_paged_keep_slots(
+                    prefix_lens=batch.seq_lens,
+                    commit_lens=commit_lens,
+                    draft_token_num=self.draft_token_num,
+                    page_size=page_size,
+                )
+                free_mask = row_offsets >= keep_slots[:, None]
+                batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+
+                keep_mask = row_offsets < commit_lens[:, None]
+                batch.out_cache_loc = out_cache_loc[keep_mask]
+            else:
+                if self.tree_topk <= 1:
+                    # Page-size > 1 is only supported for tree verify with topk > 1.
+                    raise NotImplementedError(
+                        "DFLASH verify with page_size > 1 is not supported yet."
+                    )
+
+                if accept_index_abs is None:
+                    raise RuntimeError(
+                        "DFLASH tree verify requires accept_index_abs for page_size > 1."
+                    )
+
+                accept_length = torch.clamp(commit_lens - 1, min=0)
+                accept_index_flat = accept_index_abs[accept_index_abs != -1]
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    accept_index_flat,
+                    accept_length,
+                    self.draft_token_num,
+                    page_size,
+                )
+                to_free_slots = torch.empty(
+                    (to_free_num_slots.sum().item(),),
+                    dtype=torch.int64,
+                    device=to_free_num_slots.device,
+                )
+                get_target_cache_loc[(bs,)](
+                    tgt_cache_loc,
+                    to_free_slots,
+                    accept_length,
+                    to_free_num_slots,
+                    batch.out_cache_loc,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                    next_power_of_2(bs),
+                )
+
+                batch.token_to_kv_pool_allocator.free(to_free_slots)
+                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
+                batch.out_cache_loc = tgt_cache_loc
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
