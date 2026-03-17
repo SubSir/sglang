@@ -12,17 +12,28 @@ base_image = (
 local_image = (
     base_image
     .run_commands(
-        "echo 66 > /tmp/build_time",
+        "echo 43 > /tmp/build_time",
         "git clone  https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
     )
 )
 
+# 将本地代码打包进镜像后，再在运行时复制到目标目录
 local_image = (
     local_image
     .add_local_dir(
-        "./benchmark/dflash",
-        remote_path="/root/sglang_local/benchmark/dflash"
+        "./python",
+        remote_path="/root/sglang_local/python_local",
+        copy=True,
+    )
+    .add_local_dir(
+        "./benchmark",
+        remote_path="/root/sglang_local/benchmark_local",
+        copy=True,
+    )
+    .run_commands(
+        "rm -rf /root/sglang_local/python && cp -r /root/sglang_local/python_local /root/sglang_local/python",
+        "rm -rf /root/sglang_local/benchmark && cp -r /root/sglang_local/benchmark_local /root/sglang_local/benchmark"
     )
 )
 
@@ -44,6 +55,7 @@ def run_dataset_sweep(
     block_verify: bool = False,
     tree_verify: bool = False,
     tree_verify_topk: int = 1,
+    tree_verify_num_draft_tokens: int = None,
     disable_cuda_graph: bool = False,
 ):
     """
@@ -78,18 +90,19 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "1,2,8,32",
+        "--concurrencies", "32",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
-        # "--samples-per-concurrency-base", "1",
         "--attention-backends", "fa3",
         "--mem-fraction-static", "0.7",
         # "--enable-piecewise-cuda-graph",
         # "--piecewise-cuda-graph-max-tokens",
         # str(piecewise_cuda_graph_max_tokens)
-        # "--speculative-num-draft-tokens", str(1 + tree_verify_topk * 15),
         "--speculative-eagle-topk", str(tree_verify_topk),
     ]
+    if tree_verify_num_draft_tokens is not None:
+        args.append("--speculative-num-draft-tokens")
+        args.append(str(tree_verify_num_draft_tokens))
 
     if skip_baseline:
         args.append("--skip-baseline")
@@ -112,6 +125,9 @@ def run_dataset_sweep(
     env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
+    # env["CUDA_LAUNCH_BLOCKING"] = "1"
+    # env["SGLANG_FA_SPEC_DEBUG"] = "1"
+    # env["SGLANG_ATTN_BACKEND_DEBUG"] = "1"
     
     sglang_path = "/root/sglang_local/python"
     if sglang_path not in sys.path:
@@ -156,9 +172,9 @@ def run_dataset_sweep(
 
 @app.local_entrypoint()
 def main(
-    data_names: str = "gsm8k,mt-bench",
-    target_model: str = "openai/gpt-oss-120b",
-    draft_model: str = "z-lab/gpt-oss-120b-DFlash",
+    data_names: str = "gsm8k",
+    target_model: str = "openai/gpt-oss-20b",
+    draft_model: str = "z-lab/gpt-oss-20b-DFlash",
     offset: int = 2,
     warmup: int = 0,
 ):
@@ -174,7 +190,7 @@ def main(
     ]
 
     dataset_list = [d.strip() for d in data_names.split(",") if d.strip()]
-    base_results_dir = f"gptoss_{data_names.replace(',', '_')}"
+    base_results_dir = f"tmp_{data_names.replace(',', '_')}"
 
     # Ensure output directories exist before writing markdown files.
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
@@ -195,14 +211,14 @@ def main(
             calls = []
 
             for dataset in dataset_list:
-                for tree_verify in [True, False]:
+                for tree_verify, tree_verify_num_draft_tokens in [(True, None)]:
                     print(
                         f"\n>>> Spawning benchmark [{dataset}] "
                         f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}: "
                         f"Target={target}, Draft={draft}..."
                     )
 
-                    topks = [2, 4, 6] if tree_verify else [1]
+                    topks = [4] if tree_verify else [1]
                     for topk in topks:
                         call = run_dataset_sweep.spawn(
                             target,
@@ -215,6 +231,7 @@ def main(
                             block_verify=block_verify,
                             tree_verify=tree_verify,
                             tree_verify_topk=topk,
+                            tree_verify_num_draft_tokens=tree_verify_num_draft_tokens,
                             disable_cuda_graph=disable_cuda_graph,
                         )
 
