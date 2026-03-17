@@ -1,9 +1,10 @@
 import logging
 import math
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional, Union, cast, Tuple
 
 import torch
+import os
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -26,6 +27,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
+    build_tree_verify_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -128,6 +130,12 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # Draft worker still uses DFLASH block size for drafting.
+        if server_args.speculative_dflash_block_size is not None:
+            draft_server_args.speculative_num_draft_tokens = int(
+                server_args.speculative_dflash_block_size
+            )
+        draft_server_args.speculative_eagle_topk = 1
         saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -149,22 +157,37 @@ class DFlashWorker:
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if server_args.speculative_num_draft_tokens is None:
+        if server_args.speculative_dflash_block_size is not None:
+            self.block_size = int(server_args.speculative_dflash_block_size)
+        elif server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = draft_config.block_size
-            if model_block_size is None:
-                model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
-            ):
-                logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
-                    model_block_size,
-                )
+
+        model_block_size = getattr(self.draft_model, "block_size", None)
+        if model_block_size is not None and int(model_block_size) != int(self.block_size):
+            logger.warning(
+            "DFLASH block size mismatch: using block_size=%s but draft config block_size=%s.",
+            self.block_size,
+            model_block_size,
+        )
+
+        self._tree_verify_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0"))
+        )
+        # SGLANG_DFLASH_TREE_VERIFY_TOPK: topk for tree construction (default=8)
+        self._tree_verify_topk: int = int(
+            server_args.speculative_eagle_topk
+            if server_args.speculative_eagle_topk is not None
+            else 1
+        )
+        # Tree verify uses the same draft token count as speculative_num_draft_tokens.
+        self._tree_num_draft_tokens: int = int(
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_num_draft_tokens is not None
+            else self.block_size
+        )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -174,12 +197,15 @@ class DFlashWorker:
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s, tree_verify=%s, tree_verify_topk=%s, tree_num_draft_tokens=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
+                self._tree_verify_enabled,
+                self._tree_verify_topk,
+                self._tree_num_draft_tokens,
             )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
@@ -653,23 +679,74 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
+        if not self._tree_verify_enabled:
+            draft_result = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+            )
+            draft_next = cast(torch.Tensor, draft_result).view(bs, self.block_size - 1)
+        
         positions = positions_2d.reshape(-1)
 
-        verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
-        )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
+        if self._tree_verify_enabled:
+            build_custom_mask = True
+
+        if self._tree_verify_enabled:
+            # ===== EAGLE-style tree verify =====
+            tree_topk = int(self._tree_verify_topk)
+            tree_num_draft_tokens = int(self._tree_num_draft_tokens)
+            num_steps = int(draft_hidden.shape[1]) - 1
+
+            topk_result = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+                return_topk=tree_topk,
+            )
+            _, draft_topk_ids, draft_topk_probs = cast(
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
+            )
+            draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
+            draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
+
+            (
+                tree_draft_tokens,
+                tree_parent_list,
+                tree_selected_index,
+            ) = build_tree_verify_tokens(
+                verified_id=block_ids[:, 0],  # [bs]
+                topk_probs=draft_topk_probs,
+                topk_ids=draft_topk_ids,
+                topk=tree_topk,
+                num_draft_tokens=tree_num_draft_tokens,
+            )
+            # For tree verify, we use TARGET_VERIFY mode with tree structure
+            # The attention backend will build the tree mask based on parent_list
+            verify_input = DFlashVerifyInput(
+                draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
+                positions=None,
+                draft_token_num=tree_num_draft_tokens,
+                # Tree metadata for eagle-style verify
+                tree_parent_list=tree_parent_list,
+                tree_selected_index=tree_selected_index,
+                topk=tree_topk,
+            )
+
+        else:
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+            # ===== Original linear block verify =====
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=self.block_size,
+            )
+            
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
@@ -690,7 +767,12 @@ class DFlashWorker:
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_topk: Optional[int] = None,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
@@ -726,6 +808,19 @@ class DFlashWorker:
         out_token_ids = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
+        out_topk_ids: Optional[torch.Tensor] = None
+        out_topk_probs: Optional[torch.Tensor] = None
+        if return_topk is not None:
+            out_topk_ids = torch.empty(
+                (num_tokens, int(return_topk)),
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            out_topk_probs = torch.empty(
+                (num_tokens, int(return_topk)),
+                dtype=weight_dtype,
+                device=hidden_states.device,
+            )
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
@@ -733,6 +828,40 @@ class DFlashWorker:
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                if num_org > 0:
+                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    out_token_ids[start:end] = (
+                        torch.argmax(base_logits, dim=-1).to(torch.long)
+                        + org_vocab_start
+                    )
+                else:
+                    out_token_ids[start:end] = 0
+            if return_topk is not None:
+                assert out_topk_ids is not None
+                assert out_topk_probs is not None
+                for start in range(0, num_tokens, int(chunk_size)):
+                    end = min(num_tokens, start + int(chunk_size))
+                    hs = _cast_hs(hidden_states[start:end])
+                    if num_org > 0:
+                        base_logits = torch.matmul(hs, weight[:num_org].T)
+                        topk_vals, topk_idx = torch.topk(
+                            base_logits, k=int(return_topk), dim=-1
+                        )
+                        out_topk_probs[start:end] = torch.softmax(
+                            topk_vals, dim=-1
+                        ).to(weight_dtype)
+                        out_topk_ids[start:end] = (
+                            topk_idx.to(torch.long) + org_vocab_start
+                        )
+                        out_token_ids[start:end] = out_topk_ids[start:end, 0]
+                    else:
+                        out_token_ids[start:end] = 0
+                        out_topk_probs[start:end] = 0
+                        out_topk_ids[start:end] = 0
+                return out_token_ids, out_topk_ids, out_topk_probs
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
@@ -754,7 +883,15 @@ class DFlashWorker:
             # Base vocab logits.
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
-                local_max, local_arg = torch.max(base_logits, dim=-1)
+                if return_topk is not None:
+                    topk_vals, topk_idx = torch.topk(
+                        base_logits, k=int(return_topk), dim=-1
+                    )
+                    local_max = topk_vals[:, 0]
+                    local_arg = topk_idx[:, 0]
+                    topk_probs = _cast_hs(torch.softmax(topk_vals, dim=-1))
+                else:
+                    local_max, local_arg = torch.max(base_logits, dim=-1)
             else:
                 local_max = torch.full(
                     (chunk_len,),
@@ -765,9 +902,24 @@ class DFlashWorker:
                 local_arg = torch.zeros(
                     (chunk_len,), dtype=torch.int64, device=hs.device
                 )
+                if return_topk is not None:
+                    topk_probs = torch.zeros(
+                        (chunk_len, int(return_topk)),
+                        dtype=weight_dtype,
+                        device=hs.device,
+                    )
+                    topk_idx = torch.zeros(
+                        (chunk_len, int(return_topk)),
+                        dtype=torch.long,
+                        device=hs.device,
+                    )
 
             # Added vocab logits (e.g., LoRA-added embeddings), if present.
             if num_added > 0:
+                if return_topk is not None:
+                    raise RuntimeError(
+                        "return_topk is not supported with added vocab shards"
+                    )
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
                 added_logits = torch.matmul(
@@ -786,6 +938,8 @@ class DFlashWorker:
             if num_added == 0:
                 local_arg.add_(org_vocab_start)
                 global_ids = local_arg
+                if return_topk is not None:
+                    topk_idx = topk_idx + org_vocab_start
             else:
                 global_ids = torch.empty(
                     (chunk_len,), dtype=torch.int64, device=hs.device
@@ -798,8 +952,16 @@ class DFlashWorker:
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                if return_topk is not None:
+                    assert out_topk_ids is not None
+                    assert out_topk_probs is not None
+                    out_topk_ids[start:end] = topk_idx.to(torch.long)
+                    out_topk_probs[start:end] = topk_probs.to(weight_dtype)
                 continue
 
+
+            if return_topk is not None:
+                raise RuntimeError("return_topk is only supported with tp_size == 1")
             # Gather per-rank maxima and associated global ids, then select the global max.
             needed = tp_size * chunk_len
             chunk_cap = int(chunk_size)
@@ -855,6 +1017,10 @@ class DFlashWorker:
             selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
+        if return_topk is not None:
+            assert out_topk_ids is not None
+            assert out_topk_probs is not None
+            return out_token_ids, out_topk_ids, out_topk_probs
 
         return out_token_ids
 
@@ -921,7 +1087,11 @@ class DFlashWorker:
             if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
                 max_ctx = int(ctx_lens.max().item())
             else:
-                max_ctx = int(self.block_size)
+                max_ctx = (
+                    int(self.block_size)
+                    if not self._tree_verify_enabled
+                    else int(self._tree_num_draft_tokens)
+                )
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 

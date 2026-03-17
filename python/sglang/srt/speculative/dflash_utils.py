@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import fast_topk
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -635,3 +636,141 @@ def compute_dflash_sampling_accept_len_and_bonus(
     accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
     return accept_len, bonus
+
+@torch.compile(dynamic=True)
+def _select_top_k_tokens_no_hidden(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    scores: Optional[torch.Tensor],
+    topk: int,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if i == 0:
+        scores = topk_p
+        tree_info = (
+            topk_p.unsqueeze(1),
+            topk_index,
+            torch.arange(-1, topk, dtype=torch.long, device=topk_p.device)
+            .unsqueeze(0)
+            .repeat(topk_p.shape[0], 1),
+        )
+    else:
+        if scores is None:
+            raise ValueError("scores must be initialized before expanding scores")
+        expand_scores = torch.mul(
+            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
+        )
+        topk_cs_p, topk_cs_index = fast_topk(
+            expand_scores.flatten(start_dim=1), topk, dim=-1
+        )
+        scores = topk_cs_p
+
+        topk_index = topk_index.reshape(-1, topk**2)
+        tree_info = (
+            expand_scores,
+            topk_index,
+            topk_cs_index + (topk**2 * (i - 1) + topk),
+        )
+
+    return scores, tree_info
+
+
+def build_tree_verify_tokens(
+    *,
+    verified_id: torch.Tensor,
+    topk_probs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+    num_draft_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build tree verify tokens for DFlash eagle-style tree verify (TARGET_VERIFY mode).
+
+    This function constructs a pruned tree of draft tokens and returns:
+      - The pruned tokens (including the root verified_id)
+      - A full topk-tree parent list compatible with the EAGLE kernel
+      - A selected_index list that encodes the pruned tree inside the full tree
+
+    Args:
+        verified_id: Current token per request, shape [bs]
+        topk_probs: Draft topk probabilities, shape [bs, num_steps, topk]
+        topk_ids: Draft topk token ids, shape [bs, num_steps, topk]
+        topk: Number of top candidates to select at each node
+        num_draft_tokens: Total number of tokens in the pruned tree (including root)
+
+    Returns:
+        draft_tokens: Flattened pruned tokens, shape [bs * num_draft_tokens]
+        parent_list: Full topk-tree parent list, shape [bs, topk * (depth - 1) + 1]
+        selected_index: Selected indices encoding the pruned tree, shape [bs, num_draft_tokens - 1]
+    """
+    bs = topk_probs.shape[0]
+    num_steps = topk_probs.shape[1]
+    device = topk_probs.device
+
+    # if topk == 1:
+    #     max_candidates = num_steps
+    #     if num_draft_tokens - 1 > max_candidates:
+    #         raise ValueError(
+    #             "num_draft_tokens exceeds available candidates: "
+    #             f"requested={num_draft_tokens - 1}, available={max_candidates}."
+    #         )
+
+    #     linear_tokens = topk_ids[:, : num_draft_tokens - 1, 0]
+    #     draft_tokens = torch.cat([verified_id[:, None], linear_tokens], dim=1).flatten()
+    #     parent_ids = torch.arange(
+    #         -1, num_steps - 1, dtype=torch.long, device=device
+    #     ).unsqueeze(0)
+    #     parent_list = parent_ids.repeat(bs, 1)
+    #     selected_index = torch.arange(
+    #         num_draft_tokens - 1, dtype=torch.long, device=device
+    #     ).unsqueeze(0)
+    #     selected_index = selected_index.repeat(bs, 1)
+    #     return draft_tokens, parent_list, selected_index
+
+    score_list: list[torch.Tensor] = []
+    token_list: list[torch.Tensor] = []
+    parents_list: list[torch.Tensor] = []
+
+    scores = None
+    expanded_topk_probs = topk_probs[:, 1:].repeat_interleave(topk, dim=0)
+    expanded_topk_ids = topk_ids[:, 1:].repeat_interleave(topk, dim=0)
+
+    for i in range(num_steps):
+        if i == 0:
+            step_topk_p = topk_probs[:, 0]
+            step_topk_ids = topk_ids[:, 0]
+        else:
+            step_topk_p = expanded_topk_probs[:, i - 1]
+            step_topk_ids = expanded_topk_ids[:, i - 1]
+
+        scores, tree_info = _select_top_k_tokens_no_hidden(
+            i,
+            step_topk_p,
+            step_topk_ids,
+            scores,
+            topk,
+        )
+
+        score_list.append(tree_info[0])
+        token_list.append(tree_info[1])
+        parents_list.append(tree_info[2])
+
+    score_list_cat = torch.cat(score_list, dim=1).flatten(1)
+    max_candidates = score_list_cat.shape[1]
+    if num_draft_tokens - 1 > max_candidates:
+        raise ValueError(
+            "num_draft_tokens exceeds available candidates: "
+            f"requested={num_draft_tokens - 1}, available={max_candidates}."
+        )
+
+    top_scores = fast_topk(score_list_cat, num_draft_tokens - 1, dim=-1)
+    top_scores_index = torch.sort(top_scores.indices).values
+    ss_token_list = torch.cat(token_list, dim=1)
+    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+    draft_tokens = torch.cat([verified_id[:, None], draft_tokens], dim=1).flatten()
+
+    if len(parents_list) > 1:
+        parent_list = torch.cat(parents_list[:-1], dim=1)
+    else:
+        parent_list = torch.empty((bs, 0), dtype=torch.long, device=device)
+
+    return draft_tokens, parent_list, top_scores_index

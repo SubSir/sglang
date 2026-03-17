@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
-
+from typing import List, Tuple, Optional
+import os
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient, verify_tree_greedy_func
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -21,8 +22,13 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    get_src_tgt_cache_loc,
+    get_target_cache_loc,
+)
+from sglang.srt.utils import next_power_of_2
+ 
 
 def _compute_paged_keep_slots(
     *,
@@ -164,6 +170,13 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    tree_parent_list: Optional[torch.Tensor] = None  # Full topk-tree parent list
+    tree_selected_index: Optional[torch.Tensor] = None  # Selected indices inside full tree
+    tree_retrive_index: Optional[torch.Tensor] = None
+    tree_retrive_next_token: Optional[torch.Tensor] = None
+    tree_retrive_next_sibling: Optional[torch.Tensor] = None
+
+
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
@@ -171,7 +184,10 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
-
+        if os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1":
+            self.custom_mask = torch.empty(
+            (1,), dtype=torch.bool, device="cuda"
+        )
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
@@ -185,7 +201,40 @@ class DFlashVerifyInput(SpecInput):
         if batch.forward_mode.is_idle():
             return
 
+        bs = batch.batch_size()
         batch.input_ids = self.draft_token
+        if (
+            self.positions is None
+            and self.tree_parent_list is not None
+            and self.tree_parent_list.numel() > 0
+            and self.tree_selected_index is not None
+            and self.tree_selected_index.numel() > 0
+        ):
+            depth = int((self.tree_parent_list.size(1) - 1) / int(self.topk)) + 1
+            (
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                _,
+            ) = build_tree_kernel_efficient(
+                verified_id=self.draft_token.view(bs, self.draft_token_num)[:, 0],
+                parent_list=self.tree_parent_list,
+                top_scores_index=self.tree_selected_index,
+                draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
+                seq_lens=batch.seq_lens,
+                seq_lens_sum=batch.seq_lens_sum,
+                topk=int(self.topk),
+                spec_steps=depth,
+                num_verify_tokens=self.draft_token_num,
+                tree_mask_mode=TreeMaskMode.FULL_MASK,
+            )
+            self.custom_mask = tree_mask
+            self.positions = positions
+            self.tree_retrive_index = retrive_index
+            self.tree_retrive_next_token = retrive_next_token
+            self.tree_retrive_next_sibling = retrive_next_sibling
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -225,6 +274,14 @@ class DFlashVerifyInput(SpecInput):
 
         if not build_custom_mask:
             self.custom_mask = None
+            return
+
+        if (
+            self.tree_parent_list is not None
+            and self.tree_parent_list.numel() > 0
+            and self.tree_selected_index is not None
+            and self.tree_selected_index.numel() > 0
+        ):
             return
 
         if self.draft_token_num <= 0:
@@ -331,6 +388,11 @@ class DFlashVerifyInput(SpecInput):
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
 
+        is_tree_verify = (
+            self.topk > 0
+            and self.tree_parent_list is not None
+            and self.tree_selected_index is not None
+         )
         sampling_info = batch.sampling_info
         if sampling_info is not None:
             if len(sampling_info) != bs:
@@ -362,11 +424,14 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
+        accept_index_abs = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            if is_tree_verify:
+                raise RuntimeError("Tree verify is not supported for sampling.")
             accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
@@ -376,15 +441,59 @@ class DFlashVerifyInput(SpecInput):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, self.draft_token_num
             )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                candidates=candidates,
-                target_predict=target_predict,
-            )
+            if is_tree_verify:
+                if (
+                    self.tree_retrive_index is None
+                    or self.tree_retrive_next_token is None
+                    or self.tree_retrive_next_sibling is None
+                ):
+                    raise RuntimeError(
+                        "DFLASH tree verify requires retrive_* buffers to be built by the tree kernel."
+                    )
+                predicts = torch.empty(
+                    (bs * self.draft_token_num,), device=device, dtype=torch.int32
+                )
+                accept_index = torch.empty(
+                    (bs, self.draft_token_num), device=device, dtype=torch.int32
+                )
+                accept_token_num = torch.zeros(
+                    (bs,), device=device, dtype=torch.int32
+                )
+                verify_tree_greedy_func(
+                    predicts=predicts,
+                    accept_index=accept_index,
+                    accept_token_num=accept_token_num,
+                    candidates=candidates,
+                    retrive_index=self.tree_retrive_index,
+                    retrive_next_token=self.tree_retrive_next_token,
+                    retrive_next_sibling=self.tree_retrive_next_sibling,
+                    target_predict=target_predict,
+                )
+                accept_len = accept_token_num
+                batch_offsets = (
+                    torch.arange(bs, device=device, dtype=accept_index.dtype)
+                    * self.draft_token_num
+                ).unsqueeze(1)
+                accept_index_abs = accept_index
+                accept_index_local = accept_index_abs - batch_offsets
+                last_accept_abs = accept_index_abs.gather(
+                    1, accept_len.unsqueeze(1).to(torch.long)
+                ).squeeze(1)
+                bonus = predicts[last_accept_abs.to(torch.long)]
+                packed = torch.cat(
+                    [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+                ).cpu()
+                accept_index = accept_index_local
+            else:
+                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
 
-        # Single D2H transfer: candidates[1:] + accept_len + bonus
-        packed = torch.cat(
-            [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
-        ).cpu()
+                # Single D2H transfer: candidates[1:] + accept_len + bonus
+                packed = torch.cat(
+                    [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+                ).cpu()
 
         max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
@@ -393,9 +502,17 @@ class DFlashVerifyInput(SpecInput):
 
         for i, req in enumerate(batch.reqs):
             acc_len = int(packed[i, max_acc].item())
-            proposed = packed[i, :acc_len].tolist() + [
-                int(packed[i, max_acc + 1].item())
-            ]
+            bonus_token = int(packed[i, max_acc + 1].item())
+            if is_tree_verify:
+                proposed: list[int] = []
+                if acc_len > 0:
+                    accept_indices = accept_index[i, 1 : acc_len + 1].to(torch.long)
+                    proposed.extend(
+                        candidates[i].index_select(0, accept_indices).tolist()
+                    )
+                proposed.append(bonus_token)
+            else:
+                proposed = packed[i, :acc_len].tolist() + [bonus_token]
 
             appended = 0
             if (
@@ -481,26 +598,76 @@ class DFlashVerifyInput(SpecInput):
         # Free uncommitted KV cache slots and compact out_cache_loc.
         if page_size == 1:
             out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            keep_mask = (
-                torch.arange(self.draft_token_num, device=device)[None, :]
-                < commit_lens[:, None]
-            )
+            if is_tree_verify:
+                keep_mask = torch.zeros(
+                    (bs, self.draft_token_num), dtype=torch.bool, device=device
+                )
+                keep_mask[:, 0] = True
+                for row in range(bs):
+                    acc_len = int(commit_lens_cpu[row]) - 1
+                    if acc_len > 0:
+                        keep_indices = accept_index[row, : acc_len + 1]
+                        keep_mask[row, keep_indices] = True
+                    else:
+                        keep_indices = 0
+            else:
+                keep_mask = (
+                    torch.arange(self.draft_token_num, device=device)[None, :]
+                    < commit_lens[:, None]
+                )
             batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
             batch.out_cache_loc = out_cache_loc[keep_mask]
         else:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
-            keep_slots = _compute_paged_keep_slots(
-                prefix_lens=batch.seq_lens,
-                commit_lens=commit_lens,
-                draft_token_num=self.draft_token_num,
-                page_size=page_size,
-            )
-            free_mask = row_offsets >= keep_slots[:, None]
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+            if is_tree_verify:
+                if accept_index_abs is None:
+                    raise RuntimeError(
+                        "DFLASH tree verify requires accept_index_abs for page_size > 1."
+                    )
+                accept_length = torch.clamp(commit_lens - 1, min=0)
+                accept_index_flat = accept_index_abs[accept_index_abs != -1]
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    accept_index_flat,
+                    accept_length,
+                    self.draft_token_num,
+                    page_size,
+                )
+                to_free_slots = torch.empty(
+                    (to_free_num_slots.sum().item(),),
+                    dtype=torch.int64,
+                    device=to_free_num_slots.device,
+                )
+                get_target_cache_loc[(bs,)](
+                    tgt_cache_loc,
+                    to_free_slots,
+                    accept_length,
+                    to_free_num_slots,
+                    batch.out_cache_loc,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                    next_power_of_2(bs),
+                )
 
-            keep_mask = row_offsets < commit_lens[:, None]
-            batch.out_cache_loc = out_cache_loc[keep_mask]
+                batch.token_to_kv_pool_allocator.free(to_free_slots)
+                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
+                batch.out_cache_loc = tgt_cache_loc
+            else:
+                out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
+                row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
+                keep_slots = _compute_paged_keep_slots(
+                    prefix_lens=batch.seq_lens,
+                    commit_lens=commit_lens,
+                    draft_token_num=self.draft_token_num,
+                    page_size=page_size,
+                )
+                free_mask = row_offsets >= keep_slots[:, None]
+                batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+
+                keep_mask = row_offsets < commit_lens[:, None]
+                batch.out_cache_loc = out_cache_loc[keep_mask]
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
@@ -536,7 +703,11 @@ class DFlashVerifyInput(SpecInput):
         segments: List[torch.Tensor] = []
         for i, ln in enumerate(commit_lens_cpu):
             if ln > 0:
-                segments.append(hidden[i, :ln, :])
+                if is_tree_verify:
+                    indices = accept_index[i, : ln].to(hidden.device)
+                    segments.append(hidden[i].index_select(0, indices))
+                else:
+                    segments.append(hidden[i, :ln, :])
         next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).

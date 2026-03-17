@@ -1163,6 +1163,11 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            is_tree_verify = (
+                os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1"
+            )
+            if is_tree_verify:
+                build_custom_mask = True
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,

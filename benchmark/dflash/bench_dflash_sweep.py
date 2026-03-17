@@ -618,7 +618,7 @@ def main() -> None:
                 "--max-running-requests",
                 str(args.max_running_requests),
                 "--page-size",
-                "64"
+                "1"
             ]
             if args.disable_cuda_graph:
                 common_server_args.append("--disable-cuda-graph")
