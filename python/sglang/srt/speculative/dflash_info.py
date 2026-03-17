@@ -217,7 +217,7 @@ class DFlashVerifyInput(SpecInput):
                 retrive_index,
                 retrive_next_token,
                 retrive_next_sibling,
-                _,
+                draft_tokens,
             ) = build_tree_kernel_efficient(
                 verified_id=self.draft_token.view(bs, self.draft_token_num)[:, 0],
                 parent_list=self.tree_parent_list,
@@ -230,6 +230,7 @@ class DFlashVerifyInput(SpecInput):
                 num_verify_tokens=self.draft_token_num,
                 tree_mask_mode=TreeMaskMode.FULL_MASK,
             )
+            batch.input_ids = draft_tokens
             self.custom_mask = tree_mask
             self.positions = positions
             self.tree_retrive_index = retrive_index
