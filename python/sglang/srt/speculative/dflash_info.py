@@ -176,6 +176,9 @@ class DFlashVerifyInput(SpecInput):
     retrive_next_token: Optional[torch.Tensor] = None
     retrive_next_sibling: Optional[torch.Tensor] = None
 
+    # Tree-verify bookkeeping (populated during verify).
+    accept_index_local: Optional[torch.Tensor] = None
+    accept_len: Optional[torch.Tensor] = None
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
@@ -477,6 +480,8 @@ class DFlashVerifyInput(SpecInput):
                 ).unsqueeze(1)
                 accept_index_abs = accept_index
                 accept_index_local = accept_index_abs - batch_offsets
+                self.accept_index_local = accept_index_local
+                self.accept_len = accept_len
                 last_accept_abs = accept_index_abs.gather(
                     1, accept_len.unsqueeze(1).to(torch.long)
                 ).squeeze(1)

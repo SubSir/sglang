@@ -1238,6 +1238,21 @@ class DFlashWorker:
         accepted_steps = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
+        spec_info = getattr(batch, "spec_info", None)
+        is_tree_verify = (
+            isinstance(spec_info, DFlashVerifyInput)
+            and spec_info.topk > 1
+            and spec_info.accept_index_local is not None
+            and spec_info.accept_len is not None
+            and spec_info.accept_len.numel() > 0
+        )
+
+        if is_tree_verify:
+            accept_len = spec_info.accept_len.to(torch.int64)
+            last_indices = torch.clamp(accept_len, min=0)
+            accepted_steps = spec_info.accept_index_local.gather(1, last_indices[:, None])
+            accepted_steps = accepted_steps.squeeze(1).to(torch.int64)
+
         if batch.mamba_track_indices is not None:
             mamba_track_interval = self.server_args.mamba_track_interval
             to_track_mask = (
@@ -1248,14 +1263,28 @@ class DFlashWorker:
                 batch.seq_lens // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
+
+            if is_tree_verify:
+                accept_len = spec_info.accept_len.to(torch.int64)
+                can_track_mask = to_track_mask & (to_track_ith < accept_len)
+                gather_idx = torch.clamp(to_track_ith, min=0).to(torch.long)
+                mamba_steps_to_track = spec_info.accept_index_local.gather(
+                    1, gather_idx[:, None]
+                ).squeeze(1)
+                mamba_steps_to_track = torch.where(
+                    can_track_mask,
+                    mamba_steps_to_track.to(torch.int64),
+                    torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                )
+            else:
+                can_track_mask = to_track_mask & (
+                    to_track_ith < commit_lens.to(to_track_ith.dtype)
+                )
+                mamba_steps_to_track = torch.where(
+                    can_track_mask,
+                    to_track_ith.to(torch.int64),
+                    torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                )
 
         attn_backend.update_mamba_state_after_mtp_verify(
             accepted_steps=accepted_steps,

@@ -2088,6 +2088,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_token=None,
                     positions=None,
                     draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    topk=(
+                        self.server_args.speculative_eagle_topk
+                        if is_tree_verify
+                        else 1
+                    ),
                     custom_mask=buffers.custom_mask if is_tree_verify else None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL
