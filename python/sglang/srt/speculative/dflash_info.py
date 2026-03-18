@@ -172,9 +172,9 @@ class DFlashVerifyInput(SpecInput):
 
     tree_parent_list: Optional[torch.Tensor] = None  # Full topk-tree parent list
     tree_selected_index: Optional[torch.Tensor] = None  # Selected indices inside full tree
-    tree_retrive_index: Optional[torch.Tensor] = None
-    tree_retrive_next_token: Optional[torch.Tensor] = None
-    tree_retrive_next_sibling: Optional[torch.Tensor] = None
+    retrive_index: Optional[torch.Tensor] = None
+    retrive_next_token: Optional[torch.Tensor] = None
+    retrive_next_sibling: Optional[torch.Tensor] = None
 
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
@@ -233,9 +233,9 @@ class DFlashVerifyInput(SpecInput):
             batch.input_ids = draft_tokens
             self.custom_mask = tree_mask
             self.positions = positions
-            self.tree_retrive_index = retrive_index
-            self.tree_retrive_next_token = retrive_next_token
-            self.tree_retrive_next_sibling = retrive_next_sibling
+            self.retrive_index = retrive_index
+            self.retrive_next_token = retrive_next_token
+            self.retrive_next_sibling = retrive_next_sibling
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -444,9 +444,9 @@ class DFlashVerifyInput(SpecInput):
             )
             if is_tree_verify:
                 if (
-                    self.tree_retrive_index is None
-                    or self.tree_retrive_next_token is None
-                    or self.tree_retrive_next_sibling is None
+                    self.retrive_index is None
+                    or self.retrive_next_token is None
+                    or self.retrive_next_sibling is None
                 ):
                     raise RuntimeError(
                         "DFLASH tree verify requires retrive_* buffers to be built by the tree kernel."
@@ -465,9 +465,9 @@ class DFlashVerifyInput(SpecInput):
                     accept_index=accept_index,
                     accept_token_num=accept_token_num,
                     candidates=candidates,
-                    retrive_index=self.tree_retrive_index,
-                    retrive_next_token=self.tree_retrive_next_token,
-                    retrive_next_sibling=self.tree_retrive_next_sibling,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
                     target_predict=target_predict,
                 )
                 accept_len = accept_token_num
