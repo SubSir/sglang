@@ -159,6 +159,7 @@ def build_prompts_from_turns(
     tokenizer,
     max_samples: int,
     prompt_style: str,
+    enable_thinking: bool,
 ) -> List[str]:
     """Convert dataset["turns"] into the final string prompt sent to /generate.
 
@@ -187,7 +188,7 @@ def build_prompts_from_turns(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,
+                enable_thinking=enable_thinking,
             )
             prompts.append(prompt)
 
@@ -528,6 +529,12 @@ def main() -> None:
         default=None,
         help="Maximum token bucket for piecewise CUDA graph capture.",
     )
+    parser.add_argument(
+        "--speculative-dflash-block-size",
+        type=int,
+        default=None,
+        help="Override speculative_dflash_block_size for DFLASH server.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -579,6 +586,7 @@ def main() -> None:
 
     # Pre-load all datasets and prompts
     dataset_prompts = {}
+    enable_thinking = "qwen3.5" in args.target_model.lower()
     for dname in data_names:
         print(f"Loading dataset: {dname}")
         ds = load_and_process_dataset(dname)
@@ -587,6 +595,7 @@ def main() -> None:
             tokenizer=tokenizer,
             max_samples=max_samples,
             prompt_style=args.prompt_style,
+            enable_thinking=enable_thinking,
         )
 
     # 通用脚本默认没有特殊 stop 标记；如果你有可以按数据集加逻辑
@@ -595,9 +604,11 @@ def main() -> None:
     # Results indexed by (backend, tp, data_name, concurrency)
     baseline_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_toks: dict[tuple[str, int, str, int], Optional[float]] = {}
+    dflash_latency: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_verify_tokens: dict[tuple[str, int, str, int], Optional[int]] = {}
     dflash_forward_ct: dict[tuple[str, int, str, int], Optional[int]] = {}
+    dflash_output_tokens: dict[tuple[str, int, str, int], Optional[int]] = {}
     baseline_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
     dflash_acc: dict[tuple[str, int, str, int], Optional[float]] = {}
 
@@ -710,6 +721,8 @@ def main() -> None:
                 "DFLASH",
                 "--speculative-draft-model-path",
                 args.draft_model,
+                "--speculative-dflash-block-size",
+                str(args.speculative_dflash_block_size),
             ]
             if args.speculative_num_draft_tokens is not None:
                 dflash_other_args.extend(
@@ -758,6 +771,9 @@ def main() -> None:
                         dflash_toks[(backend, tp, dname, conc)] = (
                             metrics.output_toks_per_s
                         )
+                        dflash_latency[(backend, tp, dname, conc)] = (
+                            metrics.latency_s
+                        )
                         dflash_accept_len[(backend, tp, dname, conc)] = (
                             metrics.spec_accept_length
                         )
@@ -766,6 +782,9 @@ def main() -> None:
                         )
                         dflash_forward_ct[(backend, tp, dname, conc)] = (
                             metrics.spec_verify_ct_sum
+                        )
+                        dflash_output_tokens[(backend, tp, dname, conc)] = (
+                            metrics.output_tokens
                         )
                         dflash_acc[(backend, tp, dname, conc)] = metrics.accuracy
                         token_info = (
@@ -869,6 +888,38 @@ def main() -> None:
                 )
             )
             md_lines.append("")
+            md_lines.append("### DFLASH latency (seconds)")
+            md_lines.append(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values={
+                        (tp, conc): dflash_latency.get(
+                            (backend, tp, dname, conc), None
+                        )
+                        for tp in tp_sizes
+                        for conc in concurrencies
+                    },
+                    float_fmt=".1f",
+                )
+            )
+            md_lines.append("")
+            md_lines.append("### DFLASH output tokens")
+            md_lines.append(
+                _format_table(
+                    tp_sizes=tp_sizes,
+                    concurrencies=concurrencies,
+                    values={
+                        (tp, conc): dflash_output_tokens.get(
+                            (backend, tp, dname, conc), None
+                        )
+                        for tp in tp_sizes
+                        for conc in concurrencies
+                    },
+                    float_fmt="d",
+                )
+            )
+            md_lines.append("")
             md_lines.append(
                 "### DFLASH acceptance length (mean per-request spec_accept_length)"
             )
@@ -896,6 +947,36 @@ def main() -> None:
                 concurrencies=concurrencies,
                 values=speedup_values,
                 float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+        md_lines.append("### DFLASH latency (seconds)")
+        md_lines.append(
+            _format_table(
+                tp_sizes=tp_sizes,
+                concurrencies=concurrencies,
+                values={
+                    (tp, conc): dflash_latency.get((backend, tp, dname, conc), None)
+                    for tp in tp_sizes
+                    for conc in concurrencies
+                },
+                float_fmt=".1f",
+            )
+        )
+        md_lines.append("")
+        md_lines.append("### DFLASH output tokens")
+        md_lines.append(
+            _format_table(
+                tp_sizes=tp_sizes,
+                concurrencies=concurrencies,
+                values={
+                    (tp, conc): dflash_output_tokens.get(
+                        (backend, tp, dname, conc), None
+                    )
+                    for tp in tp_sizes
+                    for conc in concurrencies
+                },
+                float_fmt="d",
             )
         )
         md_lines.append("")

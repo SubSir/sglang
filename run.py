@@ -7,7 +7,7 @@ from types import SimpleNamespace
 def run_bench(
     target_model: str,
     data_names: str,
-    draft_model: str = None,
+    draft_model: str | None = None,
     skip_baseline: bool = True,
     k_online: bool = False,
     k_online_offset: int = 2,
@@ -17,6 +17,7 @@ def run_bench(
     tree_verify_topk: int = 1,
     disable_cuda_graph: bool = False,
     speculative_num_draft_tokens: int | None = None,
+    speculative_dflash_block_size: int | None = None,
     results_dir: str = "test_results",
 ):
     """本地直接调用 bench_dflash_sweep.py"""
@@ -31,7 +32,12 @@ def run_bench(
         output_file += f"_draft_{draft_model.split('/')[-1]}"
     if k_online:
         output_file += f"_k_online_off{k_online_offset}_w{k_online_warmup}"
-    output_file += f"_{run_tag}_{block_verify_tag}_{tree_verify_tag}.md"
+    spec_tokens_tag = (
+        f"drafttok_{speculative_num_draft_tokens}"
+        if speculative_num_draft_tokens is not None
+        else "drafttok_none"
+    )
+    output_file += f"_{run_tag}_{block_verify_tag}_{tree_verify_tag}_{spec_tokens_tag}.md"
 
     output_path = os.path.abspath(os.path.join(results_dir, output_file))
     os.makedirs(results_dir, exist_ok=True)
@@ -57,7 +63,7 @@ def run_bench(
         env["PYTHONPATH"] = sglang_python_path
 
     # 构建 bench 参数
-    max_concurrency = 1
+    max_concurrency = 32
 
     bench_args = SimpleNamespace(
         data_name=None,
@@ -75,14 +81,15 @@ def run_bench(
         dtype="bfloat16",
         max_running_requests=max_concurrency,
         tp_sizes="1",
-        concurrencies="1",
+        concurrencies="1,8,32",
         samples_per_concurrency_base=128,
-        max_samples_per_config=1,
+        max_samples_per_config=2048,
         attention_backends="flashinfer",
         disable_cuda_graph=disable_cuda_graph,
         enable_piecewise_cuda_graph=False,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         speculative_eagle_topk=tree_verify_topk,
+        speculative_dflash_block_size=speculative_dflash_block_size,
     )
 
     print(
@@ -135,6 +142,13 @@ def run_bench(
                     str(bench_args.speculative_num_draft_tokens),
                 ]
             )
+        if bench_args.speculative_dflash_block_size is not None:
+            sys.argv.extend(
+                [
+                    "--speculative-dflash-block-size",
+                    str(bench_args.speculative_dflash_block_size),
+                ]
+            )
         if bench_args.speculative_eagle_topk is not None:
             sys.argv.extend(
                 [
@@ -165,7 +179,7 @@ def run_bench(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data-names", type=str, default="math500"
+        "--data-names", type=str, default="mt-bench"
     )
     # ,math500,humaneval,mt-bench
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
@@ -177,22 +191,33 @@ def main():
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--speculative-dflash-block-size",
+        type=int,
+        default=16,
+    )
     args = parser.parse_args()
 
     results_dir = f"{args.data_names.replace(',', '_')}"
 
-    # 跑多组对比：枚举 cuda graph 开关 + tree_verify 开关（k_online 一直关，block verify 一直开）
+    # 跑多组对比：枚举 (tree_verify, speculative_num_draft_tokens) 组合
     for disable_cuda_graph in [False]:
         run_dir = (
             "no_cuda_graph_" + results_dir
             if disable_cuda_graph
-            else "cuda_graph_" + results_dir
+            else "verify_double_cuda_graph_" + results_dir
         )
-        for tree_verify in [True]:
+        combos = [
+            # (True, None),
+            (False, None),
+            (True, 32),
+        ]
+        for tree_verify, speculative_num_draft_tokens in combos:
             print(f"\n" + "=" * 60)
             print(
                 "Starting benchmark: "
-                f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}"
+                f"tree_verify={tree_verify}, speculative_num_draft_tokens={speculative_num_draft_tokens}, "
+                f"disable_cuda_graph={disable_cuda_graph}"
             )
             print("=" * 60)
 
@@ -205,9 +230,10 @@ def main():
                 k_online_warmup=args.warmup,
                 block_verify=True,
                 tree_verify=tree_verify,
-                tree_verify_topk=2,
+                tree_verify_topk=4 if tree_verify else 1,
                 disable_cuda_graph=disable_cuda_graph,
-                speculative_num_draft_tokens=args.speculative_num_draft_tokens,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                speculative_dflash_block_size=args.speculative_dflash_block_size,
                 results_dir=run_dir,
             )
 

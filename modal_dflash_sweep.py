@@ -15,6 +15,7 @@ local_image = (
         "echo 60 > /tmp/build_time",
         "git clone -b dflash https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
+        "pip install nvidia-cudnn-cu12==9.16.0.29"
     )
 )
 
@@ -57,6 +58,7 @@ def run_dataset_sweep(
     tree_verify_topk: int = 1,
     tree_verify_num_draft_tokens: int = None,
     disable_cuda_graph: bool = False,
+    speculative_dflash_block_size: int = 10,
 ):
     """
     Run benchmark/dflash/bench_dflash_sweep.py for a specific dataset.
@@ -90,15 +92,17 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "1",
+        "--concurrencies", "1,8,32",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
-        "--attention-backends", "fa3",
+        "--attention-backends", "flashinfer",
         "--mem-fraction-static", "0.7",
         # "--enable-piecewise-cuda-graph",
         # "--piecewise-cuda-graph-max-tokens",
         # str(piecewise_cuda_graph_max_tokens)
+        "--disable-radix-cache",
         "--speculative-eagle-topk", str(tree_verify_topk),
+        "--speculative-dflash-block-size", str(speculative_dflash_block_size),
     ]
     if tree_verify_num_draft_tokens is not None:
         args.append("--speculative-num-draft-tokens")
@@ -172,11 +176,12 @@ def run_dataset_sweep(
 
 @app.local_entrypoint()
 def main(
-    data_names: str = "gsm8k,mt-bench",
-    target_model: str = "openai/gpt-oss-120b",
-    draft_model: str = "z-lab/gpt-oss-120b-DFlash",
+    data_names: str = "alpaca",
+    target_model: str = "Qwen/Qwen3.5-27B",
+    draft_model: str = "z-lab/Qwen3.5-27B-DFlash",
     offset: int = 2,
     warmup: int = 0,
+    speculative_dflash_block_size: int = 16,
 ):
     """\
     Local entrypoint for Modal.
@@ -233,6 +238,7 @@ def main(
                             tree_verify_topk=topk,
                             tree_verify_num_draft_tokens=tree_verify_num_draft_tokens,
                             disable_cuda_graph=disable_cuda_graph,
+                            speculative_dflash_block_size=speculative_dflash_block_size,
                         )
 
                         tasks.append((dataset, tree_verify, topk, target, draft))
