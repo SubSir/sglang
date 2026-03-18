@@ -15,7 +15,7 @@ local_image = (
         "echo 60 > /tmp/build_time",
         "git clone -b dflash https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
-        "pip install nvidia-cudnn-cu12==9.16.0.29"
+        "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
     )
 )
 
@@ -83,7 +83,7 @@ def run_dataset_sweep(
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 32
+    max_concurrency = 8
     # DFLASH b16 * max_concurrency(5) => 80
     # piecewise_cuda_graph_max_tokens = 10 * max_concurrency
 
@@ -92,11 +92,11 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "1,8,32",
+        "--concurrencies", "1,8",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
-        "--attention-backends", "flashinfer",
-        "--mem-fraction-static", "0.7",
+        "--attention-backends", "fa3",
+        "--mem-fraction-static", "0.9",
         # "--enable-piecewise-cuda-graph",
         # "--piecewise-cuda-graph-max-tokens",
         # str(piecewise_cuda_graph_max_tokens)
@@ -216,7 +216,7 @@ def main(
             calls = []
 
             for dataset in dataset_list:
-                for tree_verify, tree_verify_num_draft_tokens in [(True, None), (True, 20), (False, None)]:
+                for tree_verify, tree_verify_num_draft_tokens in [(True, None), (True, 32), (False, None)]:
                     print(
                         f"\n>>> Spawning benchmark [{dataset}] "
                         f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}: "
