@@ -9,10 +9,6 @@ def run_bench(
     data_names: str,
     draft_model: str | None = None,
     skip_baseline: bool = True,
-    k_online: bool = False,
-    k_online_offset: int = 2,
-    k_online_warmup: int = 100,
-    block_verify: bool = False,
     tree_verify: bool = False,
     tree_verify_topk: int = 1,
     disable_cuda_graph: bool = False,
@@ -24,20 +20,16 @@ def run_bench(
 
     # 构建输出文件名
     data_tag = data_names.replace(",", "-")
-    run_tag = "k_online" if k_online else "no_k_online"
-    block_verify_tag = "block_verify" if block_verify else "no_block_verify"
     tree_verify_tag = "tree_verify" if tree_verify else "no_tree_verify"
     output_file = f"results_{data_tag}_{target_model.split('/')[-1]}"
     if draft_model:
         output_file += f"_draft_{draft_model.split('/')[-1]}"
-    if k_online:
-        output_file += f"_k_online_off{k_online_offset}_w{k_online_warmup}"
     spec_tokens_tag = (
         f"drafttok_{speculative_num_draft_tokens}"
         if speculative_num_draft_tokens is not None
         else "drafttok_none"
     )
-    output_file += f"_{run_tag}_{block_verify_tag}_{tree_verify_tag}_{spec_tokens_tag}.md"
+    output_file += f"_{tree_verify_tag}_{spec_tokens_tag}.md"
 
     output_path = os.path.abspath(os.path.join(results_dir, output_file))
     os.makedirs(results_dir, exist_ok=True)
@@ -48,10 +40,6 @@ def run_bench(
     # Debug toggles (optional; configure in shell if needed)
     # e.g. SGLANG_DFLASH_DEBUG=1 CUDA_LAUNCH_BLOCKING=1 python local_finetune_test.py
 
-    env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
-    env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
-    env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
-    env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
 
     # 确保 PYTHONPATH 包含当前目录下的 python 文件夹
@@ -94,7 +82,7 @@ def run_bench(
 
     print(
         "\n[Local Run] "
-        f"k_online={k_online}, tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}"
+        f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}, speculative_num_draft_tokens={speculative_num_draft_tokens}"
     )
 
     # 直接调用 benchmark 脚本 main
@@ -179,13 +167,11 @@ def run_bench(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data-names", type=str, default="mt-bench"
+        "--data-names", type=str, default="gsm8k"
     )
     # ,math500,humaneval,mt-bench
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
-    parser.add_argument("--offset", type=int, default=2)
-    parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument(
         "--speculative-num-draft-tokens",
         type=int,
@@ -205,10 +191,10 @@ def main():
         run_dir = (
             "no_cuda_graph_" + results_dir
             if disable_cuda_graph
-            else "verify_double_cuda_graph_" + results_dir
+            else "cuda_graph_" + results_dir
         )
         combos = [
-            # (True, None),
+            (True, None),
             (False, None),
             (True, 32),
         ]
@@ -225,10 +211,6 @@ def main():
                 target_model=args.target_model,
                 data_names=args.data_names,
                 draft_model=args.draft_model,
-                k_online=False,
-                k_online_offset=args.offset,
-                k_online_warmup=args.warmup,
-                block_verify=True,
                 tree_verify=tree_verify,
                 tree_verify_topk=4 if tree_verify else 1,
                 disable_cuda_graph=disable_cuda_graph,
