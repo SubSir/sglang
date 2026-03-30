@@ -1,10 +1,11 @@
 import logging
 import math
+import os
+from collections import defaultdict
 from copy import deepcopy
 from typing import Optional, Union, cast, Tuple
 
 import torch
-import os
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -36,6 +37,30 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+class _CudaTimer:
+    def __init__(self, worker: "DFlashWorker", key: str):
+        self.worker = worker
+        self.key = key
+        self.enabled = worker._timing_enabled
+        self.start_evt = None
+        self.end_evt = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        self.start_evt = torch.cuda.Event(enable_timing=True)
+        self.end_evt = torch.cuda.Event(enable_timing=True)
+        self.start_evt.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.enabled or self.start_evt is None or self.end_evt is None:
+            return False
+        self.end_evt.record()
+        self.worker._pending_timing_events.append((self.key, self.start_evt, self.end_evt))
+        return False
 
 
 def _get_fused_kv_materialize_helper():
@@ -85,6 +110,17 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+
+        self._timing_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_TIMING", "0"))
+        )
+        self._timing_log_interval: int = max(
+            1, int(os.environ.get("SGLANG_DFLASH_TIMING_LOG_INTERVAL", "100"))
+        )
+        self._timing_step: int = 0
+        self._timing_stats_ms: dict[str, float] = defaultdict(float)
+        self._timing_counts: dict[str, int] = defaultdict(int)
+        self._pending_timing_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -363,6 +399,115 @@ class DFlashWorker:
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
         pass
+
+    def _cuda_timer(self, key: str) -> _CudaTimer:
+        return _CudaTimer(self, key)
+
+    def _drain_timing_events(self) -> None:
+        if not self._timing_enabled or not self._pending_timing_events:
+            return
+        torch.cuda.synchronize(self.device)
+        pending = self._pending_timing_events
+        self._pending_timing_events = []
+        for key, start_evt, end_evt in pending:
+            elapsed = float(start_evt.elapsed_time(end_evt))
+            self._timing_stats_ms[key] += elapsed
+            self._timing_counts[key] += 1
+
+    def _log_timing_summary_if_needed(self) -> None:
+        if not self._timing_enabled or self.tp_rank != 0:
+            return
+        if self._timing_step <= 0 or (self._timing_step % self._timing_log_interval) != 0:
+            return
+
+        draft_ms = float(self._timing_stats_ms.get("draft_model_forward", 0.0))
+        target_ms = float(self._timing_stats_ms.get("target_model_forward", 0.0))
+
+        append_ms = float(self._timing_stats_ms.get("append_target_hidden_total", 0.0))
+        verify_prepare_ms = float(self._timing_stats_ms.get("verify_prepare_total", 0.0))
+        tree_extra_ms = float(self._timing_stats_ms.get("tree_verify_extra_total", 0.0))
+        linear_extra_ms = float(self._timing_stats_ms.get("linear_verify_extra_total", 0.0))
+        linear_greedy_ms = float(self._timing_stats_ms.get("linear_verify_greedy_sample", 0.0))
+        verify_prepare_only_ms = max(0.0, verify_prepare_ms - tree_extra_ms - linear_extra_ms)
+        verify_fn_ms = float(self._timing_stats_ms.get("target_verify_verify_fn", 0.0))
+        verify_post_ms = float(self._timing_stats_ms.get("verify_accept_post_total", 0.0))
+
+        other_ms = (
+            append_ms
+            + verify_prepare_only_ms
+            + tree_extra_ms
+            + linear_extra_ms
+            + linear_greedy_ms
+            + verify_fn_ms
+            + verify_post_ms
+        )
+
+        total_ms = draft_ms + target_ms + other_ms
+        denom = draft_ms if draft_ms > 1e-6 else 1e-6
+
+        def _ratio(v: float) -> float:
+            return 100.0 * (v / denom)
+
+        logger.info(
+            "DFLASH timing summary [steps=%d]: total=%.3f ms | draft=%.3f ms (100%%) | "
+            "target=%.3f ms (%.2f%% of draft) | other_nonoverlap=%.3f ms (%.2f%% of draft)",
+            self._timing_step,
+            total_ms,
+            draft_ms,
+            target_ms,
+            _ratio(target_ms),
+            other_ms,
+            _ratio(other_ms),
+        )
+        logger.info(
+            "DFLASH timing other_nonoverlap components: append=%.3f ms | verify_prepare_only=%.3f ms | "
+            "tree_extra=%.3f ms | linear_extra=%.3f ms | linear_greedy=%.3f ms | verify_fn=%.3f ms | verify_post=%.3f ms",
+            append_ms,
+            verify_prepare_only_ms,
+            tree_extra_ms,
+            linear_extra_ms,
+            linear_greedy_ms,
+            verify_fn_ms,
+            verify_post_ms,
+        )
+
+        detail_keys = [
+            "append_target_hidden_total",
+            "append_target_hidden_project",
+            "append_target_hidden_kv_write",
+            "draft_model_forward",
+            "verify_prepare_total",
+            "verify_prepare_only",
+            "tree_verify_extra_total",
+            "tree_verify_greedy_topk",
+            "tree_verify_build_tokens",
+            "tree_verify_build_tokens_expand",
+            "tree_verify_build_tokens_select_loop",
+            "tree_verify_build_tokens_pack_scores",
+            "tree_verify_build_tokens_topk_sort",
+            "tree_verify_build_tokens_gather_tokens",
+            "tree_verify_build_tokens_parent_list",
+            "linear_verify_extra_total",
+            "linear_verify_greedy_sample",
+            "target_model_forward",
+            "target_verify_verify_fn",
+            "verify_accept_post_total",
+        ]
+        detail = []
+        for key in detail_keys:
+            if key == "verify_prepare_only":
+                ms = verify_prepare_only_ms
+                count = int(self._timing_counts.get("verify_prepare_total", 0))
+            else:
+                ms = float(self._timing_stats_ms.get(key, 0.0))
+                count = int(self._timing_counts.get(key, 0))
+            if ms <= 0.0:
+                continue
+            avg = ms / max(count, 1)
+            detail.append(f"{key}={ms:.3f}ms(avg={avg:.3f},n={count},ratio={_ratio(ms):.2f}%draft)")
+
+        if detail:
+            logger.info("DFLASH timing detail: %s", " | ".join(detail))
 
     def _gather_req_to_token_masked(
         self,
@@ -671,87 +816,95 @@ class DFlashWorker:
             )
 
             with torch.inference_mode():
-                draft_hidden = self.draft_model_runner.forward(
-                    forward_batch
-                ).logits_output
+                with self._cuda_timer("draft_model_forward"):
+                    draft_hidden = self.draft_model_runner.forward(
+                        forward_batch
+                    ).logits_output
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
         if not self._tree_verify_enabled:
-            draft_result = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-            )
+            with self._cuda_timer("linear_verify_greedy_sample"):
+                draft_result = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                    lm_head=lm_head,
+                )
             draft_next = cast(torch.Tensor, draft_result).view(bs, self.block_size - 1)
         
         positions = positions_2d.reshape(-1)
 
-        _, build_custom_mask = resolve_dflash_verify_mask_policy(
-            self.model_runner.attn_backend
-        )
-        if self._tree_verify_enabled:
-            build_custom_mask = True
+        with self._cuda_timer("verify_prepare_total"):
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            if self._tree_verify_enabled:
+                build_custom_mask = True
 
-        if self._tree_verify_enabled:
-            # ===== EAGLE-style tree verify =====
-            tree_topk = int(self._tree_verify_topk)
-            tree_num_draft_tokens = int(self._tree_num_draft_tokens)
-            num_steps = int(draft_hidden.shape[1]) - 1
+            if self._tree_verify_enabled:
+                with self._cuda_timer("tree_verify_extra_total"):
+                    # ===== EAGLE-style tree verify =====
+                    tree_topk = int(self._tree_verify_topk)
+                    tree_num_draft_tokens = int(self._tree_num_draft_tokens)
+                    num_steps = int(draft_hidden.shape[1]) - 1
 
-            topk_result = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-                return_topk=tree_topk,
-            )
-            _, draft_topk_ids, draft_topk_probs = cast(
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
-            )
-            draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
-            draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
+                    with self._cuda_timer("tree_verify_greedy_topk"):
+                        topk_result = self._greedy_sample_from_vocab_parallel_head(
+                            hidden_states=draft_hidden[:, 1:, :].reshape(
+                                -1, draft_hidden.shape[-1]
+                            ),
+                            lm_head=lm_head,
+                            return_topk=tree_topk,
+                        )
+                    _, draft_topk_ids, draft_topk_probs = cast(
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
+                    )
+                    draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
+                    draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
 
-            (
-                tree_draft_tokens,
-                tree_parent_list,
-                tree_selected_index,
-            ) = build_tree_verify_tokens(
-                verified_id=block_ids[:, 0],  # [bs]
-                topk_probs=draft_topk_probs,
-                topk_ids=draft_topk_ids,
-                topk=tree_topk,
-                num_draft_tokens=tree_num_draft_tokens,
-            )
-            # For tree verify, we use TARGET_VERIFY mode with tree structure
-            # The attention backend will build the tree mask based on parent_list
-            verify_input = DFlashVerifyInput(
-                draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
-                positions=None,
-                draft_token_num=tree_num_draft_tokens,
-                # Tree metadata for eagle-style verify
-                tree_parent_list=tree_parent_list,
-                tree_selected_index=tree_selected_index,
-                topk=tree_topk,
-            )
+                    with self._cuda_timer("tree_verify_build_tokens"):
+                        (
+                            tree_draft_tokens,
+                            tree_parent_list,
+                            tree_selected_index,
+                        ) = build_tree_verify_tokens(
+                            verified_id=block_ids[:, 0],  # [bs]
+                            topk_probs=draft_topk_probs,
+                            topk_ids=draft_topk_ids,
+                            topk=tree_topk,
+                            num_draft_tokens=tree_num_draft_tokens,
+                            timing_ctx_factory=self._cuda_timer,
+                        )
+                    # For tree verify, we use TARGET_VERIFY mode with tree structure
+                    # The attention backend will build the tree mask based on parent_list
+                    verify_input = DFlashVerifyInput(
+                        draft_token=tree_draft_tokens,  # Flattened [bs * num_draft_tokens]
+                        positions=None,
+                        draft_token_num=tree_num_draft_tokens,
+                        # Tree metadata for eagle-style verify
+                        tree_parent_list=tree_parent_list,
+                        tree_selected_index=tree_selected_index,
+                        topk=tree_topk,
+                    )
 
-        else:
-            draft_tokens = self._draft_block_tokens_buf[:bs]
-            draft_tokens[:, 0].copy_(block_ids[:, 0])
-            draft_tokens[:, 1:].copy_(draft_next)
-            # ===== Original linear block verify =====
-            verify_input = DFlashVerifyInput(
-                draft_token=draft_tokens.reshape(-1),
-                positions=positions,
-                draft_token_num=self.block_size,
+            else:
+                with self._cuda_timer("linear_verify_extra_total"):
+                    draft_tokens = self._draft_block_tokens_buf[:bs]
+                    draft_tokens[:, 0].copy_(block_ids[:, 0])
+                    draft_tokens[:, 1:].copy_(draft_next)
+                    # ===== Original linear block verify =====
+                    verify_input = DFlashVerifyInput(
+                        draft_token=draft_tokens.reshape(-1),
+                        positions=positions,
+                        draft_token_num=self.block_size,
+                    )
+
+            verify_input.prepare_for_verify(
+                batch,
+                self.page_size,
+                build_custom_mask=build_custom_mask,
             )
-            
-        verify_input.prepare_for_verify(
-            batch,
-            self.page_size,
-            build_custom_mask=build_custom_mask,
-        )
 
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -1035,137 +1188,140 @@ class DFlashWorker:
         another request could reuse target KV indices without having draft KV values.
         """
 
-        bs = batch.batch_size()
-        device = self.model_runner.device
+        with self._cuda_timer("append_target_hidden_total"):
+            bs = batch.batch_size()
+            device = self.model_runner.device
 
-        if draft_input.target_hidden is None:
-            raise RuntimeError(
-                "DFLASH draft state missing target_hidden context features."
-            )
-        if draft_input.ctx_lens.numel() != bs:
-            raise RuntimeError(
-                f"DFLASH ctx_lens length mismatch: got {draft_input.ctx_lens.numel()} for bs={bs}."
-            )
-        if draft_input.draft_seq_lens.numel() != bs:
-            raise RuntimeError(
-                f"DFLASH draft_seq_lens length mismatch: got {draft_input.draft_seq_lens.numel()} for bs={bs}."
-            )
-
-        total_ctx = int(draft_input.target_hidden.shape[0])
-        if total_ctx <= 0:
-            draft_input.ctx_lens = torch.zeros_like(draft_input.ctx_lens)
-            draft_input.target_hidden = draft_input.target_hidden[:0]
-            return
-
-        target_req_to_token = batch.req_to_token_pool.req_to_token
-        draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
-
-        req_pool_indices = batch.req_pool_indices
-        if req_pool_indices.dtype != torch.int64:
-            req_pool_indices = req_pool_indices.to(torch.int64)
-
-        ctx_lens = draft_input.ctx_lens
-        if ctx_lens.dtype != torch.int32:
-            ctx_lens = ctx_lens.to(torch.int32)
-        if ctx_lens.device != device:
-            ctx_lens = ctx_lens.to(device, non_blocking=True)
-        ctx_start = batch.seq_lens.to(torch.int64) - ctx_lens.to(torch.int64)
-
-        if bs == 1:
-            # Fast path for single request.
-            max_ctx = int(total_ctx)
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
-            else:
-                r = torch.arange(max_ctx, device=device, dtype=torch.int64)
-            pos2d = ctx_start[:, None] + r[None, :]  # [1, ctx]
-            cache2d = target_req_to_token[req_pool_indices[:, None], pos2d]  # [1, ctx]
-            ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)  # [ctx]
-            ctx_positions = pos2d.reshape(-1)  # [ctx]
-        else:
-            # In decode mode, ctx_lens <= block_size so we can skip the .item() sync.
-            if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-                max_ctx = int(ctx_lens.max().item())
-            else:
-                max_ctx = (
-                    int(self.block_size)
-                    if not self._tree_verify_enabled
-                    else int(self._tree_num_draft_tokens)
-                )
-            if max_ctx <= 0:
-                raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
-
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
-            else:
-                r = torch.arange(max_ctx, device=device, dtype=torch.int64)
-            r = r[None, :]  # [1, max_ctx]
-            pos2d = ctx_start[:, None] + r  # [bs, max_ctx]
-            mask = r < ctx_lens[:, None]
-
-            # Batched gather of cache locations and positions.
-            ctx_cache_loc = self._gather_req_to_token_masked(
-                req_to_token=target_req_to_token,
-                req_pool_indices=req_pool_indices,
-                pos2d=pos2d,
-                mask=mask,
-                context="DFLASH target hidden KV append",
-            )  # [sum(ctx_lens)]
-            ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
-
-        with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(
-                draft_input.target_hidden
-            )  # [sum(ctx), hidden]
-            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+            if draft_input.target_hidden is None:
                 raise RuntimeError(
-                    f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                    "DFLASH draft state missing target_hidden context features."
+                )
+            if draft_input.ctx_lens.numel() != bs:
+                raise RuntimeError(
+                    f"DFLASH ctx_lens length mismatch: got {draft_input.ctx_lens.numel()} for bs={bs}."
+                )
+            if draft_input.draft_seq_lens.numel() != bs:
+                raise RuntimeError(
+                    f"DFLASH draft_seq_lens length mismatch: got {draft_input.draft_seq_lens.numel()} for bs={bs}."
                 )
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
-                try:
-                    self._append_target_hidden_fused(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "DFLASH fused KV append failed; falling back to sequential path: %s",
-                        e,
-                    )
-                    self._use_fused_kv_materialize = False
-                    self._fused_kv_helper = None
-                    self._append_target_hidden_sequential(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
-                    )
+            total_ctx = int(draft_input.target_hidden.shape[0])
+            if total_ctx <= 0:
+                draft_input.ctx_lens = torch.zeros_like(draft_input.ctx_lens)
+                draft_input.target_hidden = draft_input.target_hidden[:0]
+                return
+
+            target_req_to_token = batch.req_to_token_pool.req_to_token
+            draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+
+            req_pool_indices = batch.req_pool_indices
+            if req_pool_indices.dtype != torch.int64:
+                req_pool_indices = req_pool_indices.to(torch.int64)
+
+            ctx_lens = draft_input.ctx_lens
+            if ctx_lens.dtype != torch.int32:
+                ctx_lens = ctx_lens.to(torch.int32)
+            if ctx_lens.device != device:
+                ctx_lens = ctx_lens.to(device, non_blocking=True)
+            ctx_start = batch.seq_lens.to(torch.int64) - ctx_lens.to(torch.int64)
+
+            if bs == 1:
+                # Fast path for single request.
+                max_ctx = int(total_ctx)
+                if max_ctx <= self._block_pos_offsets.numel():
+                    r = self._block_pos_offsets[:max_ctx]
+                else:
+                    r = torch.arange(max_ctx, device=device, dtype=torch.int64)
+                pos2d = ctx_start[:, None] + r[None, :]  # [1, ctx]
+                cache2d = target_req_to_token[req_pool_indices[:, None], pos2d]  # [1, ctx]
+                ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)  # [ctx]
+                ctx_positions = pos2d.reshape(-1)  # [ctx]
             else:
-                self._append_target_hidden_sequential(
-                    ctx_hidden, ctx_positions, ctx_cache_loc
-                )
+                # In decode mode, ctx_lens <= block_size so we can skip the .item() sync.
+                if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+                    max_ctx = int(ctx_lens.max().item())
+                else:
+                    max_ctx = (
+                        int(self.block_size)
+                        if not self._tree_verify_enabled
+                        else int(self._tree_num_draft_tokens)
+                    )
+                if max_ctx <= 0:
+                    raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 
-        if self.use_compact_draft_cache:
-            new_draft_seq_lens = self._compute_compact_draft_seq_lens(batch.seq_lens)
-            suffix_start = batch.seq_lens.to(torch.int64) - new_draft_seq_lens.to(
-                torch.int64
-            )
-            suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=target_req_to_token,
-                req_pool_indices=req_pool_indices,
-                start=suffix_start,
-                lengths=new_draft_seq_lens,
-            )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                draft_req_to_token,
-                torch.zeros_like(new_draft_seq_lens),
-                new_draft_seq_lens,
-                suffix_cache_loc,
-                bs,
-            )
-            draft_input.draft_seq_lens = new_draft_seq_lens
-        else:
-            draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-        draft_input.ctx_lens = torch.zeros_like(ctx_lens)
-        draft_input.target_hidden = draft_input.target_hidden[:0]
+                if max_ctx <= self._block_pos_offsets.numel():
+                    r = self._block_pos_offsets[:max_ctx]
+                else:
+                    r = torch.arange(max_ctx, device=device, dtype=torch.int64)
+                r = r[None, :]  # [1, max_ctx]
+                pos2d = ctx_start[:, None] + r  # [bs, max_ctx]
+                mask = r < ctx_lens[:, None]
+
+                # Batched gather of cache locations and positions.
+                ctx_cache_loc = self._gather_req_to_token_masked(
+                    req_to_token=target_req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    pos2d=pos2d,
+                    mask=mask,
+                    context="DFLASH target hidden KV append",
+                )  # [sum(ctx_lens)]
+                ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
+
+            with torch.inference_mode():
+                with self._cuda_timer("append_target_hidden_project"):
+                    ctx_hidden = self.draft_model.project_target_hidden(
+                        draft_input.target_hidden
+                    )  # [sum(ctx), hidden]
+                if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                    raise RuntimeError(
+                        f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                    )
+
+                with self._cuda_timer("append_target_hidden_kv_write"):
+                    if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                        try:
+                            self._append_target_hidden_fused(
+                                ctx_hidden, ctx_positions, ctx_cache_loc
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "DFLASH fused KV append failed; falling back to sequential path: %s",
+                                e,
+                            )
+                            self._use_fused_kv_materialize = False
+                            self._fused_kv_helper = None
+                            self._append_target_hidden_sequential(
+                                ctx_hidden, ctx_positions, ctx_cache_loc
+                            )
+                    else:
+                        self._append_target_hidden_sequential(
+                            ctx_hidden, ctx_positions, ctx_cache_loc
+                        )
+
+            if self.use_compact_draft_cache:
+                new_draft_seq_lens = self._compute_compact_draft_seq_lens(batch.seq_lens)
+                suffix_start = batch.seq_lens.to(torch.int64) - new_draft_seq_lens.to(
+                    torch.int64
+                )
+                suffix_cache_loc = self._gather_req_to_token_segments(
+                    req_to_token=target_req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    start=suffix_start,
+                    lengths=new_draft_seq_lens,
+                )
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    draft_req_to_token,
+                    torch.zeros_like(new_draft_seq_lens),
+                    new_draft_seq_lens,
+                    suffix_cache_loc,
+                    bs,
+                )
+                draft_input.draft_seq_lens = new_draft_seq_lens
+            else:
+                draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            draft_input.ctx_lens = torch.zeros_like(ctx_lens)
+            draft_input.target_hidden = draft_input.target_hidden[:0]
 
     def _append_target_hidden_sequential(
         self,
@@ -1359,6 +1515,9 @@ class DFlashWorker:
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
 
+            self._drain_timing_events()
+            self._log_timing_summary_if_needed()
+
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -1388,42 +1547,49 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
-        )
+        with self._cuda_timer("target_model_forward"):
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True, **kwargs
+            )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
 
-        (
-            new_verified_id,
-            commit_lens,
-            next_target_hidden,
-            accept_length_per_req_cpu,
-        ) = verify_input.verify(
-            batch=batch,
-            logits_output=logits_output,
-            page_size=self.page_size,
-        )
-        if need_mamba_verify_commit:
-            assert seq_lens_pre_verify is not None
-            self._update_target_mamba_state_after_verify(
+        with self._cuda_timer("target_verify_verify_fn"):
+            (
+                new_verified_id,
+                commit_lens,
+                next_target_hidden,
+                accept_length_per_req_cpu,
+            ) = verify_input.verify(
                 batch=batch,
-                seq_lens_pre_verify=seq_lens_pre_verify,
-                commit_lens=commit_lens,
+                logits_output=logits_output,
+                page_size=self.page_size,
             )
+        with self._cuda_timer("verify_accept_post_total"):
+            if need_mamba_verify_commit:
+                assert seq_lens_pre_verify is not None
+                self._update_target_mamba_state_after_verify(
+                    batch=batch,
+                    seq_lens_pre_verify=seq_lens_pre_verify,
+                    commit_lens=commit_lens,
+                )
 
-        # Update draft state for the next iteration. Also materialize the committed verify tokens
-        # into the draft KV cache immediately so radix cache entries are safe to reuse.
-        draft_input.verified_id = new_verified_id
-        draft_input.target_hidden = next_target_hidden
-        draft_input.ctx_lens = commit_lens
-        self._append_target_hidden_to_draft_kv(batch, draft_input)
+            # Update draft state for the next iteration. Also materialize the committed verify tokens
+            # into the draft KV cache immediately so radix cache entries are safe to reuse.
+            draft_input.verified_id = new_verified_id
+            draft_input.target_hidden = next_target_hidden
+            draft_input.ctx_lens = commit_lens
+            self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
+        self._timing_step += 1
+        self._drain_timing_events()
+        self._log_timing_summary_if_needed()
+
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
                 "DFLASH verify completed. accept_length_per_req=%s",

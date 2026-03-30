@@ -1166,7 +1166,7 @@ class CudaGraphRunner:
             is_tree_verify = (
                 os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1"
             )
-            if is_tree_verify:
+            if not self.model_runner.is_draft_worker and is_tree_verify:
                 build_custom_mask = True
             spec_info = DFlashVerifyInput(
                 draft_token=None,
@@ -1174,12 +1174,12 @@ class CudaGraphRunner:
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                 topk=(
                     self.model_runner.server_args.speculative_eagle_topk
-                    if is_tree_verify
+                    if build_custom_mask
                     else 1
                 ),
                 custom_mask=(
                     None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    if not build_custom_mask
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(

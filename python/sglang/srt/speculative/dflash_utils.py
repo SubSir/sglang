@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, ContextManager, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -682,6 +683,7 @@ def build_tree_verify_tokens(
     topk_ids: torch.Tensor,
     topk: int,
     num_draft_tokens: int,
+    timing_ctx_factory: Optional[Callable[[str], ContextManager[Any]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build tree verify tokens for DFlash eagle-style tree verify (TARGET_VERIFY mode).
 
@@ -726,35 +728,59 @@ def build_tree_verify_tokens(
     #     selected_index = selected_index.repeat(bs, 1)
     #     return draft_tokens, parent_list, selected_index
 
-    score_list: list[torch.Tensor] = []
-    token_list: list[torch.Tensor] = []
-    parents_list: list[torch.Tensor] = []
+    timer = timing_ctx_factory or (lambda _key: nullcontext())
+    use_fused_triton = topk == 4 and is_cuda() and topk_probs.is_cuda
 
-    scores = None
-    expanded_topk_probs = topk_probs[:, 1:].repeat_interleave(topk, dim=0)
-    expanded_topk_ids = topk_ids[:, 1:].repeat_interleave(topk, dim=0)
-
-    for i in range(num_steps):
-        if i == 0:
-            step_topk_p = topk_probs[:, 0]
-            step_topk_ids = topk_ids[:, 0]
-        else:
-            step_topk_p = expanded_topk_probs[:, i - 1]
-            step_topk_ids = expanded_topk_ids[:, i - 1]
-
-        scores, tree_info = _select_top_k_tokens_no_hidden(
-            i,
-            step_topk_p,
-            step_topk_ids,
-            scores,
-            topk,
+    if use_fused_triton:
+        from sglang.srt.speculative.triton_ops.dflash_tree_expand_topk import (
+            dflash_tree_verify_select_topk4_fused,
         )
 
-        score_list.append(tree_info[0])
-        token_list.append(tree_info[1])
-        parents_list.append(tree_info[2])
+        with timer("tree_verify_build_tokens_expand"):
+            pass
+        with timer("tree_verify_build_tokens_select_loop"):
+            score_list_cat, ss_token_list, parent_list = (
+                dflash_tree_verify_select_topk4_fused(topk_probs, topk_ids)
+            )
+    else:
+        score_list: list[torch.Tensor] = []
+        token_list: list[torch.Tensor] = []
+        parents_list: list[torch.Tensor] = []
+        scores = None
 
-    score_list_cat = torch.cat(score_list, dim=1).flatten(1)
+        with timer("tree_verify_build_tokens_expand"):
+            expanded_topk_probs = topk_probs[:, 1:].repeat_interleave(topk, dim=0)
+            expanded_topk_ids = topk_ids[:, 1:].repeat_interleave(topk, dim=0)
+
+        with timer("tree_verify_build_tokens_select_loop"):
+            for i in range(num_steps):
+                if i == 0:
+                    step_topk_p = topk_probs[:, 0]
+                    step_topk_ids = topk_ids[:, 0]
+                else:
+                    step_topk_p = expanded_topk_probs[:, i - 1]
+                    step_topk_ids = expanded_topk_ids[:, i - 1]
+
+                scores, tree_info = _select_top_k_tokens_no_hidden(
+                    i,
+                    step_topk_p,
+                    step_topk_ids,
+                    scores,
+                    topk,
+                )
+
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
+
+        with timer("tree_verify_build_tokens_pack_scores"):
+            score_list_cat = torch.cat(score_list, dim=1).flatten(1)
+        ss_token_list = torch.cat(token_list, dim=1)
+        with timer("tree_verify_build_tokens_parent_list"):
+            if len(parents_list) > 1:
+                parent_list = torch.cat(parents_list[:-1], dim=1)
+            else:
+                parent_list = torch.empty((bs, 0), dtype=torch.long, device=device)
     max_candidates = score_list_cat.shape[1]
     if num_draft_tokens - 1 > max_candidates:
         raise ValueError(
@@ -762,15 +788,15 @@ def build_tree_verify_tokens(
             f"requested={num_draft_tokens - 1}, available={max_candidates}."
         )
 
-    top_scores = fast_topk(score_list_cat, num_draft_tokens - 1, dim=-1)
-    top_scores_index = torch.sort(top_scores.indices).values
-    ss_token_list = torch.cat(token_list, dim=1)
-    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-    draft_tokens = torch.cat([verified_id[:, None], draft_tokens], dim=1).flatten()
+    with timer("tree_verify_build_tokens_topk_sort"):
+        top_scores = fast_topk(score_list_cat, num_draft_tokens - 1, dim=-1)
+        top_scores_index = torch.sort(top_scores.indices).values
 
-    if len(parents_list) > 1:
-        parent_list = torch.cat(parents_list[:-1], dim=1)
-    else:
-        parent_list = torch.empty((bs, 0), dtype=torch.long, device=device)
+    with timer("tree_verify_build_tokens_gather_tokens"):
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+        draft_tokens = torch.cat([verified_id[:, None], draft_tokens], dim=1).flatten()
 
+    if use_fused_triton:
+        with timer("tree_verify_build_tokens_parent_list"):
+            pass
     return draft_tokens, parent_list, top_scores_index

@@ -187,10 +187,6 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
-        if os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1":
-            self.custom_mask = torch.empty(
-            (1,), dtype=torch.bool, device="cuda"
-        )
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 

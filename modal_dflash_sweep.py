@@ -13,7 +13,7 @@ local_image = (
     base_image
     .run_commands(
         "echo 60 > /tmp/build_time",
-        "git clone -b dflash https://github.com/SubSir/sglang.git /root/sglang_local",
+        "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
         "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
     )
@@ -92,7 +92,7 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "1,8",
+        "--concurrencies", "8",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         "--attention-backends", "fa3",
@@ -100,6 +100,7 @@ def run_dataset_sweep(
         # "--enable-piecewise-cuda-graph",
         # "--piecewise-cuda-graph-max-tokens",
         # str(piecewise_cuda_graph_max_tokens)
+        "--samples-per-concurrency-base", "256",
         "--disable-radix-cache",
         "--speculative-eagle-topk", str(tree_verify_topk),
         "--speculative-dflash-block-size", str(speculative_dflash_block_size),
@@ -129,6 +130,8 @@ def run_dataset_sweep(
     env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
+    env["SGLANG_DFLASH_TIMING"] = "1"
+    env["SGLANG_DFLASH_TIMING_LOG_INTERVAL"] = "100"
     # env["CUDA_LAUNCH_BLOCKING"] = "1"
     # env["SGLANG_FA_SPEC_DEBUG"] = "1"
     # env["SGLANG_ATTN_BACKEND_DEBUG"] = "1"
@@ -176,7 +179,7 @@ def run_dataset_sweep(
 
 @app.local_entrypoint()
 def main(
-    data_names: str = "alpaca",
+    data_names: str = "gsm8k",
     target_model: str = "Qwen/Qwen3.5-27B",
     draft_model: str = "z-lab/Qwen3.5-27B-DFlash",
     offset: int = 2,
@@ -216,7 +219,7 @@ def main(
             calls = []
 
             for dataset in dataset_list:
-                for tree_verify, tree_verify_num_draft_tokens in [(True, None), (True, 32), (False, None)]:
+                for tree_verify, tree_verify_num_draft_tokens in [(True, None), (False, None)]:
                     print(
                         f"\n>>> Spawning benchmark [{dataset}] "
                         f"tree_verify={tree_verify}, disable_cuda_graph={disable_cuda_graph}: "
