@@ -2713,12 +2713,6 @@ class ServerArgs:
 
             if self.speculative_eagle_topk is None:
                 self.speculative_eagle_topk = 1
-            elif int(self.speculative_eagle_topk) != 1:
-                logger.warning(
-                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
-                    self.speculative_eagle_topk,
-                )
-                self.speculative_eagle_topk = 1
 
             if self.speculative_dflash_block_size is not None:
                 if int(self.speculative_dflash_block_size) <= 0:
@@ -2726,18 +2720,6 @@ class ServerArgs:
                         "DFLASH requires --speculative-dflash-block-size to be positive, "
                         f"got {self.speculative_dflash_block_size}."
                     )
-                if self.speculative_num_draft_tokens is not None and int(
-                    self.speculative_num_draft_tokens
-                ) != int(self.speculative_dflash_block_size):
-                    raise ValueError(
-                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                        "but they differ. For DFLASH they must match. "
-                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
-                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
-                    )
-                self.speculative_num_draft_tokens = int(
-                    self.speculative_dflash_block_size
-                )
 
             window_size = None
             if self.speculative_dflash_draft_window_size is not None:

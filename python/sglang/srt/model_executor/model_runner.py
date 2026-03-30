@@ -2079,11 +2079,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
                 # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+                is_tree_verify = (
+                    os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1"
+                )
                 spec_info = DFlashVerifyInput(
                     draft_token=None,
                     positions=None,
                     draft_token_num=self.server_args.speculative_num_draft_tokens,
-                    custom_mask=None,
+                    topk=(
+                        self.server_args.speculative_eagle_topk
+                        if is_tree_verify
+                        else 1
+                    ),
+                    custom_mask=buffers.custom_mask if is_tree_verify else None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL
                         if self.is_draft_worker
