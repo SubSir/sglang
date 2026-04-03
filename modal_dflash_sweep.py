@@ -77,7 +77,7 @@ def run_dataset_sweep(
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 64
+    max_concurrency = 32
     # DFLASH b16 * max_concurrency(5) => 80
     piecewise_cuda_graph_max_tokens = 16 * max_concurrency
 
@@ -86,7 +86,7 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "64",
+        "--concurrencies", "32",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         # "--samples-per-concurrency-base", "8",

@@ -404,7 +404,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         mul_base *= get_attention_cp_size()
 
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
-    capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
+    capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))

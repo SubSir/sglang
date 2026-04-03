@@ -619,7 +619,7 @@ def main() -> None:
                     ]
                 )
                 if args.enable_piecewise_cuda_graph:
-                    common_server_args.append("--enable-piecewise-cuda-graph")
+                    common_server_args.append("--enforce-piecewise-cuda-graph")
                     if args.piecewise_cuda_graph_max_tokens is not None:
                         common_server_args.extend(
                             [

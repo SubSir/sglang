@@ -749,7 +749,9 @@ class DFlashWorker:
                 positions=positions,
                 draft_token_num=self.block_size,
             )
-            _, build_custom_mask = self._resolve_verify_mask_policy()
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.target_worker.model_runner.attn_backend
+            )
             verify_input.prepare_for_verify(
                 batch,
                 self.page_size,
