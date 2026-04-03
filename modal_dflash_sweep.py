@@ -12,27 +12,39 @@ base_image = (
 local_image = (
     base_image
     .run_commands(
-        "echo 21 > /tmp/build_time",
-        "git clone -b fa2_correct https://github.com/SubSir/sglang.git /root/sglang_local",
+        "echo 60 > /tmp/build_time",
+        "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
+        "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
     )
 )
 
 local_image = (
     local_image
     .add_local_dir(
-        "./benchmark/dflash",
-        remote_path="/root/sglang_local/benchmark/dflash"
+        "./python",
+        remote_path="/root/sglang_local/python_local",
+        copy=True,
+    )
+    .add_local_dir(
+        "./benchmark",
+        remote_path="/root/sglang_local/benchmark_local",
+        copy=True,
+    )
+    .run_commands(
+        "rm -rf /root/sglang_local/python && cp -r /root/sglang_local/python_local /root/sglang_local/python",
+        "rm -rf /root/sglang_local/benchmark && cp -r /root/sglang_local/benchmark_local /root/sglang_local/benchmark"
     )
 )
 
 @app.function(
-    gpu="H200",
+    gpu="RTX-PRO-6000",
     timeout=7200,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     cloud="aws"
 )
+
 def run_dataset_sweep(
     target_model: str,
     data_name: str,
@@ -40,7 +52,6 @@ def run_dataset_sweep(
     skip_baseline: bool = True,
     k_online: bool = False,
     k_online_offset: int = 2,
-    k_online_warmup: int = 100,
     block_verify: bool = False,
     disable_cuda_graph: bool = False,
 ):
@@ -59,23 +70,23 @@ def run_dataset_sweep(
     if draft_model:
         output_file += f"_draft_{draft_model.split('/')[-1]}"
     if k_online:
-        output_file += f"_k_online_off{k_online_offset}_w{k_online_warmup}"
+        output_file += f"_k_online_off{k_online_offset}"
     output_file += f"_{run_tag}_{block_verify_tag}.md"
     
     output_path = f"/root/sglang_local/{output_file}"
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 128
+    max_concurrency = 64
     # DFLASH b16 * max_concurrency(5) => 80
-    piecewise_cuda_graph_max_tokens = 8 * max_concurrency
+    piecewise_cuda_graph_max_tokens = 16 * max_concurrency
 
     args = [
         "bench_dflash_sweep.py",
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "32,64,128",
+        "--concurrencies", "64",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         # "--samples-per-concurrency-base", "8",
@@ -101,7 +112,6 @@ def run_dataset_sweep(
     env = os.environ.copy()
     env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
     env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
-    env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
     
     sglang_path = "/root/sglang_local/python"
@@ -145,32 +155,33 @@ def run_dataset_sweep(
     return f"Error: Output file {output_file} not found."
 
 
+
 @app.local_entrypoint()
 def main(
-    data_names: str = "gsm8k,math500,humaneval,mt-bench",
-    target_model: str = "openai/gpt-oss-20b",
-    draft_model: str = "z-lab/gpt-oss-20b-DFlash",
-    offset: int = 2,
-    warmup: int = 0,
+    data_names: str = "gsm8k,mt-bench",
+    target_model: str = "Qwen/Qwen3-8B",
+    draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+    offset: int = 3,
 ):
     """\
     Local entrypoint for Modal.
 
-    Runs the same dataset sweep for different k_online & block_verify combinations.
-    Results are saved with clear tags including block_verify status.
+    Runs the dataset sweep for k_online off vs on. When k_online is off,
+    block_verify is enabled; when k_online is on, block_verify is disabled.
     """
 
     combinations = [
         (target_model, draft_model),
     ]
 
-    base_results_dir = f"gptoss_{data_names.replace(',', '_')}"
+    dataset_list = [d.strip() for d in data_names.split(",") if d.strip()]
+    base_results_dir = f"tmp_{data_names.replace(',', '_')}"
 
     # Ensure output directories exist before writing markdown files.
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
     os.makedirs("cuda_graph_" + base_results_dir, exist_ok=True)
 
-    for disable_cuda_graph in [False, True]:
+    for disable_cuda_graph in [False]:
         if disable_cuda_graph:
             results_dir = "no_cuda_graph_" + base_results_dir
         else:
@@ -179,37 +190,47 @@ def main(
         for target, draft in combinations:
             skip_baseline = True
 
-            for k_online, block_verify in [(True, False),(False, False), (False, True)]:
-                print(
-                    f"\n>>> Starting benchmark [{data_names}] "
-                    f"k_online={k_online}, disable_cuda_graph={disable_cuda_graph}: "
-                    f"Target={target}, Draft={draft}..."
-                )
+            tasks: list[tuple[str, bool, str, str]] = []
+            calls = []
 
-                try:
-                    res_content = run_dataset_sweep.remote(
+            for dataset in dataset_list:
+                for k_online in (False, True):
+                    # No k_online: block_verify on. With k_online: block_verify off.
+                    block_verify = not k_online
+
+                    print(
+                        f"\n>>> Spawning benchmark [{dataset}] "
+                        f"k_online={k_online}, block_verify={block_verify}, "
+                        f"disable_cuda_graph={disable_cuda_graph}: "
+                        f"Target={target}, Draft={draft}..."
+                    )
+
+                    call = run_dataset_sweep.spawn(
                         target,
-                        data_names,
+                        dataset,
                         draft,
                         skip_baseline=skip_baseline,
                         k_online=k_online,
                         k_online_offset=offset,
-                        k_online_warmup=warmup,
                         block_verify=block_verify,
                         disable_cuda_graph=disable_cuda_graph,
                     )
 
-                    run_tag = "k_online" if k_online else "no_k_online"
-                    block_verify_tag = "block_verify" if block_verify else "no_block_verify"
+                    tasks.append((dataset, k_online, target, draft))
+                    calls.append(call)
 
-                    filename = f"res_{data_names.replace(',', '-')}_{target.split('/')[-1]}"
+            for (dataset, k_online, target, draft), call in zip(tasks, calls):
+                try:
+                    res_content = call.get()
+
+                    run_tag = "k_online" if k_online else "no_k_online"
+                    block_verify_tag = "block_verify" if not k_online else "no_block_verify"
+
+                    filename = f"res_{dataset.replace(',', '-')}_{target.split('/')[-1]}"
                     if draft:
                         filename += f"_vs_{draft.split('/')[-1]}"
                     else:
                         filename += "_baseline"
-
-                    if k_online:
-                        filename += f"_k_online_off{offset}_w{warmup}"
 
                     filename += f"_{run_tag}_{block_verify_tag}.md"
 
@@ -221,9 +242,8 @@ def main(
                     print(f">>> Completed: {filename}")
                 except Exception as e:
                     print(
-                        f">>> Failed: data_names={data_names}, "
-                        f"k_online={k_online}, block_verify={block_verify}, "
-                        f"Target={target}, Draft={draft}. Error: {e}"
+                        f">>> Failed: dataset={dataset}, "
+                        f"Target={target}, Draft={draft}, k_online={k_online}. Error: {e}"
                     )
 
     print(f"\nAll benchmarks for '{data_names}' finished.")
