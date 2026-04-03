@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
-
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -148,32 +147,149 @@ class DFlashDraftInput(SpecInput):
 class DFlashVerifyInput(SpecInput):
     """Inputs for a target-model verify forward in DFlash (spec-v1).
 
-    The verify forward is run with `ForwardMode.TARGET_VERIFY` so that the target
-    model returns logits for all tokens in the block, enabling accept-length
-    computation.
+    Supports two verify modes:
+    - block verify (fixed block_size): draft_token is [bs * block]
+    - ragged verify (different verify_len per req): draft_token is flattened [sum(verify_lens)]
+
+    CUDA Graph support:
+    - When ragged verify uses cuda graph, tokens are padded to the nearest cuda graph shape
+    - The cuda graph shape set is the union of: block_size * (1, 2, ..., max_concurrency) and
+      max_concurrency * (1, 2, 3, ..., block_size)
+    - verify_token_lens stores the padded lengths, verify_token_lens_actual stores the actual lengths
     """
 
     draft_token: torch.Tensor
-    positions: torch.Tensor
     draft_token_num: int
+
+    # Compatible with legacy path (block verify)
+    positions: Optional[torch.Tensor] = None
+
+    # ragged verify: actual verify token count per req (including verified_id)
+    # Note: in cuda graph mode, this value may be padded
+    verify_token_lens: Optional[torch.Tensor] = None
+    # ragged verify: per-req start offset on CPU (len == bs)
+    verify_start_offsets_cpu: Optional[List[int]] = None
+
+    # ragged verify: the extend_start_loc calculated by ForwardBatchInfo, used to slice logits
+    verify_extend_start_loc: Optional[torch.Tensor] = None
+
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
-    # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
-    # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
-    custom_mask: torch.Tensor | None = None
+
+    custom_mask: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
+    # For block verify: = draft_token_num; for ragged verify: can stay as draft_token_num (DP padding needs it)
     num_tokens_per_batch: int = -1
+
+    # CUDA Graph support fields
+    # ragged verify: actual verify token count per req (unpadded original value)
+    verify_token_lens_actual: Optional[torch.Tensor] = None
+    # ragged verify: padded total token count (for cuda graph)
+    num_tokens_padded: int = -1
+    # Whether using cuda graph
+    use_cuda_graph: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
+        if self.verify_token_lens is None:
+            self.verify_token_lens = torch.empty((0,), dtype=torch.int32)
         if self.num_tokens_per_batch == -1:
-            self.num_tokens_per_batch = int(self.draft_token_num)
+            self.num_tokens_per_batch = (
+                int(self.draft_token_num) if int(self.draft_token_num) > 0 else 1
+            )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
+
+    def _is_ragged_verify(self) -> bool:
+        """Check if this is ragged verify (verify_token_lens is non-empty and length == bs)."""
+        return self.verify_token_lens is not None and self.verify_token_lens.numel() > 0
+
+    @staticmethod
+    def find_nearest_shape(
+        actual_token_num: int,
+        shapes: List[int],
+    ) -> Tuple[int, int]:
+        """Find the smallest available shape >= actual_token_num.
+
+        Returns:
+            (nearest_shape, padding_tokens)
+        """
+        import bisect
+
+        if shapes is None or len(shapes) == 0:
+            raise ValueError("shapes must be a non-empty list")
+
+        idx = bisect.bisect_left(shapes, actual_token_num)
+        if idx >= len(shapes):
+            # Caller should avoid this by checking max shape. Keep a safe fallback.
+            return shapes[-1], 0
+
+        nearest_shape = int(shapes[idx])
+        padding_tokens = int(nearest_shape - actual_token_num)
+        return nearest_shape, padding_tokens
+
+    @staticmethod
+    def find_nearest_cuda_graph_shape(
+        actual_token_num: int,
+        cuda_graph_shapes: List[int],
+    ) -> Tuple[int, int]:
+        """Backward-compatible wrapper for DFLASH CUDA-graph shape lookup."""
+        return DFlashVerifyInput.find_nearest_shape(actual_token_num, cuda_graph_shapes)
+
+    def pad_for_cuda_graph(
+        self,
+        block_size: int,
+        max_concurrency: int,
+        cuda_graph_shapes: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Perform padding for cuda graph.
+
+        Args:
+            block_size: DFlash block size
+            max_concurrency: maximum concurrency
+            cuda_graph_shapes: precomputed cuda graph shapes (optional, recomputed if None)
+        """
+        if not self._is_ragged_verify():
+            return
+
+        if cuda_graph_shapes is None:
+            cuda_graph_shapes = self.get_cuda_graph_verify_shapes(
+                block_size, max_concurrency
+            )
+
+        # Save the actual verify_token_lens
+        self.verify_token_lens_actual = self.verify_token_lens.clone()
+
+        # Calculate the actual total token count
+        actual_token_num = int(self.verify_token_lens.sum().item())
+
+        # Find the nearest cuda graph shape
+        nearest_shape, padding_tokens = self.find_nearest_cuda_graph_shape(
+            actual_token_num, cuda_graph_shapes
+        )
+
+        self.num_tokens_padded = nearest_shape
+        self.use_cuda_graph = True
+
+        # If padding is needed, distribute extra tokens to some requests
+        if padding_tokens > 0:
+            # Simple strategy: evenly distribute extra tokens to requests
+            # Each request gets at most 1 extra token until padding is exhausted
+            vlen_cpu = self.verify_token_lens_actual.cpu().tolist()
+            bs = len(vlen_cpu)
+
+            # Round-robin distribution of padding tokens
+            for i in range(padding_tokens):
+                vlen_cpu[i % bs] += 1
+
+            self.verify_token_lens = torch.tensor(
+                vlen_cpu, dtype=torch.int32, device=self.verify_token_lens.device
+            )
 
     def prepare_for_verify(
         self,
@@ -185,8 +301,89 @@ class DFlashVerifyInput(SpecInput):
         if batch.forward_mode.is_idle():
             return
 
+        # ragged verify currently only supports page_size == 1
+        if self._is_ragged_verify() and page_size != 1:
+            raise NotImplementedError(
+                "DFLASH ragged verify currently supports page_size==1 only."
+            )
+
+        bs = batch.batch_size()
         batch.input_ids = self.draft_token
 
+        # ragged verify: do not override batch.positions, let ForwardBatchInfo compute using extend_* fields
+        if self.positions is not None:
+            batch.positions = self.positions
+
+        # Defensive checks: if scheduler enters DFLASH_VERIFY mode, ragged metadata must be present.
+        if batch.forward_mode.name == "DFLASH_VERIFY":
+            if not self._is_ragged_verify():
+                raise RuntimeError(
+                    "DFLASH_VERIFY forward requires ragged metadata, but verify_token_lens is empty. "
+                    "This can lead to invalid attention indices and GPU faults."
+                )
+            if (
+                self.verify_start_offsets_cpu is None
+                or len(self.verify_start_offsets_cpu) != bs
+            ):
+                raise RuntimeError(
+                    "DFLASH_VERIFY forward requires verify_start_offsets_cpu with length == batch_size."
+                )
+
+        if self._is_ragged_verify():
+            # --- ragged verify path
+            if self.verify_token_lens.numel() != bs:
+                raise RuntimeError(
+                    f"DFLASH verify_token_lens shape mismatch: got {self.verify_token_lens.numel()} for bs={bs}."
+                )
+
+            # Hard consistency checks before entering attention.
+            total_verify_tokens = int(self.verify_token_lens.sum().item())
+            draft_token_len = int(self.draft_token.shape[0])
+            if total_verify_tokens != draft_token_len:
+                raise RuntimeError(
+                    "DFLASH ragged verify metadata mismatch: "
+                    f"sum(verify_token_lens)={total_verify_tokens} != len(draft_token)={draft_token_len}."
+                )
+
+            # Do not validate batch.extend_num_tokens here: in current scheduling flow
+            # it is assigned by DFlash worker after prepare_for_verify().
+
+            if self.verify_start_offsets_cpu is None or len(self.verify_start_offsets_cpu) != bs:
+                raise RuntimeError(
+                    "DFLASH ragged verify requires verify_start_offsets_cpu with length == batch_size."
+                )
+            expected_offsets = []
+            running = 0
+            for v in self.verify_token_lens.tolist():
+                expected_offsets.append(running)
+                running += int(v)
+            if self.verify_start_offsets_cpu != expected_offsets:
+                raise RuntimeError(
+                    "DFLASH ragged verify metadata mismatch: verify_start_offsets_cpu is inconsistent "
+                    "with verify_token_lens used for forward. "
+                    f"got={self.verify_start_offsets_cpu}, expected={expected_offsets}."
+                )
+
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache, len(batch.input_ids)
+            )
+            prefix_lens = batch.seq_lens
+            end_offset = prefix_lens + self.verify_token_lens.to(
+                prefix_lens.device, dtype=prefix_lens.dtype
+            )
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                prefix_lens,
+                end_offset,
+                batch.out_cache_loc,
+                bs,
+            )
+            # ragged verify does not build custom_mask (not needed for flashinfer/flashattention backends)
+            self.custom_mask = None
+            return
+
+        # --- block verify path (original logic)
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
@@ -213,7 +410,6 @@ class DFlashVerifyInput(SpecInput):
             )
             self.last_loc = last_loc
 
-        bs = batch.batch_size()
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -260,6 +456,46 @@ class DFlashVerifyInput(SpecInput):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
 
+        if bs == 0:
+            return (
+                torch.empty((0,), dtype=torch.int32, device=device),
+                torch.zeros((1,), dtype=torch.int32, device=device),
+                torch.zeros((1,), dtype=torch.int32, device=device),
+                None,
+            )
+
+        # ragged verify: construct qo_indptr / kv_indices based on verify_token_lens
+        if self._is_ragged_verify():
+            vlens = self.verify_token_lens
+            if vlens is None or vlens.numel() != bs:
+                vlens = torch.full(
+                    (bs,), int(self.draft_token_num), dtype=torch.int32, device=device
+                )
+
+            qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            qo_indptr[1:].copy_(torch.cumsum(vlens.to(device), dim=0))
+
+            cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            total_kv_lens = paged_kernel_lens + vlens.to(device)
+            cum_kv_seq_len[1:] = torch.cumsum(total_kv_lens, dim=0)
+
+            kv_indices = torch.empty(
+                int(total_kv_lens.sum().item()),
+                dtype=torch.int32,
+                device=device,
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                req_to_token,
+                req_pool_indices,
+                total_kv_lens,
+                cum_kv_seq_len,
+                None,
+                kv_indices,
+                req_to_token.size(1),
+            )
+            return kv_indices, cum_kv_seq_len, qo_indptr, None
+
+        # --- block verify (original logic)
         qo_indptr = torch.arange(
             0,
             (bs + 1) * self.draft_token_num,
@@ -331,6 +567,199 @@ class DFlashVerifyInput(SpecInput):
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
 
+        if self._is_ragged_verify():
+            actual_vlen_list = (
+                self.verify_token_lens_actual.tolist()
+                if (self.use_cuda_graph and self.verify_token_lens_actual is not None)
+                else (
+                    self.verify_token_lens.tolist()
+                    if self.verify_token_lens is not None
+                    else []
+                )
+            )
+            alloc_vlen_list = (
+                self.verify_token_lens.tolist()
+                if self.verify_token_lens is not None
+                else actual_vlen_list
+            )
+            start_offsets = self.verify_start_offsets_cpu
+            if start_offsets is None or len(start_offsets) != bs:
+                raise RuntimeError(
+                    "DFLASH ragged verify requires verify_start_offsets_cpu."
+                )
+
+            logits_flat = logits_output.next_token_logits
+            hidden_flat = logits_output.hidden_states
+
+            accept_length_per_req_cpu: List[int] = []
+            commit_lens_cpu: List[int] = []
+            new_verified_cpu: List[int] = []
+            segments_hidden: List[torch.Tensor] = []
+
+            for i, req in enumerate(batch.reqs):
+                vlen = int(actual_vlen_list[i])
+                logit_off = int(start_offsets[i])
+
+                current_candidates = self.draft_token[logit_off : logit_off + vlen]
+                current_logits = logits_flat[logit_off : logit_off + vlen]
+
+                current_predict = torch.argmax(current_logits, dim=-1)  # shape [vlen]
+                target_predict = current_predict
+
+                acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
+                    candidates=current_candidates.unsqueeze(0),
+                    target_predict=target_predict.unsqueeze(0),
+                )
+                acc_len = int(acc_len_t.item())
+                bonus = int(bonus_t.item())
+
+                proposed: List[int] = []
+                if acc_len > 0:
+                    proposed.extend(current_candidates[1 : acc_len + 1].tolist())
+                proposed.append(bonus)
+
+                appended = 0
+                if (
+                    req.grammar is None
+                    and not req.sampling_params.stop_strs
+                    and not req.sampling_params.stop_regex_strs
+                ):
+                    remaining = int(req.sampling_params.max_new_tokens) - len(
+                        req.output_ids
+                    )
+                    if remaining > 0:
+                        tokens = proposed[:remaining]
+                        if not req.sampling_params.ignore_eos:
+                            stop_token_ids = req.sampling_params.stop_token_ids
+                            eos_token_ids = req.eos_token_ids
+                            tokenizer = req.tokenizer
+                            tokenizer_eos = (
+                                tokenizer.eos_token_id
+                                if tokenizer is not None
+                                else None
+                            )
+                            additional_stop = (
+                                tokenizer.additional_stop_token_ids
+                                if tokenizer is not None
+                                else None
+                            )
+                            vocab_size = getattr(req, "vocab_size", None)
+                            for j, token_id in enumerate(tokens):
+                                if vocab_size is not None and (
+                                    int(token_id) > int(vocab_size) or int(token_id) < 0
+                                ):
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if stop_token_ids and token_id in stop_token_ids:
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if eos_token_ids and token_id in eos_token_ids:
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if tokenizer_eos is not None and int(token_id) == int(
+                                    tokenizer_eos
+                                ):
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if additional_stop and token_id in additional_stop:
+                                    tokens = tokens[: j + 1]
+                                    break
+
+                        req.output_ids.extend(int(tok) for tok in tokens)
+                        appended = len(tokens)
+                        if appended > 0:
+                            req.check_finished(new_accepted_len=appended)
+                else:
+                    for tok in proposed:
+                        req.output_ids.append(int(tok))
+                        appended += 1
+                        req.check_finished()
+                        if req.finished():
+                            break
+                        if req.grammar is not None:
+                            req.grammar.accept_token(int(tok))
+
+                if appended <= 0:
+                    raise RuntimeError("DFLASH verify appended 0 tokens.")
+
+                commit_lens_cpu.append(appended)
+                new_verified_cpu.append(int(req.output_ids[-1]))
+
+                acc_true = max(0, appended - 1)
+                accept_length_per_req_cpu.append(acc_true)
+
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += acc_true
+                req.spec_verify_tokens += vlen
+
+                if hidden_flat is not None:
+                    segments_hidden.append(
+                        hidden_flat[logit_off : logit_off + appended]
+                    )
+
+            commit_lens = torch.tensor(
+                commit_lens_cpu, dtype=torch.int32, device=device
+            )
+
+            if page_size == 1:
+                out_cache_loc = batch.out_cache_loc
+                to_free_chunks, kept_chunks = [], []
+                curr = 0
+                for i, vlen_alloc in enumerate(alloc_vlen_list):
+                    committed = commit_lens_cpu[i]
+                    kept_chunks.append(out_cache_loc[curr : curr + committed])
+                    if vlen_alloc > committed:
+                        to_free_chunks.append(
+                            out_cache_loc[curr + committed : curr + vlen_alloc]
+                        )
+                    curr += vlen_alloc
+
+                if to_free_chunks:
+                    batch.token_to_kv_pool_allocator.free(torch.cat(to_free_chunks))
+                batch.out_cache_loc = (
+                    torch.cat(kept_chunks) if kept_chunks else out_cache_loc[:0]
+                )
+            else:
+                raise NotImplementedError(
+                    "DFLASH ragged verify page_size > 1 not supported."
+                )
+
+            for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
+                req.kv_committed_len += commit_len
+                req.kv_allocated_len = req.kv_committed_len
+
+            end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
+                bs,
+            )
+
+            batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+            batch.seq_lens_cpu.add_(
+                torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+            )
+            batch.seq_lens_sum += sum(commit_lens_cpu)
+
+            next_target_hidden = (
+                torch.cat(segments_hidden, dim=0)
+                if segments_hidden
+                else (hidden_flat[:0] if hidden_flat is not None else logits_flat[:0])
+            )
+            logits_output.hidden_states = None
+            new_verified_id = torch.tensor(
+                new_verified_cpu, dtype=torch.int64, device=device
+            )
+            return (
+                new_verified_id,
+                commit_lens,
+                next_target_hidden,
+                accept_length_per_req_cpu,
+            )
+
         sampling_info = batch.sampling_info
         if sampling_info is not None:
             if len(sampling_info) != bs:
@@ -339,7 +768,6 @@ class DFlashVerifyInput(SpecInput):
                     f"len(sampling_info)={len(sampling_info)}, bs={bs}."
                 )
 
-            # Keep speculative verify semantics consistent with normal sampling path.
             if sampling_info.has_custom_logit_processor:
                 apply_custom_logit_processor(
                     logits_output.next_token_logits,
@@ -423,6 +851,7 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            req.spec_verify_tokens += self.draft_token_num
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(

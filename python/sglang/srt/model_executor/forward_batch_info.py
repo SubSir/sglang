@@ -99,6 +99,9 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
+    # Used in DFlash ragged verify (EXTEND-style forward with ragged token counts)
+    DFLASH_VERIFY = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -109,6 +112,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.DRAFT_EXTEND
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DFLASH_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
         )
@@ -137,7 +141,7 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     def is_target_verify(self):
-        return self == ForwardMode.TARGET_VERIFY
+        return self == ForwardMode.TARGET_VERIFY or self == ForwardMode.DFLASH_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
         return self == ForwardMode.DRAFT_EXTEND or (
@@ -161,6 +165,7 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DFLASH_VERIFY
             or self == ForwardMode.IDLE
             or self == ForwardMode.DLLM_EXTEND
         )
@@ -483,10 +488,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
+            # Allow DFLASH_VERIFY to use explicit positions from spec_info
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        if (
+            ret.forward_mode.is_decode()
+            or ret.forward_mode == ForwardMode.TARGET_VERIFY
+        ):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
@@ -505,8 +514,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
             )
+            # For DFLASH_VERIFY (ragged verify), we prefer explicit positions from spec_info if available.
             if ret.positions is None:
                 ret.positions = positions
+
+            # Record extend_start_loc for DFLASH_VERIFY to enable correct logits slicing in verify()
+            if (
+                ret.forward_mode == ForwardMode.DFLASH_VERIFY
+                and ret.spec_info is not None
+            ):
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                if isinstance(ret.spec_info, DFlashVerifyInput):
+                    ret.spec_info.verify_extend_start_loc = ret.extend_start_loc
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
@@ -934,8 +954,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :num_tokens
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
-            elif self.forward_mode.is_target_verify():  # verify
+            elif self.forward_mode.is_target_verify():  # verify (fixed block)
                 num_tokens = bs * self.spec_info.draft_token_num
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :num_tokens
+                ]
+                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            elif self.forward_mode == ForwardMode.DFLASH_VERIFY:  # verify (ragged)
+                # Ragged verify uses EXTEND-style tokenization; actual token count is len(input_ids).
+                num_tokens = int(self.input_ids.shape[0])
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]
