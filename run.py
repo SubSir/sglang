@@ -129,7 +129,7 @@ def main() -> None:
     parser.add_argument(
         "--data-names",
         type=str,
-        default="gsm8k",
+        default="mt-bench",
         help="Comma-separated dataset names passed to bench_dflash_sweep.",
     )
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
@@ -152,7 +152,7 @@ def main() -> None:
     os.makedirs(REPO_ROOT / f"no_cuda_graph_{base_results_dir}", exist_ok=True)
     os.makedirs(REPO_ROOT / f"cuda_graph_{base_results_dir}", exist_ok=True)
 
-    for disable_cuda_graph in [True]:
+    for disable_cuda_graph in [False]:
         if disable_cuda_graph:
             results_dir = REPO_ROOT / f"no_cuda_graph_{base_results_dir}"
         else:
@@ -162,7 +162,7 @@ def main() -> None:
             skip_baseline = True
 
             for dataset in dataset_list:
-                for k_online in (False, True):
+                for k_online in (True,):
                     print(
                         f"\n>>> Running benchmark [{dataset}] "
                         f"k_online={k_online}, disable_cuda_graph={disable_cuda_graph}: "

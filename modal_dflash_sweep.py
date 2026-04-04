@@ -157,7 +157,7 @@ def run_dataset_sweep(
 
 @app.local_entrypoint()
 def main(
-    data_names: str = "gsm8k",
+    data_names: str = "gsm8k,mt-bench",
     target_model: str = "Qwen/Qwen3-8B",
     draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
     offset: int = 3,
@@ -175,7 +175,7 @@ def main(
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
     os.makedirs("cuda_graph_" + base_results_dir, exist_ok=True)
 
-    for disable_cuda_graph in [True]:
+    for disable_cuda_graph in [False]:
         if disable_cuda_graph:
             results_dir = "no_cuda_graph_" + base_results_dir
         else:

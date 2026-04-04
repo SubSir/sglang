@@ -138,6 +138,7 @@ class FlashInferAttnBackend(AttentionBackend):
         init_new_workspace: bool = False,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 
