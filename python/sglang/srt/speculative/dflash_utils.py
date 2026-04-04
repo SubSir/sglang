@@ -49,7 +49,7 @@ def is_dflash_sampling_verify_available() -> bool:
 
 
 # Target verify lengths used when SGLANG_DFLASH_K_ONLINE=1 (uniform per sub-batch).
-DFLASH_K_VERIFY_BUCKET_SIZES: Tuple[int, ...] = (6, 9, 12, 16)
+DFLASH_K_VERIFY_BUCKET_SIZES: Tuple[int, ...] = (8, 16)
 
 
 def is_dflash_k_online_enabled() -> bool:

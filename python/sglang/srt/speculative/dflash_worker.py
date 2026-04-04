@@ -11,6 +11,7 @@ import torch
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_dp_rank
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import get_last_loc
@@ -1272,6 +1273,11 @@ class DFlashWorker:
         for v_len in sorted(groups.keys(), reverse=True):
             idx_list = groups[v_len]
             sub = copy.copy(batch)
+            # Shallow copy shares sampling_info; filter_batch mutates it in place. Rebuild from
+            # full req list so each group's keep_indices stay valid (batch-size tensors).
+            sub.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                sub, sub.model_config.vocab_size
+            )
             sub.spec_info = replace(template_draft)
             sub.filter_batch(keep_indices=idx_list)
             self._adjust_global_num_tokens_for_filtered_subbatch(sub)
