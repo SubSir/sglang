@@ -52,7 +52,6 @@ def run_dataset_sweep(
     skip_baseline: bool = True,
     k_online: bool = False,
     k_online_offset: int = 2,
-    block_verify: bool = False,
     disable_cuda_graph: bool = False,
 ):
     """
@@ -65,13 +64,12 @@ def run_dataset_sweep(
     # Generate output filename based on dataset and models
     data_tag = data_name.replace(",", "-")
     run_tag = "k_online" if k_online else "no_k_online"
-    block_verify_tag = "block_verify" if block_verify else "no_block_verify"
     output_file = f"results_{data_tag}_{target_model.split('/')[-1]}"
     if draft_model:
         output_file += f"_draft_{draft_model.split('/')[-1]}"
     if k_online:
         output_file += f"_k_online_off{k_online_offset}"
-    output_file += f"_{run_tag}_{block_verify_tag}.md"
+    output_file += f"_{run_tag}.md"
     
     output_path = f"/root/sglang_local/{output_file}"
 
@@ -107,7 +105,6 @@ def run_dataset_sweep(
     env = os.environ.copy()
     env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
     env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
-    env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
     
     sglang_path = "/root/sglang_local/python"
     if sglang_path not in sys.path:
@@ -158,12 +155,7 @@ def main(
     draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
     offset: int = 3,
 ):
-    """\
-    Local entrypoint for Modal.
-
-    Runs the dataset sweep for k_online off vs on. When k_online is off,
-    block_verify is enabled; when k_online is on, block_verify is disabled.
-    """
+    """Local entrypoint for Modal: dataset sweep for k_online off vs on."""
 
     combinations = [
         (target_model, draft_model),
@@ -190,13 +182,9 @@ def main(
 
             for dataset in dataset_list:
                 for k_online in (False, True):
-                    # No k_online: block_verify on. With k_online: block_verify off.
-                    block_verify = not k_online
-
                     print(
                         f"\n>>> Spawning benchmark [{dataset}] "
-                        f"k_online={k_online}, block_verify={block_verify}, "
-                        f"disable_cuda_graph={disable_cuda_graph}: "
+                        f"k_online={k_online}, disable_cuda_graph={disable_cuda_graph}: "
                         f"Target={target}, Draft={draft}..."
                     )
 
@@ -207,7 +195,6 @@ def main(
                         skip_baseline=skip_baseline,
                         k_online=k_online,
                         k_online_offset=offset,
-                        block_verify=block_verify,
                         disable_cuda_graph=disable_cuda_graph,
                     )
 
@@ -219,7 +206,6 @@ def main(
                     res_content = call.get()
 
                     run_tag = "k_online" if k_online else "no_k_online"
-                    block_verify_tag = "block_verify" if not k_online else "no_block_verify"
 
                     filename = f"res_{dataset.replace(',', '-')}_{target.split('/')[-1]}"
                     if draft:
@@ -227,7 +213,7 @@ def main(
                     else:
                         filename += "_baseline"
 
-                    filename += f"_{run_tag}_{block_verify_tag}.md"
+                    filename += f"_{run_tag}.md"
 
                     local_path = os.path.join(results_dir, filename)
 

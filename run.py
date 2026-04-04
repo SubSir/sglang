@@ -29,20 +29,18 @@ def run_dataset_sweep(
     skip_baseline: bool = True,
     k_online: bool = False,
     k_online_offset: int = 2,
-    block_verify: bool = False,
     disable_cuda_graph: bool = False,
     staging_dir: Path,
 ) -> str:
     """Run bench_dflash_sweep for one dataset / env combo; return markdown body or error text."""
     data_tag = data_name.replace(",", "-")
     run_tag = "k_online" if k_online else "no_k_online"
-    block_verify_tag = "block_verify" if block_verify else "no_block_verify"
     output_file = f"results_{data_tag}_{target_model.split('/')[-1]}"
     if draft_model:
         output_file += f"_draft_{draft_model.split('/')[-1]}"
     if k_online:
         output_file += f"_k_online_off{k_online_offset}"
-    output_file += f"_{run_tag}_{block_verify_tag}.md"
+    output_file += f"_{run_tag}.md"
 
     staging_dir.mkdir(parents=True, exist_ok=True)
     output_path = staging_dir / output_file
@@ -85,7 +83,6 @@ def run_dataset_sweep(
     env_updates = {
         "SGLANG_DFLASH_K_ONLINE": "1" if k_online else "0",
         "SGLANG_DFLASH_K_ONLINE_OFFSET": str(k_online_offset),
-        "SGLANG_DFLASH_BLOCK_VERIFY": "1" if block_verify else "0",
     }
 
     sglang_path = str(REPO_ROOT / "python")
@@ -166,12 +163,9 @@ def main() -> None:
 
             for dataset in dataset_list:
                 for k_online in (False, True):
-                    block_verify = not k_online
-
                     print(
                         f"\n>>> Running benchmark [{dataset}] "
-                        f"k_online={k_online}, block_verify={block_verify}, "
-                        f"disable_cuda_graph={disable_cuda_graph}: "
+                        f"k_online={k_online}, disable_cuda_graph={disable_cuda_graph}: "
                         f"Target={target}, Draft={draft}..."
                     )
 
@@ -183,20 +177,18 @@ def main() -> None:
                             skip_baseline=skip_baseline,
                             k_online=k_online,
                             k_online_offset=args.offset,
-                            block_verify=block_verify,
                             disable_cuda_graph=disable_cuda_graph,
                             staging_dir=staging_dir,
                         )
 
                         run_tag = "k_online" if k_online else "no_k_online"
-                        block_verify_tag = "block_verify" if not k_online else "no_block_verify"
 
                         filename = f"res_{dataset.replace(',', '-')}_{target.split('/')[-1]}"
                         if draft:
                             filename += f"_vs_{draft.split('/')[-1]}"
                         else:
                             filename += "_baseline"
-                        filename += f"_{run_tag}_{block_verify_tag}.md"
+                        filename += f"_{run_tag}.md"
 
                         local_path = os.path.join(results_dir, filename)
                         with open(local_path, "w") as f:
