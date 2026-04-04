@@ -101,10 +101,15 @@ def run_dataset_sweep(
 
     print(f"Executing with args: {args}, k_online={k_online}, disable_cuda_graph={disable_cuda_graph}")
     
-    # Setup environment
+    # Setup environment: only apply k-online knobs when enabled so the disabled path
+    # is unaffected by OFFSET or stale values from the parent environment.
     env = os.environ.copy()
-    env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
-    env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
+    if k_online:
+        env["SGLANG_DFLASH_K_ONLINE"] = "1"
+        env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
+    else:
+        env["SGLANG_DFLASH_K_ONLINE"] = "0"
+        env.pop("SGLANG_DFLASH_K_ONLINE_OFFSET", None)
     
     sglang_path = "/root/sglang_local/python"
     if sglang_path not in sys.path:
@@ -127,7 +132,9 @@ def run_dataset_sweep(
     # Update os.environ for the duration of the execution
     old_env = os.environ.copy()
     os.environ.update(env)
-    
+    if not k_online:
+        os.environ.pop("SGLANG_DFLASH_K_ONLINE_OFFSET", None)
+
     try:
         spec.loader.exec_module(module)
         if hasattr(module, "main"):
@@ -168,7 +175,7 @@ def main(
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
     os.makedirs("cuda_graph_" + base_results_dir, exist_ok=True)
 
-    for disable_cuda_graph in [False]:
+    for disable_cuda_graph in [True]:
         if disable_cuda_graph:
             results_dir = "no_cuda_graph_" + base_results_dir
         else:

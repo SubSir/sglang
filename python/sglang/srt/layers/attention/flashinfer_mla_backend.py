@@ -19,6 +19,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
+    _cuda_graph_target_verify_q_len,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -423,7 +424,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = verify_wrapper
+            q_len = _cuda_graph_target_verify_q_len(
+                spec_info, self.model_runner.server_args.speculative_num_draft_tokens
+            )
+            self.prefill_cuda_graph_metadata[(q_len, bs)] = verify_wrapper
             self.forward_metadata = PrefillMetadata(verify_wrapper, False)
         elif forward_mode.is_draft_extend():
             draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
@@ -485,12 +489,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 **self.fast_decode_kwargs,
             )
         elif forward_mode.is_target_verify():
+            q_len = _cuda_graph_target_verify_q_len(
+                spec_info, self.model_runner.server_args.speculative_num_draft_tokens
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[(q_len, bs)],
                 use_ragged=False,
                 spec_info=spec_info,
             )

@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.flashattention_backend import (
+    _cuda_graph_target_verify_q_len,
+)
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -375,17 +378,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Target Verify
             # Here we only support topk = 1 for now.
+            q_len = _cuda_graph_target_verify_q_len(
+                spec_info, self.speculative_num_draft_tokens
+            )
+            verify_meta_key = (q_len, bs)
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.cache_seqlens_int32.copy_(
-                (seq_lens + self.speculative_num_draft_tokens)
-            )
+            metadata.cache_seqlens_int32.copy_((seq_lens + q_len))
 
             metadata.cu_seqlens_q = torch.arange(
                 0,
-                bs * self.speculative_num_draft_tokens + 1,
-                self.speculative_num_draft_tokens,
+                bs * q_len + 1,
+                q_len,
                 dtype=torch.int32,
                 device=device,
             )
@@ -394,10 +399,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 : (bs + 1)
             ]
 
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
-            metadata.max_seq_len_k = (
-                seq_lens.max().item() + self.speculative_num_draft_tokens
-            )
+            metadata.max_seq_len_q = q_len
+            metadata.max_seq_len_k = seq_lens.max().item() + q_len
 
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
@@ -407,7 +410,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bs,
             )
 
-            self.target_verify_metadata[bs] = metadata
+            self.target_verify_metadata[verify_meta_key] = metadata
         elif forward_mode.is_draft_extend():
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
@@ -493,14 +496,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
-            metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(
-                (seq_lens + self.speculative_num_draft_tokens)
+            q_len = _cuda_graph_target_verify_q_len(
+                spec_info, self.speculative_num_draft_tokens
             )
+            verify_meta_key = (q_len, bs)
+            metadata = self.target_verify_metadata[verify_meta_key]
+            metadata.cache_seqlens_int32.copy_((seq_lens + q_len))
 
-            metadata.max_seq_len_k = (
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-            )
+            metadata.max_seq_len_k = seq_lens_cpu.max().item() + q_len
             max_len = seq_lens_cpu.max().item()
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -514,7 +517,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
+            metadata.max_seq_len_q = q_len
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)

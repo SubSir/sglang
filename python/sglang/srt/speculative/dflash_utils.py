@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -46,6 +46,49 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+# Target verify lengths used when SGLANG_DFLASH_K_ONLINE=1 (uniform per sub-batch).
+DFLASH_K_VERIFY_BUCKET_SIZES: Tuple[int, ...] = (6, 9, 12, 16)
+
+
+def is_dflash_k_online_enabled() -> bool:
+    return get_bool_env_var("SGLANG_DFLASH_K_ONLINE", default="false")
+
+
+def get_dflash_k_online_offset() -> int:
+    """Only meaningful when `is_dflash_k_online_enabled()` is true; default matches prior behavior."""
+    return get_int_env_var("SGLANG_DFLASH_K_ONLINE_OFFSET", default=2)
+
+
+def dflash_bucket_verify_len(need_verify_len: int, block_size: int) -> int:
+    """Pick the smallest bucket >= need_verify_len, capped at block_size."""
+    need = int(need_verify_len)
+    bs = int(block_size)
+    if bs <= 1:
+        return bs
+    if need <= 0:
+        need = 1
+    for b in DFLASH_K_VERIFY_BUCKET_SIZES:
+        if b > bs:
+            return bs
+        if need <= b:
+            return b
+    return bs
+
+
+def dflash_k_online_verify_lengths_to_capture(block_size: int) -> List[int]:
+    """Distinct target verify lengths (draft_token_num) for CUDA graph capture."""
+    bs = int(block_size)
+    if bs <= 1:
+        return [bs]
+    sizes: List[int] = []
+    for b in DFLASH_K_VERIFY_BUCKET_SIZES:
+        if b <= bs:
+            sizes.append(b)
+    if bs not in sizes:
+        sizes.append(bs)
+    return sorted(set(sizes))
 
 
 def scale_kv_cell_size_per_token_for_dflash(

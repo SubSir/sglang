@@ -36,6 +36,22 @@ from sglang.jit_kernel.flash_attention_v4 import (
 )
 
 
+def _cuda_graph_target_verify_q_len(
+    spec_info: Optional[SpecInput], default_q_len: Optional[int]
+) -> int:
+    """Query length per sequence for TARGET_VERIFY CUDA graphs (may differ from server default)."""
+    if spec_info is not None:
+        dn = getattr(spec_info, "draft_token_num", None)
+        if dn is not None:
+            return int(dn)
+    if default_q_len is None or int(default_q_len) <= 0:
+        raise RuntimeError(
+            "CUDA graph target_verify requires draft_token_num on spec_info or "
+            f"positive speculative_num_draft_tokens (got {default_q_len})."
+        )
+    return int(default_q_len)
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -493,18 +509,20 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
+                q_len = _cuda_graph_target_verify_q_len(
+                    forward_batch.spec_info, self.speculative_num_draft_tokens
+                )
                 metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    forward_batch.seq_lens + q_len
                 ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_q = q_len
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item()
-                    + self.speculative_num_draft_tokens
+                    forward_batch.seq_lens_cpu.max().item() + q_len
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    batch_size * q_len + 1,
+                    q_len,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1738,22 +1756,22 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
+                q_len = _cuda_graph_target_verify_q_len(
+                    spec_info, self.speculative_num_draft_tokens
+                )
+                verify_meta_key = (q_len, bs)
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
-                )
+                metadata.cache_seqlens_int32.copy_((seq_lens + q_len))
 
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_q = q_len
+                metadata.max_seq_len_k = seq_lens.max().item() + q_len
 
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    bs * q_len + 1,
+                    q_len,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1764,7 +1782,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
-                self.target_verify_metadata[bs] = metadata
+                self.target_verify_metadata[verify_meta_key] = metadata
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
@@ -1988,14 +2006,14 @@ class FlashAttentionBackend(AttentionBackend):
                 )
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                q_len = _cuda_graph_target_verify_q_len(
+                    spec_info, self.speculative_num_draft_tokens
                 )
+                verify_meta_key = (q_len, bs)
+                metadata = self.target_verify_metadata[verify_meta_key]
+                metadata.cache_seqlens_int32.copy_((seq_lens + q_len))
 
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_k = seq_lens_cpu.max().item() + q_len
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )

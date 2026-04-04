@@ -39,6 +39,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _cuda_graph_target_verify_q_len(
+    spec_info: Optional[SpecInput], default_q_len: Optional[int]
+) -> int:
+    if spec_info is not None:
+        dn = getattr(spec_info, "draft_token_num", None)
+        if dn is not None:
+            return int(dn)
+    if default_q_len is None or int(default_q_len) <= 0:
+        raise RuntimeError(
+            "CUDA graph target_verify requires draft_token_num on spec_info or "
+            f"positive speculative_num_draft_tokens (got {default_q_len})."
+        )
+    return int(default_q_len)
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -634,7 +650,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            q_len = _cuda_graph_target_verify_q_len(
+                spec_info, self.model_runner.server_args.speculative_num_draft_tokens
+            )
+            self.prefill_cuda_graph_metadata[(q_len, bs)] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -722,13 +741,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
+            q_len = _cuda_graph_target_verify_q_len(
+                spec_info, self.model_runner.server_args.speculative_num_draft_tokens
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[(q_len, bs)],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
