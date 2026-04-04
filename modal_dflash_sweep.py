@@ -75,17 +75,18 @@ def run_dataset_sweep(
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 32
+    max_concurrency = 64
 
     args = [
         "bench_dflash_sweep.py",
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "32",
+        "--concurrencies", "64",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         # "--samples-per-concurrency-base", "8",
+        "--max-samples-per-config", "4096",
         "--attention-backends", "fa3",
         "--mem-fraction-static", "0.7",
     ]
