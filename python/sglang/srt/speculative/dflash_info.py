@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import torch
+from sglang.jit_kernel.dflash_adaptive_verify import accept_dflash_adaptive_verify
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -21,6 +23,11 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+
+DFLASH_VERIFY_DEBUG_CHECKS = (
+    os.environ.get("SGLANG_DFLASH_VERIFY_DEBUG_CHECKS", "0") == "1"
+)
 
 
 def _compute_paged_keep_slots(
@@ -167,6 +174,8 @@ class DFlashVerifyInput(SpecInput):
     # ragged verify: actual verify token count per req (including verified_id)
     # Note: in cuda graph mode, this value may be padded
     verify_token_lens: Optional[torch.Tensor] = None
+    # ragged verify: per-req start offset on device (len == bs)
+    verify_start_offsets: Optional[torch.Tensor] = None
     # ragged verify: per-req start offset on CPU (len == bs)
     verify_start_offsets_cpu: Optional[List[int]] = None
 
@@ -321,12 +330,12 @@ class DFlashVerifyInput(SpecInput):
                     "DFLASH_VERIFY forward requires ragged metadata, but verify_token_lens is empty. "
                     "This can lead to invalid attention indices and GPU faults."
                 )
-            if (
+            if self.verify_start_offsets is None and (
                 self.verify_start_offsets_cpu is None
                 or len(self.verify_start_offsets_cpu) != bs
             ):
                 raise RuntimeError(
-                    "DFLASH_VERIFY forward requires verify_start_offsets_cpu with length == batch_size."
+                    "DFLASH_VERIFY forward requires verify_start_offsets metadata with length == batch_size."
                 )
 
         if self._is_ragged_verify():
@@ -348,21 +357,30 @@ class DFlashVerifyInput(SpecInput):
             # Do not validate batch.extend_num_tokens here: in current scheduling flow
             # it is assigned by DFlash worker after prepare_for_verify().
 
-            if self.verify_start_offsets_cpu is None or len(self.verify_start_offsets_cpu) != bs:
+            if self.verify_start_offsets is None and (
+                self.verify_start_offsets_cpu is None
+                or len(self.verify_start_offsets_cpu) != bs
+            ):
                 raise RuntimeError(
-                    "DFLASH ragged verify requires verify_start_offsets_cpu with length == batch_size."
+                    "DFLASH ragged verify requires verify_start_offsets metadata with length == batch_size."
                 )
-            expected_offsets = []
-            running = 0
-            for v in self.verify_token_lens.tolist():
-                expected_offsets.append(running)
-                running += int(v)
-            if self.verify_start_offsets_cpu != expected_offsets:
-                raise RuntimeError(
-                    "DFLASH ragged verify metadata mismatch: verify_start_offsets_cpu is inconsistent "
-                    "with verify_token_lens used for forward. "
-                    f"got={self.verify_start_offsets_cpu}, expected={expected_offsets}."
+            if DFLASH_VERIFY_DEBUG_CHECKS:
+                start_offsets_cpu = (
+                    self.verify_start_offsets.cpu().tolist()
+                    if self.verify_start_offsets is not None
+                    else self.verify_start_offsets_cpu
                 )
+                expected_offsets = []
+                running = 0
+                for v in self.verify_token_lens.tolist():
+                    expected_offsets.append(running)
+                    running += int(v)
+                if start_offsets_cpu != expected_offsets:
+                    raise RuntimeError(
+                        "DFLASH ragged verify metadata mismatch: verify_start_offsets is inconsistent "
+                        "with verify_token_lens used for forward. "
+                        f"got={start_offsets_cpu}, expected={expected_offsets}."
+                    )
 
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
@@ -568,54 +586,61 @@ class DFlashVerifyInput(SpecInput):
         device = logits_output.next_token_logits.device
 
         if self._is_ragged_verify():
-            actual_vlen_list = (
-                self.verify_token_lens_actual.tolist()
+            actual_vlens = (
+                self.verify_token_lens_actual
                 if (self.use_cuda_graph and self.verify_token_lens_actual is not None)
-                else (
-                    self.verify_token_lens.tolist()
-                    if self.verify_token_lens is not None
-                    else []
-                )
+                else self.verify_token_lens
             )
-            alloc_vlen_list = (
-                self.verify_token_lens.tolist()
-                if self.verify_token_lens is not None
-                else actual_vlen_list
+            alloc_vlens = (
+                self.verify_token_lens if self.verify_token_lens is not None else actual_vlens
             )
-            start_offsets = self.verify_start_offsets_cpu
-            if start_offsets is None or len(start_offsets) != bs:
+            if actual_vlens is None or alloc_vlens is None:
                 raise RuntimeError(
-                    "DFLASH ragged verify requires verify_start_offsets_cpu."
+                    "DFLASH ragged verify requires verify_token_lens metadata."
                 )
+            start_offsets_t = self.verify_start_offsets
+            if start_offsets_t is None:
+                if self.verify_start_offsets_cpu is None:
+                    raise RuntimeError(
+                        "DFLASH ragged verify requires verify_start_offsets metadata."
+                    )
+                start_offsets_t = torch.tensor(
+                    self.verify_start_offsets_cpu, dtype=torch.int32, device=device
+                )
+                self.verify_start_offsets = start_offsets_t
 
             logits_flat = logits_output.next_token_logits
             hidden_flat = logits_output.hidden_states
+            target_predict_flat = torch.argmax(logits_flat, dim=-1)
+            accept_len_t, bonus_t = accept_dflash_adaptive_verify(
+                draft_token_flat=self.draft_token,
+                target_predict_flat=target_predict_flat,
+                actual_verify_lens=actual_vlens,
+                start_offsets=start_offsets_t,
+            )
+
+            actual_vlen_list = actual_vlens.cpu().tolist()
+            start_offsets = start_offsets_t.cpu().tolist()
+            accept_len_list = accept_len_t.cpu().tolist()
+            bonus_list = bonus_t.cpu().tolist()
+            draft_token_cpu = self.draft_token.cpu()
 
             accept_length_per_req_cpu: List[int] = []
             commit_lens_cpu: List[int] = []
             new_verified_cpu: List[int] = []
-            segments_hidden: List[torch.Tensor] = []
 
             for i, req in enumerate(batch.reqs):
                 vlen = int(actual_vlen_list[i])
                 logit_off = int(start_offsets[i])
 
-                current_candidates = self.draft_token[logit_off : logit_off + vlen]
-                current_logits = logits_flat[logit_off : logit_off + vlen]
-
-                current_predict = torch.argmax(current_logits, dim=-1)  # shape [vlen]
-                target_predict = current_predict
-
-                acc_len_t, bonus_t = compute_dflash_accept_len_and_bonus(
-                    candidates=current_candidates.unsqueeze(0),
-                    target_predict=target_predict.unsqueeze(0),
-                )
-                acc_len = int(acc_len_t.item())
-                bonus = int(bonus_t.item())
+                acc_len = int(accept_len_list[i])
+                bonus = int(bonus_list[i])
 
                 proposed: List[int] = []
                 if acc_len > 0:
-                    proposed.extend(current_candidates[1 : acc_len + 1].tolist())
+                    proposed.extend(
+                        draft_token_cpu[logit_off + 1 : logit_off + 1 + acc_len].tolist()
+                    )
                 proposed.append(bonus)
 
                 appended = 0
@@ -692,33 +717,40 @@ class DFlashVerifyInput(SpecInput):
                 req.spec_accepted_tokens += acc_true
                 req.spec_verify_tokens += vlen
 
-                if hidden_flat is not None:
-                    segments_hidden.append(
-                        hidden_flat[logit_off : logit_off + appended]
-                    )
-
             commit_lens = torch.tensor(
                 commit_lens_cpu, dtype=torch.int32, device=device
             )
 
             if page_size == 1:
                 out_cache_loc = batch.out_cache_loc
-                to_free_chunks, kept_chunks = [], []
-                curr = 0
-                for i, vlen_alloc in enumerate(alloc_vlen_list):
-                    committed = commit_lens_cpu[i]
-                    kept_chunks.append(out_cache_loc[curr : curr + committed])
-                    if vlen_alloc > committed:
-                        to_free_chunks.append(
-                            out_cache_loc[curr + committed : curr + vlen_alloc]
-                        )
-                    curr += vlen_alloc
-
-                if to_free_chunks:
-                    batch.token_to_kv_pool_allocator.free(torch.cat(to_free_chunks))
-                batch.out_cache_loc = (
-                    torch.cat(kept_chunks) if kept_chunks else out_cache_loc[:0]
+                alloc_vlens_i64 = alloc_vlens.to(dtype=torch.int64, device=device)
+                commit_lens_i64 = commit_lens.to(torch.int64)
+                alloc_starts = start_offsets_t.to(torch.int64)
+                max_alloc = (
+                    int(alloc_vlens_i64.max().item())
+                    if alloc_vlens_i64.numel() > 0
+                    else 0
                 )
+                if max_alloc > 0:
+                    alloc_rows = torch.arange(
+                        max_alloc, dtype=torch.int64, device=device
+                    )[None, :]
+                    alloc_indices = alloc_starts[:, None] + alloc_rows
+                    valid_mask = alloc_rows < alloc_vlens_i64[:, None]
+                    keep_mask = alloc_rows < commit_lens_i64[:, None]
+                    keep_indices = alloc_indices[keep_mask]
+                    free_indices = alloc_indices[valid_mask & ~keep_mask]
+                    if free_indices.numel() > 0:
+                        batch.token_to_kv_pool_allocator.free(
+                            out_cache_loc.index_select(0, free_indices)
+                        )
+                    batch.out_cache_loc = (
+                        out_cache_loc.index_select(0, keep_indices)
+                        if keep_indices.numel() > 0
+                        else out_cache_loc[:0]
+                    )
+                else:
+                    batch.out_cache_loc = out_cache_loc[:0]
             else:
                 raise NotImplementedError(
                     "DFLASH ragged verify page_size > 1 not supported."
@@ -745,10 +777,27 @@ class DFlashVerifyInput(SpecInput):
             batch.seq_lens_sum += sum(commit_lens_cpu)
 
             next_target_hidden = (
-                torch.cat(segments_hidden, dim=0)
-                if segments_hidden
-                else (hidden_flat[:0] if hidden_flat is not None else logits_flat[:0])
+                hidden_flat[:0]
+                if hidden_flat is not None
+                else logits_flat[:0]
             )
+            if hidden_flat is not None:
+                commit_lens_i64 = commit_lens.to(torch.int64)
+                max_commit = (
+                    int(commit_lens_i64.max().item())
+                    if commit_lens_i64.numel() > 0
+                    else 0
+                )
+                if max_commit > 0:
+                    hidden_rows = torch.arange(
+                        max_commit, dtype=torch.int64, device=device
+                    )[None, :]
+                    hidden_indices = start_offsets_t.to(torch.int64)[:, None] + hidden_rows
+                    hidden_keep_indices = hidden_indices[
+                        hidden_rows < commit_lens_i64[:, None]
+                    ]
+                    next_target_hidden = hidden_flat.index_select(0, hidden_keep_indices)
+
             logits_output.hidden_states = None
             new_verified_id = torch.tensor(
                 new_verified_cpu, dtype=torch.int64, device=device

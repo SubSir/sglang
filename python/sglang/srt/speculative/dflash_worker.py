@@ -7,6 +7,7 @@ from typing import Optional, Union, Tuple, Dict
 
 import torch
 
+from sglang.jit_kernel.dflash_adaptive_verify import prepare_dflash_adaptive_verify
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -230,6 +231,7 @@ class DFlashWorker:
         self._verify_positions_flat_buf: Optional[torch.Tensor] = None
         self._verify_flat_cap: int = 0
         self._verify_start_offsets_cache: Dict[int, torch.Tensor] = {}
+        self._verify_padded_lens_cache: Dict[int, torch.Tensor] = {}
 
         # Verify-length prediction offset on top of expected accepted length.
         # Keep using the original env key.
@@ -805,58 +807,32 @@ class DFlashWorker:
 
         # Keep verify length computations on GPU; move to CPU only where Python lists
         # are required by scheduler metadata.
-        verify_len_i32_actual = verify_len_per_req.to(torch.int32)
-        verify_len_i32 = verify_len_i32_actual.clamp(min=1, max=block_size_i)
+        verify_len_i32_actual = verify_len_per_req.to(torch.int32).clamp(
+            min=1, max=block_size_i
+        )
 
+        total_verify_tokens_actual = int(verify_len_i32_actual.sum().item())
+        target_total_tokens = total_verify_tokens_actual
         padding_tokens = 0
         if _can_use_piecewise_graph:
-            total_verify_tokens_actual = int(verify_len_i32_actual.sum().item())
-
             # DFLASH verify shape padding is only needed for piecewise cuda graph buckets.
             cuda_graph_shapes = list(self.server_args.piecewise_cuda_graph_tokens)
 
-            nearest_shape, padding_tokens = DFlashVerifyInput.find_nearest_shape(
+            _, padding_tokens = DFlashVerifyInput.find_nearest_shape(
                 total_verify_tokens_actual,
                 cuda_graph_shapes,
             )
 
             if padding_tokens > 0:
-                # Round-robin pad on GPU with "skip-when-full" semantics.
-                # This preserves the original behavior where leftover padding keeps
-                # flowing to other requests when earlier ones hit block_size.
-                room = (block_size_i - verify_len_i32).clamp_min(0)
+                room = (block_size_i - verify_len_i32_actual).clamp_min(0)
                 total_room = int(room.sum().item())
-                to_assign = min(int(padding_tokens), total_room)
+                target_total_tokens = total_verify_tokens_actual + min(
+                    int(padding_tokens), total_room
+                )
 
-                if to_assign > 0:
-                    inc_counts = torch.zeros_like(verify_len_i32)
-                    remaining = to_assign
-
-                    # At each pass, each non-full request can take at most one token,
-                    # matching the original i % bs round-robin behavior.
-                    while remaining > 0:
-                        can_take = (verify_len_i32 + inc_counts) < block_size_i
-                        avail_idx = torch.nonzero(can_take, as_tuple=False).flatten()
-                        if avail_idx.numel() == 0:
-                            break
-
-                        take_n = min(remaining, int(avail_idx.numel()))
-                        sel = avail_idx[:take_n]
-                        inc_counts.index_add_(
-                            0,
-                            sel,
-                            torch.ones((take_n,), dtype=inc_counts.dtype, device=self.device),
-                        )
-                        remaining -= take_n
-
-                    verify_len_i32 = verify_len_i32 + inc_counts
-
-        total_verify_tokens = int(verify_len_i32.sum().item())
+        total_verify_tokens = int(target_total_tokens)
         if total_verify_tokens <= 0:
             raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
-
-        # Build once for Python-side metadata; flatten path still runs on GPU buffers.
-        vlen_list = verify_len_i32.tolist()
 
         # 3b) Flatten tokens and build per-req offsets
         if (
@@ -878,7 +854,11 @@ class DFlashWorker:
 
         verify_tokens_flat = self._verify_tokens_flat_buf[:total_verify_tokens]
 
-        # Cache per-bs start offsets tensor on GPU, and materialize list only at boundary.
+        verify_len_i32 = self._verify_padded_lens_cache.get(bs)
+        if verify_len_i32 is None:
+            verify_len_i32 = torch.empty((bs,), dtype=torch.int32, device=self.device)
+            self._verify_padded_lens_cache[bs] = verify_len_i32
+
         verify_start_offsets_t = self._verify_start_offsets_cache.get(bs)
         if verify_start_offsets_t is None:
             verify_start_offsets_t = torch.empty(
@@ -886,56 +866,59 @@ class DFlashWorker:
             )
             self._verify_start_offsets_cache[bs] = verify_start_offsets_t
 
-        pt = 0
-        for i, vlen in enumerate(vlen_list):
-            verify_start_offsets_t[i] = pt
-            v = int(vlen)
-            if v <= 0:
-                continue
-            verify_tokens_flat[pt : pt + v].copy_(draft_tokens[i, :v])
-            pt += v
-
-        verify_start_offsets_cpu = verify_start_offsets_t.tolist()
-
         if explicit_pos:
-            # Old behavior: explicitly flatten positions to avoid relying on ForwardBatchInfo.
-            total_vlen = int(sum(vlen_list))
             if (
                 self._verify_positions_flat_buf is None
-                or self._verify_positions_flat_buf.shape[0] < total_vlen
+                or self._verify_positions_flat_buf.shape[0] < total_verify_tokens
             ):
                 new_cap = max(
-                    total_vlen,
+                    total_verify_tokens,
                     (
                         self._verify_positions_flat_buf.shape[0] * 2
                         if self._verify_positions_flat_buf is not None
-                        else total_vlen
+                        else total_verify_tokens
                     ),
                 )
                 self._verify_positions_flat_buf = torch.empty(
                     (new_cap,), dtype=torch.int64, device=self.device
                 )
 
-            verify_positions_flat = self._verify_positions_flat_buf[:total_vlen]
-            pt2 = 0
-            for i, vlen in enumerate(vlen_list):
-                v = int(vlen)
-                if v <= 0:
-                    continue
-                verify_positions_flat[pt2 : pt2 + v].copy_(positions_2d[i, :v])
-                pt2 += v
-            verify_positions = verify_positions_flat
+            verify_positions_flat = self._verify_positions_flat_buf[:total_verify_tokens]
+            verify_positions_src = positions_2d
         else:
-            verify_positions = (
-                None  # Let ForwardBatchInfo compute positions from extend_*.
-            )
+            verify_positions_flat = None
+            verify_positions_src = None
+
+        (
+            verify_len_i32,
+            verify_start_offsets_t,
+            verify_tokens_flat,
+            verify_positions_flat,
+        ) = prepare_dflash_adaptive_verify(
+            draft_tokens=draft_tokens,
+            positions=verify_positions_src,
+            verify_len_actual=verify_len_i32_actual,
+            target_total_tokens=total_verify_tokens,
+            verify_len_padded=verify_len_i32,
+            start_offsets=verify_start_offsets_t,
+            packed_tokens=verify_tokens_flat,
+            packed_positions=verify_positions_flat,
+        )
+
+        # Build once for Python-side scheduler metadata.
+        vlen_list = verify_len_i32.tolist()
+        verify_positions = (
+            verify_positions_flat
+            if explicit_pos
+            else None  # Let ForwardBatchInfo compute positions from extend_*.
+        )
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_tokens_flat,
             positions=verify_positions,
             draft_token_num=int(self.block_size),
             verify_token_lens=verify_len_i32,
-            verify_start_offsets_cpu=verify_start_offsets_cpu,
+            verify_start_offsets=verify_start_offsets_t,
             verify_token_lens_actual=verify_len_i32_actual,
             use_cuda_graph=_can_use_piecewise_graph,
             num_tokens_padded=total_verify_tokens if _can_use_piecewise_graph else -1,
