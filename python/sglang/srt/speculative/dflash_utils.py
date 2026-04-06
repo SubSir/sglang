@@ -77,6 +77,30 @@ def dflash_bucket_verify_len(need_verify_len: int, block_size: int) -> int:
     return bs
 
 
+def dflash_bucket_verify_len_tensor(
+    need_verify_lens: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    """Vectorized bucket mapping for k-online verify lengths on GPU."""
+    if need_verify_lens.ndim != 1:
+        raise ValueError(
+            "need_verify_lens must be 1D, "
+            f"got shape={tuple(need_verify_lens.shape)}."
+        )
+
+    bs = int(block_size)
+    if bs <= 1:
+        return torch.full_like(need_verify_lens, bs, dtype=torch.int32)
+
+    need = need_verify_lens.to(torch.int32).clamp_min(1)
+    out = torch.full_like(need, bs, dtype=torch.int32)
+    for b in DFLASH_K_VERIFY_BUCKET_SIZES:
+        b_i = int(b)
+        if b_i > bs:
+            break
+        out = torch.where(need <= b_i, torch.full_like(out, b_i), out)
+    return out
+
+
 def dflash_k_online_verify_lengths_to_capture(block_size: int) -> List[int]:
     """Distinct target verify lengths (draft_token_num) for CUDA graph capture."""
     bs = int(block_size)

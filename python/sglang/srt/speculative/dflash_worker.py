@@ -1,7 +1,6 @@
 import copy
 import logging
 import math
-from collections import defaultdict
 from copy import deepcopy
 from dataclasses import replace
 from typing import List, Optional, Tuple, Union
@@ -28,7 +27,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
-    dflash_bucket_verify_len,
+    dflash_bucket_verify_len_tensor,
     get_dflash_k_online_offset,
     is_dflash_k_online_enabled,
     is_dflash_sampling_verify_available,
@@ -232,7 +231,7 @@ class DFlashWorker:
 
         self._k_online_enabled = is_dflash_k_online_enabled()
         self._k_online_offset = int(get_dflash_k_online_offset())
-        self._decode_k_bucket_lens_cpu: Optional[List[int]] = None
+        self._decode_k_bucket_lens: Optional[torch.Tensor] = None
         self._draft_verify_positions_full: Optional[torch.Tensor] = None
 
     def _init_fused_kv_helper(self) -> None:
@@ -697,10 +696,10 @@ class DFlashWorker:
                 predicted_acc + int(self._k_online_offset),
                 torch.full_like(predicted_acc, num_pos, dtype=torch.int32),
             )
-            need_v = (k + 1).tolist()
-            self._decode_k_bucket_lens_cpu = [
-                dflash_bucket_verify_len(int(nv), int(self.block_size)) for nv in need_v
-            ]
+            need_v = k + 1
+            self._decode_k_bucket_lens = dflash_bucket_verify_len_tensor(
+                need_v, int(self.block_size)
+            )
             self._draft_verify_positions_full = positions_2d.clone()
             return
 
@@ -1245,17 +1244,26 @@ class DFlashWorker:
         template_draft: DFlashDraftInput,
         **kwargs,
     ) -> GenerationBatchResult:
-        assert self._decode_k_bucket_lens_cpu is not None
+        assert self._decode_k_bucket_lens is not None
         assert self._draft_verify_positions_full is not None
 
-        bucket_cpu = self._decode_k_bucket_lens_cpu
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
 
-        groups: dict[int, list[int]] = defaultdict(list)
-        for i, v in enumerate(bucket_cpu):
-            groups[int(v)].append(i)
+        bucket_t = self._decode_k_bucket_lens
+        bucket_groups: List[Tuple[int, torch.Tensor]] = []
+        for v in torch.unique(bucket_t, sorted=True).flip(0):
+            idx_dev = torch.nonzero(bucket_t == v, as_tuple=False).flatten()
+            if idx_dev.numel() > 0:
+                bucket_groups.append((int(v.item()), idx_dev))
+        # Build CPU keep-indices once to avoid per-bucket D2H sync.
+        bucket_indices_cpu: dict[int, List[int]] = {}
+        for i, v in enumerate(bucket_t.cpu().tolist()):
+            v_i = int(v)
+            if v_i not in bucket_indices_cpu:
+                bucket_indices_cpu[v_i] = []
+            bucket_indices_cpu[v_i].append(i)
 
         pieces: List[ScheduleBatch] = []
         can_run_cuda_graph = True
@@ -1264,14 +1272,14 @@ class DFlashWorker:
         bs0 = batch.batch_size()
         draft_buf = self._draft_block_tokens_buf[:bs0]
         pos_full = self._draft_verify_positions_full
-        if len(bucket_cpu) != bs0:
+        if int(bucket_t.numel()) != bs0:
             raise RuntimeError(
                 "DFLASH k-online bucket list length mismatch batch size: "
-                f"len(bucket)={len(bucket_cpu)}, batch_size={bs0}."
+                f"len(bucket)={int(bucket_t.numel())}, batch_size={bs0}."
             )
 
-        for v_len in sorted(groups.keys(), reverse=True):
-            idx_list = groups[v_len]
+        for v_len, idx_dev in bucket_groups:
+            idx_list = bucket_indices_cpu[v_len]
             sub = copy.copy(batch)
             # Shallow copy shares sampling_info; filter_batch mutates it in place. Rebuild from
             # full req list so each group's keep_indices stay valid (batch-size tensors).
@@ -1285,9 +1293,6 @@ class DFlashWorker:
             if not isinstance(draft_state, DFlashDraftInput):
                 raise RuntimeError("DFLASH k-online expected DFlashDraftInput on sub-batch.")
 
-            idx_dev = torch.tensor(
-                idx_list, device=self.device, dtype=torch.int64, pin_memory=False
-            )
             verify_input = DFlashVerifyInput(
                 draft_token=draft_buf[idx_dev, :v_len].reshape(-1),
                 positions=pos_full[idx_dev, :v_len].reshape(-1),
@@ -1462,7 +1467,7 @@ class DFlashWorker:
         if (
             self._k_online_enabled
             and int(self.block_size) > 1
-            and self._decode_k_bucket_lens_cpu is not None
+            and self._decode_k_bucket_lens is not None
         ):
             return self._forward_dflash_k_online_verify(batch, draft_input, **kwargs)
 
