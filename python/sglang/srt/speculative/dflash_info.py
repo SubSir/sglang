@@ -612,36 +612,31 @@ class DFlashVerifyInput(SpecInput):
             logits_flat = logits_output.next_token_logits
             hidden_flat = logits_output.hidden_states
             target_predict_flat = torch.argmax(logits_flat, dim=-1)
-            accept_len_t, bonus_t = accept_dflash_adaptive_verify(
+            _, _, proposed_packed, proposed_count_t = accept_dflash_adaptive_verify(
                 draft_token_flat=self.draft_token,
                 target_predict_flat=target_predict_flat,
                 actual_verify_lens=actual_vlens,
                 start_offsets=start_offsets_t,
             )
 
-            actual_vlen_list = actual_vlens.cpu().tolist()
-            start_offsets = start_offsets_t.cpu().tolist()
-            accept_len_list = accept_len_t.cpu().tolist()
-            bonus_list = bonus_t.cpu().tolist()
-            draft_token_cpu = self.draft_token.cpu()
+            verify_host = torch.cat(
+                [
+                    actual_vlens.to(torch.int64).reshape(bs, 1),
+                    proposed_count_t.to(torch.int64).reshape(bs, 1),
+                    proposed_packed,
+                ],
+                dim=1,
+            ).cpu()
+            verify_host_np = verify_host.numpy()
 
             accept_length_per_req_cpu: List[int] = []
             commit_lens_cpu: List[int] = []
             new_verified_cpu: List[int] = []
 
             for i, req in enumerate(batch.reqs):
-                vlen = int(actual_vlen_list[i])
-                logit_off = int(start_offsets[i])
-
-                acc_len = int(accept_len_list[i])
-                bonus = int(bonus_list[i])
-
-                proposed: List[int] = []
-                if acc_len > 0:
-                    proposed.extend(
-                        draft_token_cpu[logit_off + 1 : logit_off + 1 + acc_len].tolist()
-                    )
-                proposed.append(bonus)
+                vlen = int(verify_host_np[i, 0])
+                pc = int(verify_host_np[i, 1])
+                proposed = verify_host_np[i, 2 : 2 + pc].tolist()
 
                 appended = 0
                 if (
@@ -771,10 +766,9 @@ class DFlashVerifyInput(SpecInput):
             )
 
             batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-            batch.seq_lens_cpu.add_(
-                torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
-            )
-            batch.seq_lens_sum += sum(commit_lens_cpu)
+            commit_lens_cpu_t = commit_lens.detach().cpu()
+            batch.seq_lens_cpu.add_(commit_lens_cpu_t.to(dtype=batch.seq_lens_cpu.dtype))
+            batch.seq_lens_sum += int(commit_lens_cpu_t.sum().item())
 
             next_target_hidden = (
                 hidden_flat[:0]
