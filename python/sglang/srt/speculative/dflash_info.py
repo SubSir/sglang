@@ -466,7 +466,7 @@ class DFlashVerifyInput(SpecInput):
         block = int(self.draft_token_num)
         start_offsets_i64 = start_offsets_t.to(device=device, dtype=torch.int64)
         vlens_i64 = vlens.to(dtype=torch.int64)
-        max_len = int(vlens_i64.max().item())
+        max_len = block
         if max_len > 0:
             rows = torch.arange(max_len, dtype=torch.int64, device=device)[None, :]
             valid_mask = rows < vlens_i64[:, None]
@@ -646,6 +646,7 @@ class DFlashVerifyInput(SpecInput):
                 target_predict_flat=target_predict_flat,
                 actual_verify_lens=actual_vlens,
                 start_offsets=start_offsets_t,
+                max_verify_len=int(self.draft_token_num),
             )
 
             verify_host = torch.cat(
@@ -764,11 +765,7 @@ class DFlashVerifyInput(SpecInput):
                     alloc_vlens_i64 = alloc_vlens.to(dtype=torch.int64, device=device)
                     commit_lens_i64 = commit_lens.to(torch.int64)
                     alloc_starts = start_offsets_t.to(torch.int64)
-                    max_alloc = (
-                        int(alloc_vlens_i64.max().item())
-                        if alloc_vlens_i64.numel() > 0
-                        else 0
-                    )
+                    max_alloc = int(self.draft_token_num)
                     if max_alloc > 0:
                         alloc_rows = torch.arange(
                             max_alloc, dtype=torch.int64, device=device
@@ -820,11 +817,7 @@ class DFlashVerifyInput(SpecInput):
             )
             if hidden_flat is not None:
                 commit_lens_i64 = commit_lens.to(torch.int64)
-                max_commit = (
-                    int(commit_lens_i64.max().item())
-                    if commit_lens_i64.numel() > 0
-                    else 0
-                )
+                max_commit = int(self.draft_token_num)
                 if max_commit > 0:
                     hidden_rows = torch.arange(
                         max_commit, dtype=torch.int64, device=device

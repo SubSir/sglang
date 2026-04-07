@@ -177,7 +177,7 @@ def main(
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
     os.makedirs("cuda_graph_" + base_results_dir, exist_ok=True)
 
-    for disable_cuda_graph in [True,]:
+    for disable_cuda_graph in [False,]:
         if disable_cuda_graph:
             results_dir = "no_cuda_graph_" + base_results_dir
         else:
