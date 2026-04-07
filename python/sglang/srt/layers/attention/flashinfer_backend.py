@@ -845,27 +845,6 @@ class FlashInferAttnBackend(AttentionBackend):
         ):
             ragged_to_dense_idx = forward_batch.spec_info.attn_ragged_to_dense_idx
             dense_num_tokens = int(forward_batch.spec_info.attn_dense_num_tokens)
-            can_sync_debug = (
-                not torch.cuda.is_current_stream_capturing()
-                if torch.cuda.is_available()
-                else True
-            )
-            if DFLASH_VERIFY_DEBUG_CHECKS:
-                if ragged_to_dense_idx.dtype != torch.int64:
-                    raise RuntimeError(
-                        f"DFLASH verify dense mapping dtype mismatch: {ragged_to_dense_idx.dtype}, expected torch.int64."
-                    )
-                if ragged_to_dense_idx.numel() != q.shape[0]:
-                    raise RuntimeError(
-                        f"DFLASH verify dense mapping size mismatch: idx_numel={ragged_to_dense_idx.numel()}, q_rows={q.shape[0]}."
-                    )
-                if can_sync_debug and ragged_to_dense_idx.numel() > 0:
-                    idx_min = int(ragged_to_dense_idx.min().item())
-                    idx_max = int(ragged_to_dense_idx.max().item())
-                    if idx_min < 0 or idx_max >= dense_num_tokens:
-                        raise RuntimeError(
-                            f"DFLASH verify dense mapping out of range: idx_min={idx_min}, idx_max={idx_max}, dense_num_tokens={dense_num_tokens}."
-                        )
             q_dense = q.new_zeros((dense_num_tokens, q.shape[1]))
             q_dense[ragged_to_dense_idx] = q
             q = q_dense
