@@ -79,7 +79,6 @@ def run_dataset_sweep(
 
     max_concurrency = 32
     # DFLASH b16 * max_concurrency(5) => 80
-    piecewise_cuda_graph_max_tokens = 16 * max_concurrency
 
     args = [
         "bench_dflash_sweep.py",
@@ -92,9 +91,6 @@ def run_dataset_sweep(
         # "--samples-per-concurrency-base", "8",
         "--attention-backends", "fa3",
         "--mem-fraction-static", "0.7",
-        "--enable-piecewise-cuda-graph",
-        "--piecewise-cuda-graph-max-tokens",
-        str(piecewise_cuda_graph_max_tokens)
     ]
 
     if skip_baseline:
@@ -181,7 +177,7 @@ def main(
     os.makedirs("no_cuda_graph_" + base_results_dir, exist_ok=True)
     os.makedirs("cuda_graph_" + base_results_dir, exist_ok=True)
 
-    for disable_cuda_graph in [False]:
+    for disable_cuda_graph in [True,]:
         if disable_cuda_graph:
             results_dir = "no_cuda_graph_" + base_results_dir
         else:
