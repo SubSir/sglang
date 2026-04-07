@@ -2538,6 +2538,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         prefer_piecewise_dflash_verify = (
             forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY
             and self.piecewise_cuda_graph_runner is not None
+            and not self.spec_algorithm.is_dflash()
         )
         # Keep decode cuda-graph runner for TARGET_VERIFY warmup/capture.
         use_device_graph_runner = not prefer_piecewise_dflash_verify

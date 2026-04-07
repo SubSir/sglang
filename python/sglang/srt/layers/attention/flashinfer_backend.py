@@ -38,6 +38,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+DFLASH_VERIFY_DEBUG_CHECKS = (
+    os.environ.get("SGLANG_DFLASH_VERIFY_DEBUG_CHECKS", "0") == "1"
+)
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -466,6 +469,21 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
             )
+        elif forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY:
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_wrappers_verify,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=forward_batch.spec_info,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_verify, False, False
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -555,6 +573,19 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        dflash_capture_tokens = (
+            int(getattr(spec_info, "num_tokens_padded", -1))
+            if spec_info is not None
+            else -1
+        )
+        prefill_graph_key = (
+            (bs, dflash_capture_tokens)
+            if (
+                forward_mode == ForwardMode.DFLASH_VERIFY
+                and dflash_capture_tokens > 0
+            )
+            else bs
+        )
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -590,7 +621,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers[i].begin_forward = partial(
                     fast_decode_plan, decode_wrappers[i]
                 )
-        elif forward_mode.is_target_verify():
+        elif (
+            forward_mode.is_target_verify()
+            or forward_mode == ForwardMode.DFLASH_VERIFY
+        ):
             # FlashInfer's prefill wrapper decides mask mode based on whether
             # `custom_mask_buf` is initialized (not whether a custom mask is provided).
             # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
@@ -634,7 +668,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[prefill_graph_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -709,6 +743,19 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        dflash_capture_tokens = (
+            int(getattr(spec_info, "num_tokens_padded", -1))
+            if spec_info is not None
+            else -1
+        )
+        prefill_graph_key = (
+            (bs, dflash_capture_tokens)
+            if (
+                forward_mode == ForwardMode.DFLASH_VERIFY
+                and dflash_capture_tokens > 0
+            )
+            else bs
+        )
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -721,14 +768,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        elif forward_mode.is_target_verify():
+        elif (
+            forward_mode.is_target_verify()
+            or forward_mode == ForwardMode.DFLASH_VERIFY
+        ):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[prefill_graph_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -783,6 +833,42 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
 
+
+        ragged_to_dense_idx = None
+        if (
+            forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY
+            and forward_batch.spec_info is not None
+            and getattr(forward_batch.spec_info, "attn_ragged_to_dense_idx", None)
+            is not None
+            and int(getattr(forward_batch.spec_info, "attn_dense_num_tokens", -1))
+            > q.shape[0]
+        ):
+            ragged_to_dense_idx = forward_batch.spec_info.attn_ragged_to_dense_idx
+            dense_num_tokens = int(forward_batch.spec_info.attn_dense_num_tokens)
+            can_sync_debug = (
+                not torch.cuda.is_current_stream_capturing()
+                if torch.cuda.is_available()
+                else True
+            )
+            if DFLASH_VERIFY_DEBUG_CHECKS:
+                if ragged_to_dense_idx.dtype != torch.int64:
+                    raise RuntimeError(
+                        f"DFLASH verify dense mapping dtype mismatch: {ragged_to_dense_idx.dtype}, expected torch.int64."
+                    )
+                if ragged_to_dense_idx.numel() != q.shape[0]:
+                    raise RuntimeError(
+                        f"DFLASH verify dense mapping size mismatch: idx_numel={ragged_to_dense_idx.numel()}, q_rows={q.shape[0]}."
+                    )
+                if can_sync_debug and ragged_to_dense_idx.numel() > 0:
+                    idx_min = int(ragged_to_dense_idx.min().item())
+                    idx_max = int(ragged_to_dense_idx.max().item())
+                    if idx_min < 0 or idx_max >= dense_num_tokens:
+                        raise RuntimeError(
+                            f"DFLASH verify dense mapping out of range: idx_min={idx_min}, idx_max={idx_max}, dense_num_tokens={dense_num_tokens}."
+                        )
+            q_dense = q.new_zeros((dense_num_tokens, q.shape[1]))
+            q_dense[ragged_to_dense_idx] = q
+            q = q_dense
         q = q.contiguous()
         if not self.forward_metadata.use_ragged:
             if k is not None:
@@ -874,7 +960,25 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        if ragged_to_dense_idx is not None:
+            can_sync_debug = (
+                not torch.cuda.is_current_stream_capturing()
+                if torch.cuda.is_available()
+                else True
+            )
+            if (
+                DFLASH_VERIFY_DEBUG_CHECKS
+                and can_sync_debug
+                and ragged_to_dense_idx.numel() > 0
+            ):
+                idx_max = int(ragged_to_dense_idx.max().item())
+                if idx_max >= int(o.shape[0]):
+                    raise RuntimeError(
+                        f"DFLASH verify output gather out of range: idx_max={idx_max}, o_rows={int(o.shape[0])}."
+                    )
+            o = o[ragged_to_dense_idx]
+        return o
 
     def forward_decode(
         self,

@@ -799,10 +799,13 @@ class DFlashWorker:
 
         # We are in ragged verify construction path right now. Do not rely on the
         # incoming batch.forward_mode (it is usually DECODE here and will be set to
-        # DFLASH_VERIFY later in this function), otherwise piecewise CUDA graph is
+        # DFLASH_VERIFY later in this function), otherwise graphability checks are
         # spuriously disabled.
-        _pcg_runner = self.model_runner.piecewise_cuda_graph_runner
-        _can_use_piecewise_graph = _pcg_runner is not None
+        _cg_runner = self.model_runner.graph_runner
+        _can_use_cuda_graph = bool(
+            _cg_runner is not None
+            and getattr(_cg_runner, "_is_dflash_ragged_verify_target", False)
+        )
         block_size_i = int(self.block_size)
 
         # Keep verify length computations on GPU; move to CPU only where Python lists
@@ -814,9 +817,13 @@ class DFlashWorker:
         total_verify_tokens_actual = int(verify_len_i32_actual.sum().item())
         target_total_tokens = total_verify_tokens_actual
         padding_tokens = 0
-        if _can_use_piecewise_graph:
-            # DFLASH verify shape padding is only needed for piecewise cuda graph buckets.
-            cuda_graph_shapes = list(self.server_args.piecewise_cuda_graph_tokens)
+        if _can_use_cuda_graph:
+            if _can_use_cuda_graph and hasattr(
+                _cg_runner, "_get_dflash_capture_tokens_for_bs"
+            ):
+                cuda_graph_shapes = list(_cg_runner._get_dflash_capture_tokens_for_bs(bs))
+            else:
+                cuda_graph_shapes = list(self.server_args.piecewise_cuda_graph_tokens)
 
             _, padding_tokens = DFlashVerifyInput.find_nearest_shape(
                 total_verify_tokens_actual,
@@ -920,8 +927,8 @@ class DFlashWorker:
             verify_token_lens=verify_len_i32,
             verify_start_offsets=verify_start_offsets_t,
             verify_token_lens_actual=verify_len_i32_actual,
-            use_cuda_graph=_can_use_piecewise_graph,
-            num_tokens_padded=total_verify_tokens if _can_use_piecewise_graph else -1,
+            use_cuda_graph=_can_use_cuda_graph,
+            num_tokens_padded=total_verify_tokens if _can_use_cuda_graph else -1,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend

@@ -440,6 +440,8 @@ class CudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
+        self._last_capture_spec_info = None
+        self._dflash_capture_spec_info_by_graph_key: Dict[str, object] = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -476,12 +478,29 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        self._dflash_block_verify_enabled = bool(
+            int(os.environ.get("SGLANG_DFLASH_BLOCK_VERIFY", "1"))
+        )
+        self._is_dflash_ragged_verify_target = (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and not self._dflash_block_verify_enabled
+        )
+        self._debug_disable_dflash_verify_cudagraph_replay = get_bool_env_var(
+            "SGLANG_DFLASH_VERIFY_DEBUG_DISABLE_CUDAGRAPH_REPLAY"
+        )
+        self._dflash_verify_capture_multipliers = [6, 9, 12, 16]
+        self._dflash_verify_token_buckets_by_bs: Dict[int, list[int]] = {}
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
-            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.capture_forward_mode = (
+                ForwardMode.DFLASH_VERIFY
+                if self._is_dflash_ragged_verify_target
+                else ForwardMode.TARGET_VERIFY
+            )
             self.num_tokens_per_bs = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
@@ -585,6 +604,25 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self._is_dflash_ragged_verify_target:
+            if self._debug_disable_dflash_verify_cudagraph_replay:
+                return False
+            if forward_batch.forward_mode != ForwardMode.DFLASH_VERIFY:
+                raise ValueError("This should not happen")
+            if forward_batch.batch_size not in self.capture_bs:
+                return False
+            static_num_tokens = self._select_dflash_static_num_tokens(
+                bs=forward_batch.batch_size,
+                raw_num_token=len(forward_batch.input_ids),
+            )
+            graph_key = self._build_dflash_graph_key(
+                bs=forward_batch.batch_size,
+                num_tokens=static_num_tokens,
+            )
+            if self.enable_pdmux:
+                graph_key = f"{get_current_stream_idx()}_{graph_key}"
+            return graph_key in self.graphs
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -704,20 +742,48 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                if self._is_dflash_ragged_verify_target:
+                    for num_tokens in self._get_dflash_capture_tokens_for_bs(bs):
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=num_tokens,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(
+                                bs,
+                                forward,
+                                stream_idx,
+                                num_tokens_override=num_tokens,
+                            )
+                            key = (
+                                self._build_dflash_graph_key(bs=bs, num_tokens=num_tokens)
+                                if stream_idx is None
+                                else f"{stream_idx}_{self._build_dflash_graph_key(bs=bs, num_tokens=num_tokens)}"
+                            )
+                            self.graphs[key] = graph
+                            self.output_buffers[key] = output_buffers
+                            self._dflash_capture_spec_info_by_graph_key[key] = (
+                                self._last_capture_spec_info
+                            )
+                else:
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                        # For pd_multiplexing, we need to save the graph and output buffers
+                        key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -756,13 +822,100 @@ class CudaGraphRunner:
     def _create_device_graph(self):
         return torch.cuda.CUDAGraph()
 
+    def _sync_dflash_capture_spec_info_inplace(
+        self, graph_key: str, runtime_spec_info: object
+    ) -> None:
+        captured_spec_info = self._dflash_capture_spec_info_by_graph_key.get(graph_key)
+        if captured_spec_info is None:
+            raise RuntimeError(
+                f"DFLASH verify cuda graph: missing captured spec_info for graph_key={graph_key}."
+            )
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        if not isinstance(runtime_spec_info, DFlashVerifyInput):
+            raise RuntimeError(
+                "DFLASH verify cuda graph requires runtime DFlashVerifyInput spec_info."
+            )
+        if not isinstance(captured_spec_info, DFlashVerifyInput):
+            raise RuntimeError(
+                "DFLASH verify cuda graph captured spec_info has unexpected type."
+            )
+
+        def _copy_with_padding(
+            dst: Optional[torch.Tensor],
+            src: Optional[torch.Tensor],
+            *,
+            pad_value: int = 0,
+        ) -> Optional[torch.Tensor]:
+            if dst is None or src is None:
+                return src
+            src_cast = src.to(device=dst.device, dtype=dst.dtype)
+            if src_cast.numel() > dst.numel():
+                raise RuntimeError(
+                    "DFLASH verify cuda graph: runtime spec tensor exceeds captured capacity. "
+                    f"graph_key={graph_key}, src_numel={src_cast.numel()}, dst_numel={dst.numel()}."
+                )
+            if src_cast.numel() > 0:
+                dst[: src_cast.numel()].copy_(src_cast)
+            if dst.numel() > src_cast.numel():
+                dst[src_cast.numel() :].fill_(pad_value)
+            return dst
+
+        # Replay uses the captured forward_batch/spec_info object, so we must update
+        # tensor contents in-place (do not swap to new runtime tensor objects).
+        captured_spec_info.draft_token = _copy_with_padding(
+            captured_spec_info.draft_token,
+            runtime_spec_info.draft_token,
+            pad_value=0,
+        )
+        captured_spec_info.positions = _copy_with_padding(
+            captured_spec_info.positions,
+            runtime_spec_info.positions,
+            pad_value=0,
+        )
+        captured_spec_info.verify_token_lens = _copy_with_padding(
+            captured_spec_info.verify_token_lens,
+            runtime_spec_info.verify_token_lens,
+            pad_value=0,
+        )
+        captured_spec_info.verify_token_lens_actual = _copy_with_padding(
+            captured_spec_info.verify_token_lens_actual,
+            runtime_spec_info.verify_token_lens_actual,
+            pad_value=0,
+        )
+        captured_spec_info.verify_start_offsets = _copy_with_padding(
+            captured_spec_info.verify_start_offsets,
+            runtime_spec_info.verify_start_offsets,
+            pad_value=0,
+        )
+        captured_spec_info.verify_start_offsets_cpu = (
+            runtime_spec_info.verify_start_offsets_cpu
+        )
+        captured_spec_info.attn_ragged_to_dense_idx = _copy_with_padding(
+            captured_spec_info.attn_ragged_to_dense_idx,
+            runtime_spec_info.attn_ragged_to_dense_idx,
+            pad_value=0,
+        )
+        captured_spec_info.attn_dense_num_tokens = runtime_spec_info.attn_dense_num_tokens
+        captured_spec_info.num_tokens_padded = runtime_spec_info.num_tokens_padded
+        captured_spec_info.use_cuda_graph = runtime_spec_info.use_cuda_graph
+        captured_spec_info.custom_mask = runtime_spec_info.custom_mask
+
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        num_tokens_override: Optional[int] = None,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = (
+            int(num_tokens_override)
+            if num_tokens_override is not None
+            else bs * self.num_tokens_per_bs
+        )
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -820,7 +973,8 @@ class CudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = self.get_spec_info(num_tokens, bs)
+        self._last_capture_spec_info = spec_info
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -991,10 +1145,23 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        raw_num_token = (
+            len(forward_batch.input_ids)
+            if self._is_dflash_ragged_verify_target
+            else raw_bs * self.num_tokens_per_bs
+        )
 
         # Pad
-        if self.require_mlp_tp_gather:
+        if self._is_dflash_ragged_verify_target:
+            if raw_bs not in self.capture_bs:
+                raise RuntimeError(
+                    f"DFLASH verify cuda graph: unsupported batch size {raw_bs}, capture_bs={self.capture_bs}."
+                )
+            bs = raw_bs
+            static_num_token = self._select_dflash_static_num_tokens(
+                bs=bs, raw_num_token=raw_num_token
+            )
+        elif self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
@@ -1004,9 +1171,12 @@ class CudaGraphRunner:
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
+            bs = self.capture_bs[index]
+            static_num_token = bs * self.num_tokens_per_bs
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
+            bs = self.capture_bs[index]
+            static_num_token = bs * self.num_tokens_per_bs
 
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
@@ -1022,6 +1192,58 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self._is_dflash_ragged_verify_target and static_num_token > raw_num_token:
+            buffers.input_ids[raw_num_token:static_num_token].zero_()
+            buffers.positions[raw_num_token:static_num_token].zero_()
+            buffers.out_cache_loc[raw_num_token:static_num_token].zero_()
+            if forward_batch.mrope_positions is not None:
+                buffers.mrope_positions[:, raw_num_token:static_num_token].zero_()
+        if (
+            self._is_dflash_ragged_verify_target
+            and forward_batch.spec_info is not None
+            and hasattr(forward_batch.spec_info, "num_tokens_padded")
+        ):
+            forward_batch.spec_info.num_tokens_padded = static_num_token
+        if (
+            self._is_dflash_ragged_verify_target
+            and get_bool_env_var("SGLANG_DFLASH_VERIFY_DEBUG_CHECKS")
+            and forward_batch.spec_info is not None
+        ):
+            dense_tokens = int(
+                getattr(forward_batch.spec_info, "attn_dense_num_tokens", -1)
+            )
+            ragged_to_dense_idx = getattr(
+                forward_batch.spec_info, "attn_ragged_to_dense_idx", None
+            )
+            if ragged_to_dense_idx is not None:
+                if ragged_to_dense_idx.numel() != raw_num_token:
+                    raise RuntimeError(
+                        f"DFLASH verify mapping size mismatch before replay: idx_numel={ragged_to_dense_idx.numel()}, raw_num_token={raw_num_token}, bs={bs}, static_num_token={static_num_token}."
+                    )
+                if dense_tokens <= 0:
+                    raise RuntimeError(
+                        f"DFLASH verify invalid attn_dense_num_tokens={dense_tokens}."
+                    )
+                idx_min = int(ragged_to_dense_idx.min().item())
+                idx_max = int(ragged_to_dense_idx.max().item())
+                if idx_min < 0 or idx_max >= dense_tokens:
+                    raise RuntimeError(
+                        f"DFLASH verify mapping out of range before replay: idx_min={idx_min}, idx_max={idx_max}, dense_tokens={dense_tokens}, bs={bs}, static_num_token={static_num_token}."
+                    )
+        if self._is_dflash_ragged_verify_target:
+            dflash_key = self._build_dflash_graph_key(bs=bs, num_tokens=static_num_token)
+            graph_key = (
+                f"{get_current_stream_idx()}_{dflash_key}"
+                if self.enable_pdmux
+                else dflash_key
+            )
+            if forward_batch.spec_info is None:
+                raise RuntimeError(
+                    "DFLASH verify cuda graph requires runtime spec_info before replay."
+                )
+            self._sync_dflash_capture_spec_info_inplace(
+                graph_key=graph_key, runtime_spec_info=forward_batch.spec_info
+            )
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker
@@ -1059,6 +1281,7 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.static_num_token = static_num_token
 
     def replay(
         self,
@@ -1084,25 +1307,48 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        if self.enable_pdmux:
+        if self._is_dflash_ragged_verify_target:
+            dflash_key = self._build_dflash_graph_key(
+                bs=self.bs, num_tokens=self.static_num_token
+            )
+            if self.enable_pdmux:
+                graph_key = f"{get_current_stream_idx()}_{dflash_key}"
+            else:
+                graph_key = dflash_key
+        elif self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
+        try:
+            self.graphs[graph_key].replay()
+        except Exception as e:
+            if self._is_dflash_ragged_verify_target:
+                raise RuntimeError(
+                    "DFLASH verify cuda-graph replay failed. "
+                    f"graph_key={graph_key}, raw_bs={self.raw_bs}, raw_num_token={self.raw_num_token}, "
+                    f"padded_bs={self.bs}, static_num_token={self.static_num_token}. "
+                    "Set SGLANG_DFLASH_VERIFY_DEBUG_DISABLE_CUDAGRAPH_REPLAY=1 for eager fallback."
+                ) from e
+            raise
         output = self.output_buffers[graph_key]
+        replay_num_token = (
+            self.static_num_token
+            if self._is_dflash_ragged_verify_target
+            else self.raw_num_token
+        )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
                 full_logits = (
-                    output.full_logits[: self.raw_num_token]
+                    output.full_logits[: replay_num_token]
                     if output.full_logits is not None
                     else None
                 )
             else:
                 full_logits = None
                 next_token_logits = (
-                    output.next_token_logits[: self.raw_num_token]
+                    output.next_token_logits[: replay_num_token]
                     if output.next_token_logits is not None
                     else None
                 )
@@ -1111,7 +1357,7 @@ class CudaGraphRunner:
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
+                    output.hidden_states[: replay_num_token]
                     if output.hidden_states is not None
                     else None
                 ),
@@ -1120,7 +1366,7 @@ class CudaGraphRunner:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, bs: Optional[int] = None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1157,21 +1403,87 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
-            spec_info = DFlashVerifyInput(
-                draft_token=None,
-                positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                custom_mask=(
-                    None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
-                    else self.buffers.custom_mask
-                ),
-                capture_hidden_mode=(
-                    CaptureHiddenMode.NULL
-                    if self.model_runner.is_draft_worker
-                    else CaptureHiddenMode.FULL
-                ),
+            draft_token_num = int(
+                self.model_runner.server_args.speculative_num_draft_tokens
             )
+            if self._is_dflash_ragged_verify_target and draft_token_num > 0:
+                bs_capture = int(bs) if bs is not None else 0
+                if bs_capture <= 0:
+                    raise RuntimeError(
+                        f"DFLASH ragged verify capture requires valid batch size, got bs={bs_capture}."
+                    )
+                if num_tokens % bs_capture != 0:
+                    raise RuntimeError(
+                        f"DFLASH ragged verify capture expects num_tokens to be divisible by bs, "
+                        f"got num_tokens={num_tokens}, bs={bs_capture}."
+                    )
+                per_req_len = num_tokens // bs_capture
+                if per_req_len <= 0 or per_req_len > draft_token_num:
+                    raise RuntimeError(
+                        f"DFLASH ragged verify capture per-request length out of range: "
+                        f"per_req_len={per_req_len}, draft_token_num={draft_token_num}."
+                    )
+                verify_lens = torch.full(
+                    (bs_capture,),
+                    per_req_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                verify_starts = torch.arange(
+                    0,
+                    num_tokens,
+                    step=per_req_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                ragged_to_dense = torch.empty(
+                    (num_tokens,), dtype=torch.int64, device=self.device
+                )
+                for i in range(bs_capture):
+                    start_i = i * per_req_len
+                    ragged_to_dense[start_i : start_i + per_req_len] = torch.arange(
+                        i * draft_token_num,
+                        i * draft_token_num + per_req_len,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                spec_info = DFlashVerifyInput(
+                    draft_token=torch.zeros(
+                        (num_tokens,), dtype=torch.int64, device=self.device
+                    ),
+                    positions=None,
+                    draft_token_num=draft_token_num,
+                    verify_token_lens=verify_lens,
+                    verify_start_offsets=verify_starts,
+                    verify_start_offsets_cpu=verify_starts.cpu().tolist(),
+                    custom_mask=None,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.model_runner.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                    attn_ragged_to_dense_idx=ragged_to_dense,
+                    attn_dense_num_tokens=bs_capture * draft_token_num,
+                    num_tokens_padded=num_tokens,
+                    use_cuda_graph=True,
+                )
+            else:
+                spec_info = DFlashVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=draft_token_num,
+                    custom_mask=(
+                        None
+                        if (self.model_runner.is_draft_worker or not build_custom_mask)
+                        else self.buffers.custom_mask
+                    ),
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.model_runner.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                    num_tokens_padded=-1,
+                )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -1188,6 +1500,32 @@ class CudaGraphRunner:
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
+
+    def _get_dflash_capture_tokens_for_bs(self, bs: int) -> list[int]:
+        buckets = self._dflash_verify_token_buckets_by_bs.get(bs)
+        if buckets is not None:
+            return buckets
+        bs_i = int(bs)
+        buckets = sorted(
+            set(
+                bs_i * int(multiplier)
+                for multiplier in self._dflash_verify_capture_multipliers
+            )
+        )
+        self._dflash_verify_token_buckets_by_bs[bs_i] = buckets
+        return buckets
+
+    def _select_dflash_static_num_tokens(self, *, bs: int, raw_num_token: int) -> int:
+        buckets = self._get_dflash_capture_tokens_for_bs(bs)
+        idx = bisect.bisect_left(buckets, int(raw_num_token))
+        if idx >= len(buckets):
+            raise RuntimeError(
+                f"DFLASH verify cuda graph: raw_num_token={raw_num_token} exceeds captured buckets={buckets} for bs={bs}."
+            )
+        return buckets[idx]
+
+    def _build_dflash_graph_key(self, *, bs: int, num_tokens: int) -> str:
+        return f"{bs}x{num_tokens}"
 
 
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (

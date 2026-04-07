@@ -172,10 +172,9 @@ class PiecewiseCudaGraphRunner:
             "eager",
             "inductor",
         ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
-        self._capture_dflash_verify_only = (
-            self.model_runner.spec_algorithm.is_dflash()
-            and not self.model_runner.is_draft_worker
-        )
+        # DFLASH verify should use full CUDA graph runner.
+        # Keep piecewise runner focused on EXTEND path.
+        self._capture_dflash_verify_only = False
 
         self.compile_config = CompilationConfig(
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
@@ -453,6 +452,11 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and forward_batch.forward_mode == ForwardMode.DFLASH_VERIFY
+        ):
+            return False
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
