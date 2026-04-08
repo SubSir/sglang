@@ -575,6 +575,9 @@ class DFlashWorker:
         if draft_prefix_lens.device != self.device:
             draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
 
+        # Launch sum early so the GPU computes it in parallel with subsequent work.
+        _draft_seq_lens_sum = draft_prefix_lens.sum()
+
         positions_2d = self._draft_block_positions_buf[:bs]
         torch.add(
             target_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d
@@ -626,7 +629,7 @@ class DFlashWorker:
             # derive kv_len by adding `draft_token_num`.
             draft_spec_info = self._draft_block_spec_info
             seq_lens = draft_prefix_lens
-            seq_lens_sum = int(draft_prefix_lens.sum().item())
+            seq_lens_sum = int(_draft_seq_lens_sum.item())
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
