@@ -484,11 +484,10 @@ class DFlashVerifyInput(SpecInput):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, self.draft_token_num, -1)
-        segments: List[torch.Tensor] = []
-        for i, ln in enumerate(commit_lens_cpu):
-            if ln > 0:
-                segments.append(hidden[i, :ln, :])
-        next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
+        # Vectorized gather: select first commit_lens[i] rows per request.
+        offsets = torch.arange(self.draft_token_num, device=device)[None, :]
+        gather_mask = offsets < commit_lens[:, None]
+        next_target_hidden = hidden[gather_mask]
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None
