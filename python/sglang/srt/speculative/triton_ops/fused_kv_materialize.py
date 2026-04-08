@@ -16,7 +16,7 @@
 Combines: KV projection (cuBLAS) + RMSNorm + RoPE (Triton), then pool-managed KV writes.
 """
 
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import triton
@@ -255,6 +255,7 @@ class FusedKVMaterializeHelper:
         ctx_hidden: torch.Tensor,
         positions: torch.Tensor,
         write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+        max_position: Optional[int] = None,
     ) -> None:
         """Materialize KV cache for all layers using batched projection."""
         total_ctx = ctx_hidden.shape[0]
@@ -269,7 +270,8 @@ class FusedKVMaterializeHelper:
                 f"positions={positions.numel()}, total_ctx={total_ctx}."
             )
 
-        max_position = int(positions.max().item())
+        if max_position is None:
+            max_position = int(positions.max().item())
         ensure_cos_sin_cache_length = getattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length", None
         )

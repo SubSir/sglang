@@ -968,9 +968,12 @@ class DFlashWorker:
                 )
 
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                # Compute max_position from CPU data to avoid GPU sync in materialize.
+                max_pos_bound = int(batch.seq_lens_cpu.max()) + max_ctx - 1
                 try:
                     self._append_target_hidden_fused(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
+                        ctx_hidden, ctx_positions, ctx_cache_loc,
+                        max_position=max_pos_bound,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1039,6 +1042,7 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        max_position: int | None = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
@@ -1061,6 +1065,7 @@ class DFlashWorker:
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
+            max_position=max_position,
         )
 
     def _update_target_mamba_state_after_verify(
