@@ -694,23 +694,15 @@ class DFlashWorker:
         bucket_indices = torch.searchsorted(bucket_sizes_t, dyn_raw)
         bucket_indices.clamp_(max=len(BUCKET_SIZES) - 1)
         per_request_draft_lens = bucket_sizes_t[bucket_indices]
-        max_draft_token_num = int(per_request_draft_lens.max().item())
 
-        if max_draft_token_num < self.block_size:
-            draft_tokens_flat = (
-                draft_tokens[:, :max_draft_token_num].contiguous().reshape(-1)
-            )
-            positions_flat = (
-                positions_2d[:, :max_draft_token_num].contiguous().reshape(-1)
-            )
-        else:
-            draft_tokens_flat = draft_tokens.reshape(-1)
-            positions_flat = positions_2d.reshape(-1)
+        # Keep draft_token_num = block_size for CUDA graph compatibility (Phase 1).
+        # Only cap acceptance in verify() based on per_request_draft_lens.
+        positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens_flat,
-            positions=positions_flat,
-            draft_token_num=max_draft_token_num,
+            draft_token=draft_tokens.reshape(-1),
+            positions=positions,
+            draft_token_num=self.block_size,
             per_request_draft_lens=per_request_draft_lens,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
