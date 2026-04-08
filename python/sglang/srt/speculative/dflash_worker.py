@@ -664,12 +664,54 @@ class DFlashWorker:
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+
+        # --- Dynamic block size: estimate acceptance length from draft confidence ---
+        shard = lm_head.shard_indices
+        num_org = int(shard.num_org_elements)
+        draft_hs_for_conf = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+        with torch.no_grad():
+            draft_logits_conf = torch.matmul(
+                draft_hs_for_conf.to(lm_head.weight.dtype),
+                lm_head.weight[:num_org].T,
+            )
+            max_logits = draft_logits_conf.max(dim=-1).values
+            log_denom = torch.logsumexp(draft_logits_conf, dim=-1)
+            confidence = torch.exp(max_logits - log_denom).view(bs, self.block_size - 1)
+            del draft_logits_conf, max_logits, log_denom
+
+        cumprod_conf = confidence.cumprod(dim=-1)
+        est_accept_len = 1.0 + cumprod_conf.sum(dim=-1)
+        del cumprod_conf, confidence
+
+        DYNAMIC_MARGIN = 2
+        BUCKET_SIZES = [4, 6, 8, 10, 12, 14, 16]
+        dyn_raw = (torch.ceil(est_accept_len).to(torch.int32) + DYNAMIC_MARGIN).clamp(
+            min=BUCKET_SIZES[0], max=self.block_size
+        )
+        bucket_sizes_t = torch.tensor(
+            BUCKET_SIZES, device=self.device, dtype=torch.int32
+        )
+        bucket_indices = torch.searchsorted(bucket_sizes_t, dyn_raw)
+        bucket_indices.clamp_(max=len(BUCKET_SIZES) - 1)
+        per_request_draft_lens = bucket_sizes_t[bucket_indices]
+        max_draft_token_num = int(per_request_draft_lens.max().item())
+
+        if max_draft_token_num < self.block_size:
+            draft_tokens_flat = (
+                draft_tokens[:, :max_draft_token_num].contiguous().reshape(-1)
+            )
+            positions_flat = (
+                positions_2d[:, :max_draft_token_num].contiguous().reshape(-1)
+            )
+        else:
+            draft_tokens_flat = draft_tokens.reshape(-1)
+            positions_flat = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=draft_tokens_flat,
+            positions=positions_flat,
+            draft_token_num=max_draft_token_num,
+            per_request_draft_lens=per_request_draft_lens,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend

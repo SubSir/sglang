@@ -164,6 +164,10 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # Per-request actual draft lengths for dynamic block size truncation.
+    # None means all requests use self.draft_token_num (no truncation).
+    per_request_draft_lens: torch.Tensor | None = None
+
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
@@ -380,6 +384,24 @@ class DFlashVerifyInput(SpecInput):
                 candidates=candidates,
                 target_predict=target_predict,
             )
+
+        # Cap accept_len for dynamic block size truncation
+        if self.per_request_draft_lens is not None:
+            max_accept = (self.per_request_draft_lens - 1).to(
+                dtype=accept_len.dtype, device=device
+            )
+            needs_cap = accept_len > max_accept
+            if needs_cap.any():
+                accept_len = torch.min(accept_len, max_accept)
+                # Recompute bonus for capped requests using target argmax
+                logits_2d = logits_output.next_token_logits.view(
+                    bs, self.draft_token_num, -1
+                )
+                row_idx = torch.arange(bs, device=device)
+                new_bonus = torch.argmax(
+                    logits_2d[row_idx, accept_len.to(torch.long)], dim=-1
+                ).to(torch.int64)
+                bonus = torch.where(needs_cap, new_bonus, bonus)
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(
