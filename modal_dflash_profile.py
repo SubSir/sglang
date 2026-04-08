@@ -11,23 +11,43 @@ import modal
 
 app = modal.App("sglang-dflash-profile")
 
-# Keep the same environment style as modal_dflash_sweep.py
+# Reuse base image configuration
 base_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "libnuma-dev")
 )
 
 local_image = (
-    base_image.run_commands(
-        "echo 21 > /tmp/build_time",
-        "git clone -b fa2_correct https://github.com/SubSir/sglang.git /root/sglang_local",
+    base_image
+    .run_commands(
+        "echo 60 > /tmp/build_time",
+        "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
+        "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
+    )
+)
+
+local_image = (
+    local_image
+    .add_local_dir(
+        "./python",
+        remote_path="/root/sglang_local/python_local",
+        copy=True,
+    )
+    .add_local_dir(
+        "./benchmark",
+        remote_path="/root/sglang_local/benchmark_local",
+        copy=True,
+    )
+    .run_commands(
+        "rm -rf /root/sglang_local/python && cp -r /root/sglang_local/python_local /root/sglang_local/python",
+        "rm -rf /root/sglang_local/benchmark && cp -r /root/sglang_local/benchmark_local /root/sglang_local/benchmark"
     )
 )
 
 
 @app.function(
-    gpu="H200",
+    gpu="B200",
     timeout=7200,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -38,13 +58,12 @@ def run_profile_once(
     draft_model: str = "z-lab/gpt-oss-20b-DFlash",
     host: str = "127.0.0.1",
     port: int = 30000,
-    num_prompts: int = 64,
-    random_input_len: int = 64,
-    random_output_len: int = 256,
+    num_prompts: int = 1024,
+    random_input_len: int = 512,
+    random_output_len: int = 2048,
     profile_dir: str = "/root/sglang/profile_log",
     k_online: bool = False,
     k_online_offset: int = 2,
-    k_online_warmup: int = 0,
     block_verify: bool = False,
 ) -> dict:
     """
@@ -57,7 +76,6 @@ def run_profile_once(
     env["SGLANG_TORCH_PROFILER_DIR"] = profile_dir
     env["SGLANG_DFLASH_K_ONLINE"] = "1" if k_online else "0"
     env["SGLANG_DFLASH_K_ONLINE_OFFSET"] = str(k_online_offset)
-    env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
 
     server_cmd = [
@@ -77,11 +95,11 @@ def run_profile_once(
         "--tp-size",
         "1",
         "--attention-backend",
-        "fa3",
+        "flashinfer",
         "--max-running-requests",
         "32",
         "--mem-fraction-static", "0.7",
-        "--enable-piecewise-cuda-graph",
+        "--enforce-piecewise-cuda-graph",
         "--piecewise-cuda-graph-max-tokens",
         str(16 * 32),
     ]
@@ -107,6 +125,10 @@ def run_profile_once(
         "--random-output-len",
         str(random_output_len),
         "--profile",
+        "--profile-start-step",
+        "1000",
+        "--profile-steps",
+        "200",
     ]
 
     server_proc = None
@@ -243,19 +265,20 @@ def run_profile_once(
 
 @app.local_entrypoint()
 def main(
-    target_model: str = "openai/gpt-oss-20b",
-    draft_model: str = "z-lab/gpt-oss-20b-DFlash",
+    target_model: str = "Qwen/Qwen3-8B",
+    draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
     output_dir: str = "profile_logs",
-    offset: int = 2,
-    warmup: int = 0,
+    offset: int = 3,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
     combinations = [
         (True, False),
-        (False, False),
         (False, True),
     ]
+
+    tasks: list[tuple[bool, bool, str]] = []
+    calls = []
 
     for k_online, block_verify in combinations:
         run_tag = "k_online" if k_online else "no_k_online"
@@ -263,29 +286,41 @@ def main(
         output_tar = os.path.join(
             output_dir,
             f"profile_{target_model.split('/')[-1]}_vs_{draft_model.split('/')[-1]}"
-            f"_off{offset}_w{warmup}_{run_tag}_{block_verify_tag}.tar.gz",
+            f"_{run_tag}_{block_verify_tag}.tar.gz",
         )
 
         print(
-            f"\n>>> Starting profile: k_online={k_online}, block_verify={block_verify}, "
+            f"\n>>> Spawning profile: k_online={k_online}, block_verify={block_verify}, "
             f"target={target_model}, draft={draft_model}"
         )
 
-        ret = run_profile_once.remote(
+        call = run_profile_once.spawn(
             target_model=target_model,
             draft_model=draft_model,
             k_online=k_online,
             k_online_offset=offset,
-            k_online_warmup=warmup,
             block_verify=block_verify,
         )
+        tasks.append((k_online, block_verify, output_tar))
+        calls.append(call)
 
-        with open(output_tar, "wb") as f:
-            f.write(ret["profile_tar_bytes"])
+    for (k_online, block_verify, output_tar), call in zip(tasks, calls):
+        try:
+            ret = call.get()
+            print(
+                f"\n>>> Completed profile: k_online={k_online}, block_verify={block_verify}"
+            )
+            with open(output_tar, "wb") as f:
+                f.write(ret["profile_tar_bytes"])
 
-        print(f"Saved profiler tarball to: {output_tar}")
-        print(f"Profiler file count: {ret['profile_file_count']}")
-        for p in ret["profile_files"]:
-            print(" -", p)
+            print(f"Saved profiler tarball to: {output_tar}")
+            print(f"Profiler file count: {ret['profile_file_count']}")
+            for p in ret["profile_files"]:
+                print(" -", p)
+        except Exception as e:
+            print(
+                f"\n>>> Failed profile: k_online={k_online}, "
+                f"block_verify={block_verify}. Error: {e}"
+            )
 
     print("\nAll profile runs finished.")
