@@ -117,17 +117,18 @@ class DFlashDraftInput(SpecInput):
         seg_start = start[new_indices]
         seg_lens = old_ctx_lens[new_indices].to(torch.int64)
 
-        max_len = int(seg_lens.max().item()) if seg_lens.numel() > 0 else 0
-        if max_len <= 0:
+        if seg_lens.numel() == 0:
             self.target_hidden = old_target_hidden[:0]
             return
 
-        r = torch.arange(max_len, device=old_ctx_lens.device, dtype=torch.int64)[
-            None, :
-        ]
-        pos2d = seg_start[:, None] + r
-        mask = r < seg_lens[:, None]
-        flat_pos = pos2d[mask]
+        seg_prefix = torch.cumsum(seg_lens, dim=0) - seg_lens
+        flat_seg_start = torch.repeat_interleave(seg_start, seg_lens)
+        if flat_seg_start.numel() == 0:
+            self.target_hidden = old_target_hidden[:0]
+            return
+        flat_seg_prefix = torch.repeat_interleave(seg_prefix, seg_lens)
+        flat_global_idx = torch.cumsum(torch.ones_like(flat_seg_start), dim=0) - 1
+        flat_pos = flat_seg_start + (flat_global_idx - flat_seg_prefix)
         self.target_hidden = (
             old_target_hidden.index_select(0, flat_pos)
             if flat_pos.numel() > 0
@@ -249,57 +250,6 @@ class DFlashVerifyInput(SpecInput):
         """Backward-compatible wrapper for DFLASH CUDA-graph shape lookup."""
         return DFlashVerifyInput.find_nearest_shape(actual_token_num, cuda_graph_shapes)
 
-    def pad_for_cuda_graph(
-        self,
-        block_size: int,
-        max_concurrency: int,
-        cuda_graph_shapes: Optional[List[int]] = None,
-    ) -> None:
-        """
-        Perform padding for cuda graph.
-
-        Args:
-            block_size: DFlash block size
-            max_concurrency: maximum concurrency
-            cuda_graph_shapes: precomputed cuda graph shapes (optional, recomputed if None)
-        """
-        if not self._is_ragged_verify():
-            return
-
-        if cuda_graph_shapes is None:
-            cuda_graph_shapes = self.get_cuda_graph_verify_shapes(
-                block_size, max_concurrency
-            )
-
-        # Save the actual verify_token_lens
-        self.verify_token_lens_actual = self.verify_token_lens.clone()
-
-        # Calculate the actual total token count
-        actual_token_num = int(self.verify_token_lens.sum().item())
-
-        # Find the nearest cuda graph shape
-        nearest_shape, padding_tokens = self.find_nearest_cuda_graph_shape(
-            actual_token_num, cuda_graph_shapes
-        )
-
-        self.num_tokens_padded = nearest_shape
-        self.use_cuda_graph = True
-
-        # If padding is needed, distribute extra tokens to some requests
-        if padding_tokens > 0:
-            # Simple strategy: evenly distribute extra tokens to requests
-            # Each request gets at most 1 extra token until padding is exhausted
-            vlen_cpu = self.verify_token_lens_actual.cpu().tolist()
-            bs = len(vlen_cpu)
-
-            # Round-robin distribution of padding tokens
-            for i in range(padding_tokens):
-                vlen_cpu[i % bs] += 1
-
-            self.verify_token_lens = torch.tensor(
-                vlen_cpu, dtype=torch.int32, device=self.verify_token_lens.device
-            )
-
     def prepare_for_verify(
         self,
         batch: ScheduleBatch,
@@ -339,49 +289,6 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         if self._is_ragged_verify():
-            # --- ragged verify path
-            if self.verify_token_lens.numel() != bs:
-                raise RuntimeError(
-                    f"DFLASH verify_token_lens shape mismatch: got {self.verify_token_lens.numel()} for bs={bs}."
-                )
-
-            # Hard consistency checks before entering attention.
-            total_verify_tokens = int(self.verify_token_lens.sum().item())
-            draft_token_len = int(self.draft_token.shape[0])
-            if total_verify_tokens != draft_token_len:
-                raise RuntimeError(
-                    "DFLASH ragged verify metadata mismatch: "
-                    f"sum(verify_token_lens)={total_verify_tokens} != len(draft_token)={draft_token_len}."
-                )
-
-            # Do not validate batch.extend_num_tokens here: in current scheduling flow
-            # it is assigned by DFlash worker after prepare_for_verify().
-
-            if self.verify_start_offsets is None and (
-                self.verify_start_offsets_cpu is None
-                or len(self.verify_start_offsets_cpu) != bs
-            ):
-                raise RuntimeError(
-                    "DFLASH ragged verify requires verify_start_offsets metadata with length == batch_size."
-                )
-            if DFLASH_VERIFY_DEBUG_CHECKS:
-                start_offsets_cpu = (
-                    self.verify_start_offsets.cpu().tolist()
-                    if self.verify_start_offsets is not None
-                    else self.verify_start_offsets_cpu
-                )
-                expected_offsets = []
-                running = 0
-                for v in self.verify_token_lens.tolist():
-                    expected_offsets.append(running)
-                    running += int(v)
-                if start_offsets_cpu != expected_offsets:
-                    raise RuntimeError(
-                        "DFLASH ragged verify metadata mismatch: verify_start_offsets is inconsistent "
-                        "with verify_token_lens used for forward. "
-                        f"got={start_offsets_cpu}, expected={expected_offsets}."
-                    )
-
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
             )
@@ -617,6 +524,7 @@ class DFlashVerifyInput(SpecInput):
                 target_predict_flat=target_predict_flat,
                 actual_verify_lens=actual_vlens,
                 start_offsets=start_offsets_t,
+                max_verify_len=int(self.draft_token_num),
             )
 
             verify_host = torch.cat(
@@ -721,11 +629,7 @@ class DFlashVerifyInput(SpecInput):
                 alloc_vlens_i64 = alloc_vlens.to(dtype=torch.int64, device=device)
                 commit_lens_i64 = commit_lens.to(torch.int64)
                 alloc_starts = start_offsets_t.to(torch.int64)
-                max_alloc = (
-                    int(alloc_vlens_i64.max().item())
-                    if alloc_vlens_i64.numel() > 0
-                    else 0
-                )
+                max_alloc = int(self.draft_token_num)
                 if max_alloc > 0:
                     alloc_rows = torch.arange(
                         max_alloc, dtype=torch.int64, device=device
@@ -777,11 +681,7 @@ class DFlashVerifyInput(SpecInput):
             )
             if hidden_flat is not None:
                 commit_lens_i64 = commit_lens.to(torch.int64)
-                max_commit = (
-                    int(commit_lens_i64.max().item())
-                    if commit_lens_i64.numel() > 0
-                    else 0
-                )
+                max_commit = int(self.draft_token_num)
                 if max_commit > 0:
                     hidden_rows = torch.arange(
                         max_commit, dtype=torch.int64, device=device

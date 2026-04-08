@@ -70,6 +70,7 @@ def accept_dflash_adaptive_verify(
     target_predict_flat: torch.Tensor,
     actual_verify_lens: torch.Tensor,
     start_offsets: torch.Tensor,
+    max_verify_len: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched greedy DFlash accept length, bonus token, and packed proposed ids (Triton, CUDA only).
 
@@ -81,6 +82,7 @@ def accept_dflash_adaptive_verify(
         target_predict_flat: Per-position argmax ids aligned with the verify forward, shape ``[total_tokens]``.
         actual_verify_lens: Per-request verify lengths (unpadded), shape ``[bs]``, int32/int64.
         start_offsets: Exclusive start index per request into the flat buffers, shape ``[bs]``, int32/int64.
+        max_verify_len: Upper bound for per-request verify length (e.g. draft block size).
 
     Returns:
         ``(accept_len, bonus, proposed_packed, proposed_count)``:
@@ -102,7 +104,7 @@ def accept_dflash_adaptive_verify(
         zc = torch.empty((0,), dtype=torch.int32, device=device)
         return z, zb, zp, zc
 
-    max_v = int(actual_verify_lens.max().item())
+    max_v = int(max_verify_len)
     if max_v <= 0:
         z = torch.zeros((bs,), dtype=torch.int32, device=device)
         zb = torch.zeros((bs,), dtype=torch.int64, device=device)
@@ -159,27 +161,22 @@ def prepare_dflash_adaptive_verify(
         return verify_len_padded, start_offsets, packed_tokens, packed_positions
 
     block_size_i = int(draft_tokens.shape[1])
-    current_sum = int(verify_len_padded.sum().item())
-    deficit = int(target_total_tokens) - current_sum
-    if deficit > 0:
-        remaining = deficit
-        while remaining > 0:
-            can_take = verify_len_padded < block_size_i
-            avail_idx = torch.nonzero(can_take, as_tuple=False).flatten()
-            if avail_idx.numel() == 0:
-                break
-            take_n = min(remaining, int(avail_idx.numel()))
-            sel = avail_idx[:take_n]
-            verify_len_padded.index_add_(
-                0,
-                sel,
-                torch.ones(
-                    (take_n,),
-                    dtype=verify_len_padded.dtype,
-                    device=verify_len_padded.device,
-                ),
-            )
-            remaining -= take_n
+    device = verify_len_padded.device
+    cap = (block_size_i - verify_len_padded).clamp(min=0)
+    deficit = torch.tensor(target_total_tokens, device=device, dtype=torch.int64) - (
+        verify_len_padded.to(torch.int64).sum()
+    )
+    max_add = cap.to(torch.int64).sum()
+    add_total = torch.minimum(deficit, max_add).clamp(min=0)
+    round_ids = torch.arange(block_size_i, device=device, dtype=torch.int64)[:, None]
+    # Equivalent to historical per-round `can_take = verify_len_padded < block_size_i`:
+    # request j can take one token in round r iff r < cap[j].
+    can_take_slots = round_ids < cap.to(torch.int64)[None, :]
+    # Preserve historical ordering: round-robin by round, then by request index.
+    slots = can_take_slots.flatten()
+    picked = slots & (slots.to(torch.int64).cumsum(dim=0) <= add_total)
+    extras = picked.view(block_size_i, bs).sum(dim=0).to(verify_len_padded.dtype)
+    verify_len_padded.add_(extras)
 
     lens_i64 = verify_len_padded.to(torch.int64)
     cum = lens_i64.cumsum(dim=0)
@@ -191,9 +188,8 @@ def prepare_dflash_adaptive_verify(
     ).to(dtype=start_offsets.dtype)
     start_offsets.copy_(starts)
 
-    max_a = int(lens_i64.max().item())
+    max_a = block_size_i
     if max_a > 0:
-        device = draft_tokens.device
         rows = torch.arange(max_a, device=device, dtype=torch.int64).unsqueeze(0).expand(
             bs, -1
         )
