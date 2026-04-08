@@ -189,6 +189,10 @@ class DFlashWorker:
                 self._mask_token_id_override,
             )
 
+        # Verify block size: truncate draft tokens before verification.
+        # Must match the CUDA graph capture size in cuda_graph_runner.py.
+        self.verify_block_size = min(self.block_size, 8)
+
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
@@ -665,45 +669,23 @@ class DFlashWorker:
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        # --- Dynamic block size: estimate acceptance length from draft confidence ---
-        shard = lm_head.shard_indices
-        num_org = int(shard.num_org_elements)
-        draft_hs_for_conf = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-        with torch.no_grad():
-            draft_logits_conf = torch.matmul(
-                draft_hs_for_conf.to(lm_head.weight.dtype),
-                lm_head.weight[:num_org].T,
+        # Truncate draft tokens to verify_block_size for reduced verify compute.
+        vbs = self.verify_block_size
+        if vbs < self.block_size:
+            draft_tokens_flat = (
+                draft_tokens[:, :vbs].contiguous().reshape(-1)
             )
-            max_logits = draft_logits_conf.max(dim=-1).values
-            log_denom = torch.logsumexp(draft_logits_conf, dim=-1)
-            confidence = torch.exp(max_logits - log_denom).view(bs, self.block_size - 1)
-            del draft_logits_conf, max_logits, log_denom
-
-        cumprod_conf = confidence.cumprod(dim=-1)
-        est_accept_len = 1.0 + cumprod_conf.sum(dim=-1)
-        del cumprod_conf, confidence
-
-        DYNAMIC_MARGIN = 2
-        BUCKET_SIZES = [4, 6, 8, 10, 12, 14, 16]
-        dyn_raw = (torch.ceil(est_accept_len).to(torch.int32) + DYNAMIC_MARGIN).clamp(
-            min=BUCKET_SIZES[0], max=self.block_size
-        )
-        bucket_sizes_t = torch.tensor(
-            BUCKET_SIZES, device=self.device, dtype=torch.int32
-        )
-        bucket_indices = torch.searchsorted(bucket_sizes_t, dyn_raw)
-        bucket_indices.clamp_(max=len(BUCKET_SIZES) - 1)
-        per_request_draft_lens = bucket_sizes_t[bucket_indices]
-
-        # Keep draft_token_num = block_size for CUDA graph compatibility (Phase 1).
-        # Only cap acceptance in verify() based on per_request_draft_lens.
-        positions = positions_2d.reshape(-1)
+            positions_flat = (
+                positions_2d[:, :vbs].contiguous().reshape(-1)
+            )
+        else:
+            draft_tokens_flat = draft_tokens.reshape(-1)
+            positions_flat = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
-            per_request_draft_lens=per_request_draft_lens,
+            draft_token=draft_tokens_flat,
+            positions=positions_flat,
+            draft_token_num=vbs,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend

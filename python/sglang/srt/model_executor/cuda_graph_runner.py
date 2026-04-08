@@ -553,9 +553,18 @@ class CudaGraphRunner:
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
+            full_block_size = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
+            # DFLASH target model: capture with reduced verify block size
+            # so that truncated verify batches can still use CUDA graphs.
+            if (
+                model_runner.spec_algorithm.is_dflash()
+                and not self.model_runner.is_draft_worker
+            ):
+                self.num_tokens_per_bs = min(full_block_size, 8)
+            else:
+                self.num_tokens_per_bs = full_block_size
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
