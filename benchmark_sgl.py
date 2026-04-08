@@ -21,7 +21,7 @@ DRAFT_MODEL = "z-lab/Qwen3-8B-DFlash-b16"
 NUM_DRAFT_TOKENS = 16
 TEMPERATURE = 0.0
 TOP_P = 1.0
-DATASET_PATH = "./mt-bench.jsonl"
+DATASET_PATH = "/home/zlab/workspace/jianc/math500.jsonl"
 TP_SIZE = 1
 MEM_FRACTION_STATIC = 0.75
 SERVER_TIMEOUT = 600
@@ -66,6 +66,7 @@ def _launch_server() -> subprocess.Popen:
         "--tp-size", str(TP_SIZE),
         "--attention-backend", "flashinfer",
         "--mem-fraction-static", str(MEM_FRACTION_STATIC),
+        "--max-running-requests", "64",
         "--port", str(PORT),
         "--trust-remote-code",
     ]
@@ -101,7 +102,8 @@ def _run_benchmark(base_url: str) -> None:
     prompts: list[str] = []
     for i in range(num_prompts):
         item = dataset[i % len(dataset)]
-        user_content = item["turns"][0]
+        # user_content = item["turns"][0]
+        user_content = item["prompt"]
         prompts.append(tokenizer.apply_chat_template(
             [{"role": "user", "content": user_content}],
             tokenize=False, add_generation_prompt=True,
