@@ -567,16 +567,16 @@ class DFlashVerifyInput(SpecInput):
                 ],
                 dim=1,
             ).cpu()
-            verify_host_np = verify_host.numpy()
 
             accept_length_per_req_cpu: List[int] = []
             commit_lens_cpu: List[int] = []
             new_verified_cpu: List[int] = []
 
             for i, req in enumerate(batch.reqs):
-                vlen = int(verify_host_np[i, 0])
-                pc = int(verify_host_np[i, 1])
-                proposed = verify_host_np[i, 2 : 2 + pc].tolist()
+                vlen = int(verify_host[i, 0].item())
+                pc = int(verify_host[i, 1].item())
+                proposed_slice = verify_host[i, 2 : 2 + pc]
+                proposed = [int(tok) for tok in proposed_slice]
 
                 appended = 0
                 if (

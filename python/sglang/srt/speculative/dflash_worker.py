@@ -842,21 +842,18 @@ class DFlashWorker:
             shape_idx = torch.clamp(shape_idx, max=cuda_graph_shapes_t.numel() - 1)
             total_verify_tokens_t = cuda_graph_shapes_t[shape_idx]
 
-        total_verify_tokens = int(total_verify_tokens_t.item())
-        if total_verify_tokens <= 0:
-            raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
-
         # 3b) Flatten tokens and build per-req offsets
+        max_total_verify_tokens = bs * block_size_i
         if (
             self._verify_tokens_flat_buf is None
-            or int(self._verify_flat_cap) < total_verify_tokens
+            or int(self._verify_flat_cap) < max_total_verify_tokens
         ):
             new_cap = max(
-                total_verify_tokens,
+                max_total_verify_tokens,
                 (
                     int(self._verify_flat_cap) * 2
                     if int(self._verify_flat_cap) > 0
-                    else total_verify_tokens
+                    else max_total_verify_tokens
                 ),
             )
             self._verify_tokens_flat_buf = torch.empty(
@@ -864,7 +861,7 @@ class DFlashWorker:
             )
             self._verify_flat_cap = new_cap
 
-        verify_tokens_flat = self._verify_tokens_flat_buf[:total_verify_tokens]
+        verify_tokens_flat = self._verify_tokens_flat_buf[:max_total_verify_tokens]
 
         verify_len_i32 = self._verify_padded_lens_cache.get(bs)
         if verify_len_i32 is None:
@@ -888,15 +885,25 @@ class DFlashWorker:
             draft_tokens=draft_tokens,
             positions=None,
             verify_len_actual=verify_len_i32_actual,
-            target_total_tokens=total_verify_tokens,
+            target_total_tokens=total_verify_tokens_t,
             verify_len_padded=verify_len_i32,
             start_offsets=verify_start_offsets_t,
             packed_tokens=verify_tokens_flat,
             packed_positions=None,
         )
 
-        # Build once for Python-side scheduler metadata.
-        vlen_list = verify_len_i32.tolist()
+        # Single D2H sync for both metadata consumers:
+        # - Python scheduler needs vlen_list
+        # - Python slicing/size fields need total_verify_tokens
+        verify_meta_cpu = torch.cat(
+            [verify_len_i32.to(torch.int64), verify_len_i32.sum().to(torch.int64).view(1)],
+            dim=0,
+        ).cpu()
+        total_verify_tokens = int(verify_meta_cpu[-1].item())
+        if total_verify_tokens <= 0:
+            raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
+        vlen_list = [int(x) for x in verify_meta_cpu[:-1]]
+        verify_tokens_flat = verify_tokens_flat[:total_verify_tokens]
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_tokens_flat,

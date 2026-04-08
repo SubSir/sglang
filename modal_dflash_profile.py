@@ -47,7 +47,7 @@ local_image = (
 
 
 @app.function(
-    gpu="B200",
+    gpu="H100",
     timeout=7200,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
