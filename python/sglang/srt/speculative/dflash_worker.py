@@ -661,23 +661,23 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+
+        # Only sample positions we'll actually verify to save draft sampling compute.
+        vbs = self.verify_block_size
+        sample_len = vbs - 1 if vbs < self.block_size else self.block_size - 1
         draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            hidden_states=draft_hidden[:, 1 : 1 + sample_len, :].reshape(
+                -1, draft_hidden.shape[-1]
+            ),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
+        ).view(bs, sample_len)
+        draft_tokens = self._draft_block_tokens_buf[:bs, :vbs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        # Truncate draft tokens to verify_block_size for reduced verify compute.
-        vbs = self.verify_block_size
         if vbs < self.block_size:
-            draft_tokens_flat = (
-                draft_tokens[:, :vbs].contiguous().reshape(-1)
-            )
-            positions_flat = (
-                positions_2d[:, :vbs].contiguous().reshape(-1)
-            )
+            draft_tokens_flat = draft_tokens.contiguous().reshape(-1)
+            positions_flat = positions_2d[:, :vbs].contiguous().reshape(-1)
         else:
             draft_tokens_flat = draft_tokens.reshape(-1)
             positions_flat = positions_2d.reshape(-1)
