@@ -254,57 +254,6 @@ class DFlashVerifyInput(SpecInput):
         """Backward-compatible wrapper for DFLASH CUDA-graph shape lookup."""
         return DFlashVerifyInput.find_nearest_shape(actual_token_num, cuda_graph_shapes)
 
-    def pad_for_cuda_graph(
-        self,
-        block_size: int,
-        max_concurrency: int,
-        cuda_graph_shapes: Optional[List[int]] = None,
-    ) -> None:
-        """
-        Perform padding for cuda graph.
-
-        Args:
-            block_size: DFlash block size
-            max_concurrency: maximum concurrency
-            cuda_graph_shapes: precomputed cuda graph shapes (optional, recomputed if None)
-        """
-        if not self._is_ragged_verify():
-            return
-
-        if cuda_graph_shapes is None:
-            cuda_graph_shapes = self.get_cuda_graph_verify_shapes(
-                block_size, max_concurrency
-            )
-
-        # Save the actual verify_token_lens
-        self.verify_token_lens_actual = self.verify_token_lens.clone()
-
-        # Calculate the actual total token count
-        actual_token_num = int(self.verify_token_lens.sum().item())
-
-        # Find the nearest cuda graph shape
-        nearest_shape, padding_tokens = self.find_nearest_cuda_graph_shape(
-            actual_token_num, cuda_graph_shapes
-        )
-
-        self.num_tokens_padded = nearest_shape
-        self.use_cuda_graph = True
-
-        # If padding is needed, distribute extra tokens to some requests
-        if padding_tokens > 0:
-            # Simple strategy: evenly distribute extra tokens to requests
-            # Each request gets at most 1 extra token until padding is exhausted
-            vlen_cpu = self.verify_token_lens_actual.cpu().tolist()
-            bs = len(vlen_cpu)
-
-            # Round-robin distribution of padding tokens
-            for i in range(padding_tokens):
-                vlen_cpu[i % bs] += 1
-
-            self.verify_token_lens = torch.tensor(
-                vlen_cpu, dtype=torch.int32, device=self.verify_token_lens.device
-            )
-
     def prepare_for_verify(
         self,
         batch: ScheduleBatch,
@@ -330,31 +279,6 @@ class DFlashVerifyInput(SpecInput):
 
         if self._is_ragged_verify():
             # --- ragged verify path
-            if self.verify_token_lens.numel() != bs:
-                raise RuntimeError(
-                    f"DFLASH verify_token_lens shape mismatch: got {self.verify_token_lens.numel()} for bs={bs}."
-                )
-
-            # Hard consistency checks before entering attention.
-            total_verify_tokens = int(self.verify_token_lens.sum().item())
-            draft_token_len = int(self.draft_token.shape[0])
-            if total_verify_tokens != draft_token_len:
-                raise RuntimeError(
-                    "DFLASH ragged verify metadata mismatch: "
-                    f"sum(verify_token_lens)={total_verify_tokens} != len(draft_token)={draft_token_len}."
-                )
-
-            # Do not validate batch.extend_num_tokens here: in current scheduling flow
-            # it is assigned by DFlash worker after prepare_for_verify().
-
-            if self.verify_start_offsets is None and (
-                self.verify_start_offsets_cpu is None
-                or len(self.verify_start_offsets_cpu) != bs
-            ):
-                raise RuntimeError(
-                    "DFLASH ragged verify requires verify_start_offsets metadata with length == batch_size."
-                )
-
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
             )
@@ -615,24 +539,10 @@ class DFlashVerifyInput(SpecInput):
         device = logits_output.next_token_logits.device
 
         if self._is_ragged_verify():
-            actual_vlens = (
-                self.verify_token_lens_actual
-                if (self.use_cuda_graph and self.verify_token_lens_actual is not None)
-                else self.verify_token_lens
-            )
-            alloc_vlens = (
-                self.verify_token_lens if self.verify_token_lens is not None else actual_vlens
-            )
-            if actual_vlens is None or alloc_vlens is None:
-                raise RuntimeError(
-                    "DFLASH ragged verify requires verify_token_lens metadata."
-                )
+            actual_vlens = self.verify_token_lens
+
             start_offsets_t = self.verify_start_offsets
             if start_offsets_t is None:
-                if self.verify_start_offsets_cpu is None:
-                    raise RuntimeError(
-                        "DFLASH ragged verify requires verify_start_offsets metadata."
-                    )
                 start_offsets_t = torch.tensor(
                     self.verify_start_offsets_cpu, dtype=torch.int32, device=device
                 )
@@ -748,44 +658,27 @@ class DFlashVerifyInput(SpecInput):
 
             if page_size == 1:
                 out_cache_loc = batch.out_cache_loc
-                use_block_keep_layout = (
-                    self.attn_dense_num_tokens == bs * int(self.draft_token_num)
-                    and out_cache_loc.numel() == bs * int(self.draft_token_num)
-                )
-                if use_block_keep_layout:
-                    # Dense-attention ragged verify keeps/free KV like block verify.
-                    out_cache_loc = out_cache_loc.view(bs, self.draft_token_num)
-                    keep_mask = (
-                        torch.arange(self.draft_token_num, device=device)[None, :]
-                        < commit_lens[:, None]
+                alloc_vlens_i64 = actual_vlens.to(dtype=torch.int64, device=device)
+                commit_lens_i64 = commit_lens.to(torch.int64)
+                alloc_starts = start_offsets_t.to(torch.int64)
+                max_alloc = int(self.draft_token_num)
+                alloc_rows = torch.arange(
+                    max_alloc, dtype=torch.int64, device=device
+                )[None, :]
+                alloc_indices = alloc_starts[:, None] + alloc_rows
+                valid_mask = alloc_rows < alloc_vlens_i64[:, None]
+                keep_mask = alloc_rows < commit_lens_i64[:, None]
+                keep_indices = alloc_indices[keep_mask]
+                free_indices = alloc_indices[valid_mask & ~keep_mask]
+                if free_indices.numel() > 0:
+                    batch.token_to_kv_pool_allocator.free(
+                        out_cache_loc.index_select(0, free_indices)
                     )
-                    batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
-                    batch.out_cache_loc = out_cache_loc[keep_mask]
-                else:
-                    alloc_vlens_i64 = alloc_vlens.to(dtype=torch.int64, device=device)
-                    commit_lens_i64 = commit_lens.to(torch.int64)
-                    alloc_starts = start_offsets_t.to(torch.int64)
-                    max_alloc = int(self.draft_token_num)
-                    if max_alloc > 0:
-                        alloc_rows = torch.arange(
-                            max_alloc, dtype=torch.int64, device=device
-                        )[None, :]
-                        alloc_indices = alloc_starts[:, None] + alloc_rows
-                        valid_mask = alloc_rows < alloc_vlens_i64[:, None]
-                        keep_mask = alloc_rows < commit_lens_i64[:, None]
-                        keep_indices = alloc_indices[keep_mask]
-                        free_indices = alloc_indices[valid_mask & ~keep_mask]
-                        if free_indices.numel() > 0:
-                            batch.token_to_kv_pool_allocator.free(
-                                out_cache_loc.index_select(0, free_indices)
-                            )
-                        batch.out_cache_loc = (
-                            out_cache_loc.index_select(0, keep_indices)
-                            if keep_indices.numel() > 0
-                            else out_cache_loc[:0]
-                        )
-                    else:
-                        batch.out_cache_loc = out_cache_loc[:0]
+                batch.out_cache_loc = (
+                    out_cache_loc.index_select(0, keep_indices)
+                    if keep_indices.numel() > 0
+                    else out_cache_loc[:0]
+                )
             else:
                 raise NotImplementedError(
                     "DFLASH ragged verify page_size > 1 not supported."

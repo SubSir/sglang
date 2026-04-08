@@ -232,6 +232,7 @@ class DFlashWorker:
         self._verify_flat_cap: int = 0
         self._verify_start_offsets_cache: Dict[int, torch.Tensor] = {}
         self._verify_padded_lens_cache: Dict[int, torch.Tensor] = {}
+        self._verify_cuda_graph_shapes_cache: Dict[int, torch.Tensor] = {}
 
         # Verify-length prediction offset on top of expected accepted length.
         # Keep using the original env key.
@@ -770,10 +771,6 @@ class DFlashWorker:
             return
 
         # ===== ragged verify (DFLASH_VERIFY) =====
-        # Optional: explicitly pass positions to avoid relying on ForwardBatchInfo.
-        explicit_pos = (
-            os.environ.get("SGLANG_DFLASH_RAGGED_EXPLICIT_POS", "0") == "1"
-        )
         # 3a) Determine per-request verify length.
         # Use per-token confidence as acceptance probability, compute expected
         # accepted length with conditional probabilities:
@@ -810,34 +807,42 @@ class DFlashWorker:
 
         # Keep verify length computations on GPU; move to CPU only where Python lists
         # are required by scheduler metadata.
-        verify_len_i32_actual = verify_len_per_req.to(torch.int32).clamp(
-            min=1, max=block_size_i
-        )
+        verify_len_i32_actual = verify_len_per_req.clamp(min=1, max=block_size_i)
 
-        total_verify_tokens_actual = int(verify_len_i32_actual.sum().item())
-        target_total_tokens = total_verify_tokens_actual
-        padding_tokens = 0
+        total_verify_tokens_t = verify_len_i32_actual.sum(dtype=torch.int64)
         if _can_use_cuda_graph:
-            if _can_use_cuda_graph and hasattr(
-                _cg_runner, "_get_dflash_capture_tokens_for_bs"
-            ):
-                cuda_graph_shapes = list(_cg_runner._get_dflash_capture_tokens_for_bs(bs))
-            else:
-                cuda_graph_shapes = list(self.server_args.piecewise_cuda_graph_tokens)
-
-            _, padding_tokens = DFlashVerifyInput.find_nearest_shape(
-                total_verify_tokens_actual,
-                cuda_graph_shapes,
-            )
-
-            if padding_tokens > 0:
-                room = (block_size_i - verify_len_i32_actual).clamp_min(0)
-                total_room = int(room.sum().item())
-                target_total_tokens = total_verify_tokens_actual + min(
-                    int(padding_tokens), total_room
+            cuda_graph_shapes_t = self._verify_cuda_graph_shapes_cache.get(bs)
+            if cuda_graph_shapes_t is None:
+                if _can_use_cuda_graph and hasattr(
+                    _cg_runner, "_get_dflash_capture_tokens_for_bs"
+                ):
+                    cuda_graph_shapes = list(
+                        _cg_runner._get_dflash_capture_tokens_for_bs(bs)
+                    )
+                else:
+                    piecewise_tokens = self.server_args.piecewise_cuda_graph_tokens
+                    cuda_graph_shapes = (
+                        list(piecewise_tokens) if piecewise_tokens is not None else []
+                    )
+                if not cuda_graph_shapes:
+                    raise RuntimeError(
+                        "DFLASH ragged verify requires non-empty cuda graph shapes."
+                    )
+                cuda_graph_shapes_t = torch.tensor(
+                    cuda_graph_shapes,
+                    dtype=torch.int64,
+                    device=self.device,
                 )
+                self._verify_cuda_graph_shapes_cache[bs] = cuda_graph_shapes_t
 
-        total_verify_tokens = int(target_total_tokens)
+            shape_idx = torch.searchsorted(
+                cuda_graph_shapes_t, total_verify_tokens_t
+            )
+            # Match find_nearest_shape() fallback when actual exceeds captured max.
+            shape_idx = torch.clamp(shape_idx, max=cuda_graph_shapes_t.numel() - 1)
+            total_verify_tokens_t = cuda_graph_shapes_t[shape_idx]
+
+        total_verify_tokens = int(total_verify_tokens_t.item())
         if total_verify_tokens <= 0:
             raise RuntimeError("DFLASH ragged verify: total_verify_tokens is 0.")
 
@@ -873,60 +878,32 @@ class DFlashWorker:
             )
             self._verify_start_offsets_cache[bs] = verify_start_offsets_t
 
-        if explicit_pos:
-            if (
-                self._verify_positions_flat_buf is None
-                or self._verify_positions_flat_buf.shape[0] < total_verify_tokens
-            ):
-                new_cap = max(
-                    total_verify_tokens,
-                    (
-                        self._verify_positions_flat_buf.shape[0] * 2
-                        if self._verify_positions_flat_buf is not None
-                        else total_verify_tokens
-                    ),
-                )
-                self._verify_positions_flat_buf = torch.empty(
-                    (new_cap,), dtype=torch.int64, device=self.device
-                )
-
-            verify_positions_flat = self._verify_positions_flat_buf[:total_verify_tokens]
-            verify_positions_src = positions_2d
-        else:
-            verify_positions_flat = None
-            verify_positions_src = None
 
         (
             verify_len_i32,
             verify_start_offsets_t,
             verify_tokens_flat,
-            verify_positions_flat,
+            _,
         ) = prepare_dflash_adaptive_verify(
             draft_tokens=draft_tokens,
-            positions=verify_positions_src,
+            positions=None,
             verify_len_actual=verify_len_i32_actual,
             target_total_tokens=total_verify_tokens,
             verify_len_padded=verify_len_i32,
             start_offsets=verify_start_offsets_t,
             packed_tokens=verify_tokens_flat,
-            packed_positions=verify_positions_flat,
+            packed_positions=None,
         )
 
         # Build once for Python-side scheduler metadata.
         vlen_list = verify_len_i32.tolist()
-        verify_positions = (
-            verify_positions_flat
-            if explicit_pos
-            else None  # Let ForwardBatchInfo compute positions from extend_*.
-        )
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_tokens_flat,
-            positions=verify_positions,
+            positions=None,
             draft_token_num=int(self.block_size),
             verify_token_lens=verify_len_i32,
             verify_start_offsets=verify_start_offsets_t,
-            verify_token_lens_actual=verify_len_i32_actual,
             use_cuda_graph=_can_use_cuda_graph,
             num_tokens_padded=total_verify_tokens if _can_use_cuda_graph else -1,
         )
@@ -1444,9 +1421,10 @@ class DFlashWorker:
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, **kwargs
-            )
+            with torch.profiler.record_function("DFLASH.target_prefill_forward"):
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch, **kwargs
+                )
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
@@ -1524,9 +1502,10 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
-        )
+        with torch.profiler.record_function("DFLASH.target_verify_forward"):
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True, **kwargs
+            )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
