@@ -639,7 +639,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            # Key by (bs, draft_token_num) to support multiple verify block sizes.
+            dtn = getattr(spec_info, "draft_token_num", None) if spec_info else None
+            meta_key = (bs, dtn) if dtn is not None else bs
+            self.prefill_cuda_graph_metadata[meta_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -727,13 +730,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
+            # Look up by (bs, draft_token_num) to match the capture key.
+            dtn = getattr(spec_info, "draft_token_num", None) if spec_info else None
+            meta_key = (bs, dtn) if dtn is not None else bs
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[meta_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,

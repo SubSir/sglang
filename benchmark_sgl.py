@@ -16,8 +16,8 @@ from rich import print
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-MODEL = "Qwen/Qwen3-4B"
-DRAFT_MODEL = "z-lab/Qwen3-4B-DFlash-b16"
+MODEL = "Qwen/Qwen3-8B"
+DRAFT_MODEL = "z-lab/Qwen3-8B-DFlash-b16"
 NUM_DRAFT_TOKENS = 16
 TEMPERATURE = 0.0
 TOP_P = 1.0
@@ -27,7 +27,7 @@ MEM_FRACTION_STATIC = 0.75
 SERVER_TIMEOUT = 600
 MAX_NEW_TOKENS = 2048
 NUM_PROMPTS = 768
-CONCURRENCY = 32
+CONCURRENCY = 64
 PORT = 30000
 TIMEOUT_S = 3600
 

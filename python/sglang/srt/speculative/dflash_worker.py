@@ -189,9 +189,12 @@ class DFlashWorker:
                 self._mask_token_id_override,
             )
 
-        # Verify block size: truncate draft tokens before verification.
-        # Must match the CUDA graph capture size in cuda_graph_runner.py.
-        self.verify_block_size = min(self.block_size, 8)
+        # Dynamic verify block size: per-request truncation based on draft confidence.
+        # CUDA graphs are captured for each bucket size; batch uses max bucket.
+        self.use_dynamic_verify = True
+        self.dynamic_verify_margin = 2
+        # Must match dflash_verify_buckets in cuda_graph_runner.py.
+        self.dynamic_verify_buckets = [4, 6, 8, 12, self.block_size]
 
         # Cache target model components accessed every iteration.
         target_model = self.target_worker.model_runner.model
@@ -662,26 +665,103 @@ class DFlashWorker:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
-        # Only sample positions we'll actually verify to save draft sampling compute.
-        vbs = self.verify_block_size
-        sample_len = vbs - 1 if vbs < self.block_size else self.block_size - 1
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1 : 1 + sample_len, :].reshape(
-                -1, draft_hidden.shape[-1]
-            ),
-            lm_head=lm_head,
-        ).view(bs, sample_len)
-        # Build flat verify tokens directly (contiguous from torch.cat).
-        draft_tokens_flat = torch.cat(
-            [block_ids[:, 0:1], draft_next], dim=1
-        ).reshape(-1)
-        positions_flat = positions_2d[:, :vbs].contiguous().reshape(-1)
+        if self.use_dynamic_verify:
+            # Sample all block_size-1 draft positions with confidence estimation.
+            sample_len = self.block_size - 1
+            draft_next, confidence = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1 : 1 + sample_len, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+                return_confidence=True,
+            )
+            draft_next = draft_next.view(bs, sample_len)
+            confidence = confidence.view(bs, sample_len)
 
-        verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens_flat,
-            positions=positions_flat,
-            draft_token_num=vbs,
-        )
+            # Compute per-request estimated acceptance length from confidence.
+            cum_conf = torch.cumprod(confidence, dim=1)  # [bs, sample_len]
+            est_accept = cum_conf.sum(dim=1)  # [bs]
+
+            # Per-request VBS: each request gets its own verify block size.
+            buckets = self.dynamic_verify_buckets
+            raw_vbs = torch.ceil(est_accept + self.dynamic_verify_margin).clamp(
+                min=buckets[0], max=self.block_size
+            ).int()
+            device = draft_hidden.device
+            per_req_vbs = raw_vbs.to(device)
+
+            # Pack tokens tightly: each request contributes per_req_vbs[i] tokens.
+            full_draft_tokens = torch.cat(
+                [block_ids[:, 0:1], draft_next], dim=1
+            )  # [bs, block_size]
+
+            # Cumulative sum for indexing.
+            vbs_cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            vbs_cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
+            total_real = int(vbs_cumsum[-1].item())
+
+            # Vectorized packing: build row/col indices for gather.
+            row_idx = torch.repeat_interleave(
+                torch.arange(bs, device=device), per_req_vbs
+            )
+            col_idx = torch.arange(total_real, device=device) - torch.repeat_interleave(
+                vbs_cumsum[:bs], per_req_vbs
+            )
+
+            # Determine effective_tpbs for CUDA graph: ceil(total / bs) → bucket.
+            effective_tpbs = -(-total_real // bs)  # ceil division
+            for b in buckets:
+                if effective_tpbs <= b:
+                    effective_tpbs = b
+                    break
+            else:
+                effective_tpbs = self.block_size
+
+            # Pre-allocate padded tensors and fill real tokens via gather.
+            total_padded = bs * effective_tpbs
+            padded_tokens = torch.zeros(total_padded, dtype=full_draft_tokens.dtype, device=device)
+            padded_positions = torch.zeros(total_padded, dtype=positions_2d.dtype, device=device)
+            padded_tokens[:total_real] = full_draft_tokens[row_idx, col_idx]
+            padded_positions[:total_real] = positions_2d[row_idx, col_idx]
+
+            if not hasattr(self, '_bucket_counter'):
+                self._bucket_counter = {}
+                self._bucket_log_interval = 100
+                self._bucket_log_count = 0
+            self._bucket_counter[effective_tpbs] = self._bucket_counter.get(effective_tpbs, 0) + 1
+            self._bucket_log_count += 1
+            if self._bucket_log_count % self._bucket_log_interval == 0:
+                logger.info("Dynamic VBS bucket distribution: %s (last %d steps)",
+                           self._bucket_counter, self._bucket_log_count)
+
+            verify_input = DFlashVerifyInput(
+                draft_token=padded_tokens,
+                positions=padded_positions,
+                draft_token_num=effective_tpbs,
+                per_request_vbs=per_req_vbs,
+                per_request_vbs_cumsum=vbs_cumsum,
+                total_real_tokens=total_real,
+            )
+        else:
+            # Fixed verify block size fallback.
+            vbs = self.block_size
+            sample_len = self.block_size - 1
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1 : 1 + sample_len, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, sample_len)
+            draft_tokens_flat = torch.cat(
+                [block_ids[:, 0:1], draft_next], dim=1
+            ).reshape(-1)
+            positions_flat = positions_2d[:, :vbs].contiguous().reshape(-1)
+
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens_flat,
+                positions=positions_flat,
+                draft_token_num=vbs,
+            )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
@@ -705,16 +785,24 @@ class DFlashWorker:
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_confidence: bool = False,
+    ):
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+
+        When return_confidence=True, also returns the top-1 softmax probability
+        (confidence) for each token, computed as exp(max_logit - logsumexp(logits)).
+        Returns (token_ids, confidence) tuple; otherwise just token_ids.
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            empty = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            if return_confidence:
+                return empty, torch.empty((0,), dtype=torch.float32, device=hidden_states.device)
+            return empty
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
@@ -748,18 +836,38 @@ class DFlashWorker:
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
+            if return_confidence:
+                out_confidence = torch.empty(
+                    (num_tokens,), dtype=torch.float32, device=hidden_states.device
+                )
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
-                    )
+                    if return_confidence:
+                        # Fused: topk(2) gives both argmax and confidence in one pass.
+                        top2_vals, top2_idx = torch.topk(base_logits, k=2, dim=-1)
+                        out_token_ids[start:end] = top2_idx[:, 0].to(torch.long) + org_vocab_start
+                        margin = (top2_vals[:, 0] - top2_vals[:, 1]).float()
+                        out_confidence[start:end] = torch.sigmoid(margin)
+                    else:
+                        out_token_ids[start:end] = (
+                            torch.argmax(base_logits, dim=-1).to(torch.long)
+                            + org_vocab_start
+                        )
                 else:
                     out_token_ids[start:end] = 0
+                    if return_confidence:
+                        out_confidence[start:end] = 1.0
+            if return_confidence:
+                return out_token_ids, out_confidence
             return out_token_ids
+
+        if return_confidence:
+            out_confidence = torch.empty(
+                (num_tokens,), dtype=torch.float32, device=hidden_states.device
+            )
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -813,6 +921,13 @@ class DFlashWorker:
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                if return_confidence:
+                    if num_org > 0:
+                        top2 = torch.topk(base_logits, k=2, dim=-1).values
+                        margin = (top2[:, 0] - top2[:, 1]).float()
+                        out_confidence[start:end] = torch.sigmoid(margin)
+                    else:
+                        out_confidence[start:end] = 1.0
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -871,6 +986,17 @@ class DFlashWorker:
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
+            if return_confidence:
+                # Conservative approximation for TP>1: use local rank's confidence.
+                if num_org > 0:
+                    top2 = torch.topk(base_logits, k=2, dim=-1).values
+                    margin = (top2[:, 0] - top2[:, 1]).float()
+                    out_confidence[start:end] = torch.sigmoid(margin)
+                else:
+                    out_confidence[start:end] = 1.0
+
+        if return_confidence:
+            return out_token_ids, out_confidence
         return out_token_ids
 
     def _append_target_hidden_to_draft_kv(

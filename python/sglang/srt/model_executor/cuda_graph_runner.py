@@ -547,6 +547,8 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        self.dflash_verify_buckets = None
+        self.cur_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
@@ -556,15 +558,16 @@ class CudaGraphRunner:
             full_block_size = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
-            # DFLASH target model: capture with reduced verify block size
-            # so that truncated verify batches can still use CUDA graphs.
+            # DFLASH target model: capture multiple CUDA graphs for different
+            # verify block sizes to support dynamic per-request truncation.
+            self.num_tokens_per_bs = full_block_size
             if (
                 model_runner.spec_algorithm.is_dflash()
                 and not self.model_runner.is_draft_worker
             ):
-                self.num_tokens_per_bs = min(full_block_size, 8)
+                self.dflash_verify_buckets = [4, 6, 8, 12, full_block_size]
             else:
-                self.num_tokens_per_bs = full_block_size
+                self.dflash_verify_buckets = None
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -683,10 +686,29 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _get_dflash_tokens_per_bs(self, forward_batch: ForwardBatch) -> int:
+        """Get the tokens_per_bs for a DFlash verify forward, rounding to bucket."""
+        if self.dflash_verify_buckets is None:
+            return self.num_tokens_per_bs
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not hasattr(spec_info, "draft_token_num"):
+            return self.num_tokens_per_bs
+        batch_vbs = int(spec_info.draft_token_num)
+        # Round up to nearest bucket.
+        for b in self.dflash_verify_buckets:
+            if batch_vbs <= b:
+                return b
+        return self.num_tokens_per_bs
+
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
+            tokens_per_bs = (
+                self._get_dflash_tokens_per_bs(forward_batch)
+                if self.dflash_verify_buckets is not None
+                else self.num_tokens_per_bs
+            )
             cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                max(forward_batch.global_num_tokens_cpu) // tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
@@ -695,9 +717,13 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
+        if self.dflash_verify_buckets is not None:
+            tokens_per_bs = self._get_dflash_tokens_per_bs(forward_batch)
+            graph_key = (cuda_graph_bs, tokens_per_bs)
+        else:
+            graph_key = cuda_graph_bs
         if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+            graph_key = f"{get_current_stream_idx()}_{graph_key}"
 
         is_bs_supported = (
             graph_key in self.graphs
@@ -803,20 +829,38 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                # For DFlash target verify: capture a graph for each bucket size.
+                bucket_sizes = (
+                    self.dflash_verify_buckets
+                    if self.dflash_verify_buckets is not None
+                    else [self.num_tokens_per_bs]
+                )
+                if get_tensor_model_parallel_rank() == 0 and len(bucket_sizes) > 1:
+                    logger.info(
+                        "Capturing %d bucket sizes for bs=%d: %s",
+                        len(bucket_sizes), bs, bucket_sizes,
+                    )
+                for tokens_per_bs in bucket_sizes:
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(
+                            bs, forward, stream_idx, tokens_per_bs=tokens_per_bs
+                        )
+                        if self.dflash_verify_buckets is not None:
+                            key = (bs, tokens_per_bs)
+                        else:
+                            key = bs
+                        if stream_idx is not None:
+                            key = f"{stream_idx}_{key}"
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -834,6 +878,11 @@ class CudaGraphRunner:
                     ) as graph_capture_context, profile_context as prof:
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
+
+        log_info_on_rank0(
+            logger,
+            f"Total CUDA graphs captured: {len(self.graphs)} (keys: {list(self.graphs.keys())[:10]}...)"
+        )
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
@@ -1104,13 +1153,19 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        # Determine the actual tokens_per_bs for this forward.
+        if self.dflash_verify_buckets is not None:
+            cur_tokens_per_bs = self._get_dflash_tokens_per_bs(forward_batch)
+        else:
+            cur_tokens_per_bs = self.num_tokens_per_bs
+        raw_num_token = raw_bs * cur_tokens_per_bs
 
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
+                max_num_tokens / cur_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
@@ -1128,7 +1183,7 @@ class CudaGraphRunner:
             bs=bs,
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
+            num_tokens_per_bs=cur_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(
                 self.model_runner.server_args
@@ -1172,6 +1227,7 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.cur_tokens_per_bs = cur_tokens_per_bs
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1200,10 +1256,12 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+        if self.dflash_verify_buckets is not None:
+            graph_key = (self.bs, self.cur_tokens_per_bs)
         else:
             graph_key = self.bs
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{graph_key}"
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 

@@ -1,0 +1,25 @@
+commit	accept_len	throughput	status	description
+327467cfe	4.165	6952.64	keep	baseline (no changes)
+b3584829b	4.046	6328.60	keep	Phase 1: dynamic block size with acceptance capping (no verify truncation yet)
+59ef093cb	4.063	5923.93	discard	eager fallback for verify (too much overhead)
+6f605386e	3.683	7698.11	keep	fixed verify_block_size=8 with CUDA graph capture at 8
+a9438b59a	3.353	7611.72	discard	verify_block_size=6 (too aggressive, lower throughput)
+ff08721b8	3.881	7413.90	discard	verify_block_size=10 (less truncation, lower throughput)
+c72f10e22	3.580	7651.20	discard	verify_block_size=7 (slightly worse than 8)
+86560148a	3.699	7909.79	keep	only sample draft tokens we'll verify (skip unused positions)
+94f6cd957	3.688	7810.01	discard	chunk_size=512 for draft sampling (worse, reverted)
+5cd557a19	3.772	7640.35	discard	verify_block_size=9 (worse than 8)
+cd00b2a76	3.457	7378.41	discard	reduced draft block to 8 (non-causal attn needs all 16 positions)
+efaa42226	3.697	7813.56	discard	pre-allocated contiguous buffers (extra compute offset savings)
+0b1242719	3.699	7777.08	discard	chunk_size=128 (more loop overhead)
+a0b4c413f	3.705	7945.44	keep	removed unused per_request_draft_lens dead code
+4324f6961	3.694	7826.65	discard	tokens_buf sized to vbs (slightly worse, within noise?)
+4a3b4fe68	3.701	7853.55	discard	reduce max_ctx in KV append (within noise but reverted)
+4a9420af2	3.705	7870.68	keep	vectorize hidden state extraction (replace Python loop)
+c10cee4e6	3.700	7956.47	keep	torch.cat for verify tokens (avoid buffer + contiguous)
+bd7366b55	3.700	7904.00	keep	removed unused _draft_block_tokens_buf
+5424177a2	3.107	7401.76	discard	verify_block_size=5 (too aggressive, much lower throughput)
+2a5a605db	3.701	7888.66	keep	cache target embed_module and lm_head at init
+694384c37	3.695	7935.78	keep	move draft seq_lens sum earlier for GPU overlap
+aec4941da	3.698	7903.75	discard	defer post-verify KV append (no improvement, correctness risk)
+47c03b6f3	3.704	7945.23	keep	avoid GPU sync in fused KV materialize (pass max_position from CPU)
