@@ -856,12 +856,17 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        tokens_per_bs: Optional[int] = None,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
-        num_tokens = bs * self.num_tokens_per_bs
+        tokens_per_bs = tokens_per_bs or self.num_tokens_per_bs
+        num_tokens = bs * tokens_per_bs
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -919,7 +924,7 @@ class CudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = self.get_spec_info(num_tokens, tokens_per_bs=tokens_per_bs)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -1232,7 +1237,7 @@ class CudaGraphRunner:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, tokens_per_bs: Optional[int] = None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1272,7 +1277,7 @@ class CudaGraphRunner:
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.num_tokens_per_bs,
+                draft_token_num=tokens_per_bs or self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
