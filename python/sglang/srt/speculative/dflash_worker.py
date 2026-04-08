@@ -671,16 +671,11 @@ class DFlashWorker:
             ),
             lm_head=lm_head,
         ).view(bs, sample_len)
-        draft_tokens = self._draft_block_tokens_buf[:bs, :vbs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
-
-        if vbs < self.block_size:
-            draft_tokens_flat = draft_tokens.contiguous().reshape(-1)
-            positions_flat = positions_2d[:, :vbs].contiguous().reshape(-1)
-        else:
-            draft_tokens_flat = draft_tokens.reshape(-1)
-            positions_flat = positions_2d.reshape(-1)
+        # Build flat verify tokens directly (contiguous from torch.cat).
+        draft_tokens_flat = torch.cat(
+            [block_ids[:, 0:1], draft_next], dim=1
+        ).reshape(-1)
+        positions_flat = positions_2d[:, :vbs].contiguous().reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens_flat,
