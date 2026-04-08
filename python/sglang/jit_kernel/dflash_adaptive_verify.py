@@ -143,7 +143,7 @@ def prepare_dflash_adaptive_verify(
     draft_tokens: torch.Tensor,
     positions: Optional[torch.Tensor],
     verify_len_actual: torch.Tensor,
-    target_total_tokens: int,
+    target_total_tokens: torch.Tensor,
     verify_len_padded: torch.Tensor,
     start_offsets: torch.Tensor,
     packed_tokens: torch.Tensor,
@@ -163,9 +163,8 @@ def prepare_dflash_adaptive_verify(
     block_size_i = int(draft_tokens.shape[1])
     device = verify_len_padded.device
     cap = (block_size_i - verify_len_padded).clamp(min=0)
-    deficit = torch.tensor(target_total_tokens, device=device, dtype=torch.int64) - (
-        verify_len_padded.to(torch.int64).sum()
-    )
+    target_total_tokens_t = target_total_tokens.to(device=device, dtype=torch.int64)
+    deficit = target_total_tokens_t - verify_len_padded.to(torch.int64).sum()
     max_add = cap.to(torch.int64).sum()
     add_total = torch.minimum(deficit, max_add).clamp(min=0)
     round_ids = torch.arange(block_size_i, device=device, dtype=torch.int64)[:, None]

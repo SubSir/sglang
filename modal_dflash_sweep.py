@@ -38,7 +38,7 @@ local_image = (
 )
 
 @app.function(
-    gpu="B200",
+    gpu="H100",
     timeout=7200,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -77,7 +77,7 @@ def run_dataset_sweep(
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 32
+    max_concurrency = 64
     # DFLASH b16 * max_concurrency(5) => 80
     piecewise_cuda_graph_max_tokens = 16 * max_concurrency
 
@@ -86,11 +86,11 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "32",
+        "--concurrencies", "16,32,64",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         # "--samples-per-concurrency-base", "8",
-        "--attention-backends", "fa3",
+        "--attention-backends", "flashinfer",
         "--mem-fraction-static", "0.7",
         "--enable-piecewise-cuda-graph",
         "--piecewise-cuda-graph-max-tokens",
