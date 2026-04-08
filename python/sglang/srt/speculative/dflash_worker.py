@@ -193,6 +193,7 @@ class DFlashWorker:
         # CUDA graphs are captured for each bucket size; batch uses max bucket.
         self.use_dynamic_verify = True
         self.dynamic_verify_margin = 2
+        self.dynamic_verify_confidence_scale = 0.5  # power < 1 compresses toward 1
         # Must match dflash_verify_buckets in cuda_graph_runner.py.
         self.dynamic_verify_buckets = [4, 6, 8, 12, self.block_size]
 
@@ -678,16 +679,17 @@ class DFlashWorker:
             draft_next = draft_next.view(bs, sample_len)
             confidence = confidence.view(bs, sample_len)
 
-            # Compute per-request estimated acceptance length from confidence.
-            cum_conf = torch.cumprod(confidence, dim=1)  # [bs, sample_len]
+            # Scale confidence to counteract cumprod amplification of miscalibration.
+            scaled_conf = confidence ** self.dynamic_verify_confidence_scale
+            cum_conf = torch.cumprod(scaled_conf, dim=1)  # [bs, sample_len]
             est_accept = cum_conf.sum(dim=1)  # [bs]
 
             # Per-request VBS: each request gets its own verify block size.
+            device = draft_hidden.device
             buckets = self.dynamic_verify_buckets
             raw_vbs = torch.ceil(est_accept + self.dynamic_verify_margin).clamp(
                 min=buckets[0], max=self.block_size
             ).int()
-            device = draft_hidden.device
             per_req_vbs = raw_vbs.to(device)
 
             # Pack tokens tightly: each request contributes per_req_vbs[i] tokens.
@@ -726,13 +728,19 @@ class DFlashWorker:
 
             if not hasattr(self, '_bucket_counter'):
                 self._bucket_counter = {}
+                self._per_req_vbs_counter = {}
                 self._bucket_log_interval = 100
                 self._bucket_log_count = 0
             self._bucket_counter[effective_tpbs] = self._bucket_counter.get(effective_tpbs, 0) + 1
+            for v in per_req_vbs.cpu().tolist():
+                v = int(v)
+                self._per_req_vbs_counter[v] = self._per_req_vbs_counter.get(v, 0) + 1
             self._bucket_log_count += 1
             if self._bucket_log_count % self._bucket_log_interval == 0:
+                sorted_vbs = dict(sorted(self._per_req_vbs_counter.items()))
                 logger.info("Dynamic VBS bucket distribution: %s (last %d steps)",
                            self._bucket_counter, self._bucket_log_count)
+                logger.info("Per-request VBS distribution: %s", sorted_vbs)
 
             verify_input = DFlashVerifyInput(
                 draft_token=padded_tokens,
