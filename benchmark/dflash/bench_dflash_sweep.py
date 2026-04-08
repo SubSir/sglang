@@ -492,7 +492,7 @@ def main() -> None:
     parser.add_argument(
         "--max-samples-per-config",
         type=int,
-        default=2048,
+        default=2048 * 4,
         help="Cap num_samples per (tp, concurrency) run.",
     )
     parser.add_argument(

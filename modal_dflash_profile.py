@@ -47,7 +47,7 @@ local_image = (
 
 
 @app.function(
-    gpu="H100",
+    gpu="H200",
     timeout=7200,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -58,7 +58,7 @@ def run_profile_once(
     draft_model: str = "z-lab/gpt-oss-20b-DFlash",
     host: str = "127.0.0.1",
     port: int = 30000,
-    num_prompts: int = 1024,
+    num_prompts: int = 512,
     random_input_len: int = 512,
     random_output_len: int = 2048,
     profile_dir: str = "/root/sglang/profile_log",
@@ -97,7 +97,7 @@ def run_profile_once(
         "--attention-backend",
         "flashinfer",
         "--max-running-requests",
-        "32",
+        "16",
         "--mem-fraction-static", "0.7",
     ]
 
