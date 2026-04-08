@@ -200,9 +200,6 @@ class DFlashWorker:
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
-        self._draft_block_tokens_buf: Optional[torch.Tensor] = (
-            None  # [cap_bs, block_size]
-        )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
@@ -321,9 +318,6 @@ class DFlashWorker:
         )
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
-        )
-        self._draft_block_tokens_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
         )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
@@ -557,7 +551,6 @@ class DFlashWorker:
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
-        assert self._draft_block_tokens_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
