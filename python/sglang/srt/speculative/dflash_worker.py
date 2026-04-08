@@ -193,6 +193,20 @@ class DFlashWorker:
         # Must match the CUDA graph capture size in cuda_graph_runner.py.
         self.verify_block_size = min(self.block_size, 8)
 
+        # Cache target model components accessed every iteration.
+        target_model = self.target_worker.model_runner.model
+        self._target_embed_module = target_model.get_input_embeddings()
+        self._target_lm_head = getattr(target_model, "lm_head", None)
+        if (
+            self._target_lm_head is None
+            or not hasattr(self._target_lm_head, "weight")
+            or not hasattr(self._target_lm_head, "shard_indices")
+        ):
+            raise RuntimeError(
+                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
+                "`shard_indices` attributes."
+            )
+
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
@@ -534,18 +548,8 @@ class DFlashWorker:
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
 
-        target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
-        lm_head = getattr(target_model, "lm_head", None)
-        if (
-            lm_head is None
-            or not hasattr(lm_head, "weight")
-            or not hasattr(lm_head, "shard_indices")
-        ):
-            raise RuntimeError(
-                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
-                "`shard_indices` attributes."
-            )
+        embed_module = self._target_embed_module
+        lm_head = self._target_lm_head
 
         # --- 2) Draft a non-causal block with the draft model.
         self._ensure_draft_block_buffers(bs)
