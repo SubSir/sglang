@@ -83,7 +83,7 @@ def run_dataset_sweep(
 
     # Construct arguments for the generic sweep script
 
-    max_concurrency = 8
+    max_concurrency = 32
     # DFLASH b16 * max_concurrency(5) => 80
     # piecewise_cuda_graph_max_tokens = 10 * max_concurrency
 
@@ -92,7 +92,7 @@ def run_dataset_sweep(
         "--data-names", data_name,
         "--target-model", target_model,
         "--tp-sizes", "1",
-        "--concurrencies", "8",
+        "--concurrencies", "32",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
         "--attention-backends", "fa3",
@@ -100,7 +100,7 @@ def run_dataset_sweep(
         # "--enable-piecewise-cuda-graph",
         # "--piecewise-cuda-graph-max-tokens",
         # str(piecewise_cuda_graph_max_tokens)
-        "--samples-per-concurrency-base", "256",
+        # "--samples-per-concurrency-base", "256",
         "--disable-radix-cache",
         "--speculative-eagle-topk", str(tree_verify_topk),
         "--speculative-dflash-block-size", str(speculative_dflash_block_size),
@@ -130,8 +130,8 @@ def run_dataset_sweep(
     env["SGLANG_DFLASH_K_ONLINE_WARMUP"] = str(k_online_warmup)
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1" if block_verify else "0"
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
-    env["SGLANG_DFLASH_TIMING"] = "1"
-    env["SGLANG_DFLASH_TIMING_LOG_INTERVAL"] = "100"
+    # env["SGLANG_DFLASH_TIMING"] = "1"
+    # env["SGLANG_DFLASH_TIMING_LOG_INTERVAL"] = "100"
     # env["CUDA_LAUNCH_BLOCKING"] = "1"
     # env["SGLANG_FA_SPEC_DEBUG"] = "1"
     # env["SGLANG_ATTN_BACKEND_DEBUG"] = "1"
@@ -179,9 +179,9 @@ def run_dataset_sweep(
 
 @app.local_entrypoint()
 def main(
-    data_names: str = "gsm8k",
-    target_model: str = "Qwen/Qwen3.5-27B",
-    draft_model: str = "z-lab/Qwen3.5-27B-DFlash",
+    data_names: str = "gsm8k,mt-bench",
+    target_model: str = "Qwen/Qwen3-8B",
+    draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
     offset: int = 2,
     warmup: int = 0,
     speculative_dflash_block_size: int = 16,

@@ -395,52 +395,61 @@ class DFlashVerifyInput(SpecInput):
          )
         sampling_info = batch.sampling_info
         if sampling_info is not None:
-            if len(sampling_info) != bs:
-                raise RuntimeError(
-                    "DFLASH verify sampling_info size mismatch: "
-                    f"len(sampling_info)={len(sampling_info)}, bs={bs}."
-                )
+            with torch.profiler.record_function("DFlashVerify.sampling_prepare_logits"):
+                if len(sampling_info) != bs:
+                    raise RuntimeError(
+                        "DFLASH verify sampling_info size mismatch: "
+                        f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+                    )
 
-            # Keep speculative verify semantics consistent with normal sampling path.
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=self.draft_token_num,
-                )
+                # Keep speculative verify semantics consistent with normal sampling path.
+                if sampling_info.has_custom_logit_processor:
+                    apply_custom_logit_processor(
+                        logits_output.next_token_logits,
+                        sampling_info,
+                        num_tokens_in_batch=self.draft_token_num,
+                    )
 
-            if (
-                sampling_info.penalizer_orchestrator.is_required
-                or sampling_info.logit_bias is not None
-            ):
-                linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-                )
+                if (
+                    sampling_info.penalizer_orchestrator.is_required
+                    or sampling_info.logit_bias is not None
+                ):
+                    linear_penalty = torch.zeros(
+                        (bs, logits_output.next_token_logits.shape[1]),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    sampling_info.apply_logits_bias(linear_penalty)
+                    logits_output.next_token_logits.add_(
+                        torch.repeat_interleave(
+                            linear_penalty, self.draft_token_num, dim=0
+                        )
+                    )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
         accept_index_abs = None
+        packed = None
+        accept_len_cpu = None
+        accept_index_abs_cpu = None
+        predicts_cpu = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            if is_tree_verify:
-                raise RuntimeError("Tree verify is not supported for sampling.")
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-            )
+            with torch.profiler.record_function("DFlashVerify.sampling_accept_len_bonus"):
+                if is_tree_verify:
+                    raise RuntimeError("Tree verify is not supported for sampling.")
+                accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+                    candidates=candidates,
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                )
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, self.draft_token_num
-            )
+            with torch.profiler.record_function("DFlashVerify.greedy_target_argmax"):
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, self.draft_token_num)
             if is_tree_verify:
                 if (
                     self.retrive_index is None
@@ -450,267 +459,340 @@ class DFlashVerifyInput(SpecInput):
                     raise RuntimeError(
                         "DFLASH tree verify requires retrive_* buffers to be built by the tree kernel."
                     )
-                predicts = torch.empty(
-                    (bs * self.draft_token_num,), device=device, dtype=torch.int32
-                )
-                accept_index = torch.empty(
-                    (bs, self.draft_token_num), device=device, dtype=torch.int32
-                )
-                accept_token_num = torch.zeros(
-                    (bs,), device=device, dtype=torch.int32
-                )
-                verify_tree_greedy_func(
-                    predicts=predicts,
-                    accept_index=accept_index,
-                    accept_token_num=accept_token_num,
-                    candidates=candidates,
-                    retrive_index=self.retrive_index,
-                    retrive_next_token=self.retrive_next_token,
-                    retrive_next_sibling=self.retrive_next_sibling,
-                    target_predict=target_predict,
-                )
-                accept_len = accept_token_num
-                batch_offsets = (
-                    torch.arange(bs, device=device, dtype=accept_index.dtype)
-                    * self.draft_token_num
-                ).unsqueeze(1)
-                accept_index_abs = accept_index
-                accept_index_local = accept_index_abs - batch_offsets
-                self.accept_index_local = accept_index_local
-                self.accept_len = accept_len
-                last_accept_abs = accept_index_abs.gather(
-                    1, accept_len.unsqueeze(1).to(torch.long)
-                ).squeeze(1)
-                bonus = predicts[last_accept_abs.to(torch.long)]
-                packed = torch.cat(
-                    [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
-                ).cpu()
+                with torch.profiler.record_function(
+                    "DFlashVerify.verify_tree_greedy_func"
+                ):
+                    predicts = torch.empty(
+                        (bs * self.draft_token_num,),
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    accept_index = torch.full(
+                        (bs, self.draft_token_num),
+                        -1,
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    accept_token_num = torch.zeros(
+                        (bs,), device=device, dtype=torch.int32
+                    )
+                    predicts, accept_index, accept_token_num = verify_tree_greedy_func(
+                        predicts=predicts,
+                        accept_index=accept_index,
+                        accept_token_num=accept_token_num,
+                        candidates=candidates,
+                        retrive_index=self.retrive_index,
+                        retrive_next_token=self.retrive_next_token,
+                        retrive_next_sibling=self.retrive_next_sibling,
+                        target_predict=target_predict,
+                        topk=self.topk,
+                    )
+                with torch.profiler.record_function(
+                    "DFlashVerify.tree_accept_metadata_gpu"
+                ):
+                    accept_len = accept_token_num
+                    batch_offsets = (
+                        torch.arange(bs, device=device, dtype=accept_index.dtype)
+                        * self.draft_token_num
+                    ).unsqueeze(1)
+                    accept_index_abs = accept_index
+                    accept_index_local = accept_index_abs - batch_offsets
+                    self.accept_index_local = accept_index_local
+                    self.accept_len = accept_len
+                with torch.profiler.record_function("DFlashVerify.tree_pack_to_cpu"):
+                    packed_tree_cpu = torch.cat(
+                        [
+                            accept_len.to(torch.int32),
+                            accept_index_abs.reshape(-1).to(torch.int32),
+                            predicts.to(torch.int32),
+                        ],
+                        dim=0,
+                    ).cpu()
+                    accept_len_cpu = packed_tree_cpu[:bs]
+                    accept_index_abs_cpu = packed_tree_cpu[
+                        bs : bs + bs * self.draft_token_num
+                    ].reshape(bs, self.draft_token_num)
+                    predicts_cpu = packed_tree_cpu[bs + bs * self.draft_token_num :]
                 accept_index = accept_index_local
             else:
-                accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                )
+                with torch.profiler.record_function(
+                    "DFlashVerify.linear_accept_len_bonus"
+                ):
+                    accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
 
                 # Single D2H transfer: candidates[1:] + accept_len + bonus
-                packed = torch.cat(
-                    [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
-                ).cpu()
+                with torch.profiler.record_function("DFlashVerify.pack_to_cpu"):
+                    packed = torch.cat(
+                        [
+                            candidates[:, 1:],
+                            accept_len.unsqueeze(1),
+                            bonus.unsqueeze(1),
+                        ],
+                        dim=1,
+                    ).cpu()
 
         max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
         new_verified_list: List[int] = []
-
-        for i, req in enumerate(batch.reqs):
-            acc_len = int(packed[i, max_acc].item())
-            bonus_token = int(packed[i, max_acc + 1].item())
-            if is_tree_verify:
-                proposed: list[int] = []
-                if acc_len > 0:
-                    accept_indices = accept_index[i, 1 : acc_len + 1].to(torch.long)
-                    proposed.extend(
-                        candidates[i].index_select(0, accept_indices).tolist()
-                    )
-                proposed.append(bonus_token)
-            else:
-                proposed = packed[i, :acc_len].tolist() + [bonus_token]
-
-            appended = 0
-            if (
-                req.grammar is None
-                and not req.sampling_params.stop_strs
-                and not req.sampling_params.stop_regex_strs
-            ):
-                remaining = int(req.sampling_params.max_new_tokens) - len(
-                    req.output_ids
-                )
-                if remaining > 0:
-                    tokens = proposed[:remaining]
-                    if not req.sampling_params.ignore_eos:
-                        stop_token_ids = req.sampling_params.stop_token_ids
-                        eos_token_ids = req.eos_token_ids
-                        tokenizer = req.tokenizer
-                        tokenizer_eos = (
-                            tokenizer.eos_token_id if tokenizer is not None else None
-                        )
-                        additional_stop = (
-                            tokenizer.additional_stop_token_ids
-                            if tokenizer is not None
-                            else None
-                        )
-                        vocab_size = getattr(req, "vocab_size", None)
-
-                        for j, token_id in enumerate(tokens):
-                            if vocab_size is not None and (
-                                int(token_id) >= int(vocab_size) or int(token_id) < 0
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if stop_token_ids and token_id in stop_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if eos_token_ids and token_id in eos_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if tokenizer_eos is not None and int(token_id) == int(
-                                tokenizer_eos
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if additional_stop and token_id in additional_stop:
-                                tokens = tokens[: j + 1]
-                                break
-
-                    req.output_ids.extend(int(tok) for tok in tokens)
-                    appended = len(tokens)
-                    if appended > 0:
-                        req.check_finished(new_accepted_len=appended)
-            else:
-                for tok in proposed:
-                    req.output_ids.append(int(tok))
-                    appended += 1
-                    req.check_finished()
-                    if req.finished():
-                        break
-                    if req.grammar is not None:
-                        req.grammar.accept_token(int(tok))
-
-            if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
-            elif req.origin_input_ids:
-                # If no token was appended in this verify step, keep the current token unchanged.
-                new_verified_token = int(req.origin_input_ids[-1])
-            else:
-                raise RuntimeError(
-                    "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
-                )
-
-            commit_lens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
-            accept_length_per_req_cpu.append(max(0, appended - 1))
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
-
-        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        new_verified_id = torch.tensor(
-            new_verified_list, dtype=torch.int64, device=device
+        accept_index_abs_list = (
+            accept_index_abs_cpu.tolist() if accept_index_abs_cpu is not None else None
         )
+        predicts_list = predicts_cpu.tolist() if predicts_cpu is not None else None
+
+        with torch.profiler.record_function("DFlashVerify.cpu_per_req_bookkeeping"):
+            for i, req in enumerate(batch.reqs):
+                if is_tree_verify:
+                    if (
+                        accept_len_cpu is None
+                        or accept_index_abs_list is None
+                        or predicts_list is None
+                    ):
+                        raise RuntimeError(
+                            "DFLASH tree verify expects accept_len/index/predict tensors on CPU."
+                        )
+                    acc_len = int(accept_len_cpu[i].item())
+                    cur_len = acc_len + 1
+                    accept_row = accept_index_abs_list[i][:cur_len]
+                    proposed = [int(predicts_list[idx]) for idx in accept_row]
+                else:
+                    if packed is None:
+                        raise RuntimeError("DFLASH linear verify expects packed tensor.")
+                    acc_len = int(packed[i, max_acc].item())
+                    bonus_token = int(packed[i, max_acc + 1].item())
+                    proposed = packed[i, :acc_len].tolist() + [bonus_token]
+
+                appended = 0
+                if (
+                    req.grammar is None
+                    and not req.sampling_params.stop_strs
+                    and not req.sampling_params.stop_regex_strs
+                ):
+                    remaining = int(req.sampling_params.max_new_tokens) - len(
+                        req.output_ids
+                    )
+                    if remaining > 0:
+                        tokens = proposed[:remaining]
+                        if not req.sampling_params.ignore_eos:
+                            stop_token_ids = req.sampling_params.stop_token_ids
+                            eos_token_ids = req.eos_token_ids
+                            tokenizer = req.tokenizer
+                            tokenizer_eos = (
+                                tokenizer.eos_token_id
+                                if tokenizer is not None
+                                else None
+                            )
+                            additional_stop = (
+                                tokenizer.additional_stop_token_ids
+                                if tokenizer is not None
+                                else None
+                            )
+                            vocab_size = getattr(req, "vocab_size", None)
+
+                            for j, token_id in enumerate(tokens):
+                                if vocab_size is not None and (
+                                    int(token_id) >= int(vocab_size)
+                                    or int(token_id) < 0
+                                ):
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if stop_token_ids and token_id in stop_token_ids:
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if eos_token_ids and token_id in eos_token_ids:
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if tokenizer_eos is not None and int(token_id) == int(
+                                    tokenizer_eos
+                                ):
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if additional_stop and token_id in additional_stop:
+                                    tokens = tokens[: j + 1]
+                                    break
+
+                        req.output_ids.extend(int(tok) for tok in tokens)
+                        appended = len(tokens)
+                        if appended > 0:
+                            req.check_finished(new_accepted_len=appended)
+                else:
+                    for tok in proposed:
+                        req.output_ids.append(int(tok))
+                        appended += 1
+                        req.check_finished()
+                        if req.finished():
+                            break
+                        if req.grammar is not None:
+                            req.grammar.accept_token(int(tok))
+
+                if req.output_ids:
+                    new_verified_token = int(req.output_ids[-1])
+                elif req.origin_input_ids:
+                    # If no token was appended in this verify step, keep the current token unchanged.
+                    new_verified_token = int(req.origin_input_ids[-1])
+                else:
+                    raise RuntimeError(
+                        "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
+                    )
+
+                commit_lens_cpu.append(appended)
+                new_verified_list.append(new_verified_token)
+                accept_length_per_req_cpu.append(max(0, appended - 1))
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+
+        with torch.profiler.record_function("DFlashVerify.h2d_commit_tensors"):
+            commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+            new_verified_id = torch.tensor(
+                new_verified_list, dtype=torch.int64, device=device
+            )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
         if page_size == 1:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            if is_tree_verify:
-                keep_mask = torch.zeros(
-                    (bs, self.draft_token_num), dtype=torch.bool, device=device
-                )
-                keep_mask[:, 0] = True
-                for row in range(bs):
-                    acc_len = int(commit_lens_cpu[row]) - 1
-                    if acc_len > 0:
-                        keep_indices = accept_index[row, : acc_len + 1]
-                        keep_mask[row, keep_indices] = True
-                    else:
-                        keep_indices = 0
-            else:
-                keep_mask = (
-                    torch.arange(self.draft_token_num, device=device)[None, :]
-                    < commit_lens[:, None]
-                )
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
-            batch.out_cache_loc = out_cache_loc[keep_mask]
+            with torch.profiler.record_function("DFlashVerify.kv_compact_page_size_1"):
+                out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
+                if is_tree_verify:
+                    keep_mask = torch.zeros(
+                        (bs, self.draft_token_num),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    col_arange = torch.arange(
+                        self.draft_token_num, device=device
+                    )[None, :]
+                    valid_accept = col_arange < commit_lens[:, None]
+                    row_ids = torch.arange(bs, device=device)[:, None].expand(
+                        bs, self.draft_token_num
+                    )
+                    keep_rows = row_ids[valid_accept]
+                    keep_cols = accept_index.to(torch.long)[valid_accept]
+                    keep_mask[keep_rows, keep_cols] = True
+                else:
+                    keep_mask = (
+                        torch.arange(self.draft_token_num, device=device)[None, :]
+                        < commit_lens[:, None]
+                    )
+                batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
+                batch.out_cache_loc = out_cache_loc[keep_mask]
         else:
             if is_tree_verify:
-                if accept_index_abs is None:
-                    raise RuntimeError(
-                        "DFLASH tree verify requires accept_index_abs for page_size > 1."
+                with torch.profiler.record_function(
+                    "DFlashVerify.kv_compact_paged_tree"
+                ):
+                    if accept_index_abs is None:
+                        raise RuntimeError(
+                            "DFLASH tree verify requires accept_index_abs for page_size > 1."
+                        )
+                    accept_length = torch.clamp(commit_lens - 1, min=0)
+                    accept_index_flat = accept_index_abs[accept_index_abs != -1]
+                    (
+                        src_cache_loc,
+                        tgt_cache_loc,
+                        to_free_num_slots,
+                    ) = get_src_tgt_cache_loc(
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        accept_index_flat,
+                        accept_length,
+                        self.draft_token_num,
+                        page_size,
                     )
-                accept_length = torch.clamp(commit_lens - 1, min=0)
-                accept_index_flat = accept_index_abs[accept_index_abs != -1]
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    accept_index_flat,
-                    accept_length,
-                    self.draft_token_num,
-                    page_size,
-                )
-                to_free_slots = torch.empty(
-                    (to_free_num_slots.sum().item(),),
-                    dtype=torch.int64,
-                    device=to_free_num_slots.device,
-                )
-                get_target_cache_loc[(bs,)](
-                    tgt_cache_loc,
-                    to_free_slots,
-                    accept_length,
-                    to_free_num_slots,
-                    batch.out_cache_loc,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                    next_power_of_2(bs),
-                )
+                    with torch.profiler.record_function(
+                        "DFlashVerify.paged_to_free_num_slots_sum_item"
+                    ):
+                        _n_to_free = int(to_free_num_slots.sum().item())
+                    to_free_slots = torch.empty(
+                        (_n_to_free,),
+                        dtype=torch.int64,
+                        device=to_free_num_slots.device,
+                    )
+                    get_target_cache_loc[(bs,)](
+                        tgt_cache_loc,
+                        to_free_slots,
+                        accept_length,
+                        to_free_num_slots,
+                        batch.out_cache_loc,
+                        self.draft_token_num,
+                        next_power_of_2(self.draft_token_num),
+                        next_power_of_2(bs),
+                    )
 
-                batch.token_to_kv_pool_allocator.free(to_free_slots)
-                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                    tgt_cache_loc, src_cache_loc
-                )
-                batch.out_cache_loc = tgt_cache_loc
+                    batch.token_to_kv_pool_allocator.free(to_free_slots)
+                    batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                        tgt_cache_loc, src_cache_loc
+                    )
+                    batch.out_cache_loc = tgt_cache_loc
             else:
-                out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-                row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
-                keep_slots = _compute_paged_keep_slots(
-                    prefix_lens=batch.seq_lens,
-                    commit_lens=commit_lens,
-                    draft_token_num=self.draft_token_num,
-                    page_size=page_size,
-                )
-                free_mask = row_offsets >= keep_slots[:, None]
-                batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+                with torch.profiler.record_function(
+                    "DFlashVerify.kv_compact_paged_linear"
+                ):
+                    out_cache_loc = batch.out_cache_loc.view(
+                        bs, self.draft_token_num
+                    )
+                    row_offsets = torch.arange(
+                        self.draft_token_num, device=device
+                    )[None, :]
+                    keep_slots = _compute_paged_keep_slots(
+                        prefix_lens=batch.seq_lens,
+                        commit_lens=commit_lens,
+                        draft_token_num=self.draft_token_num,
+                        page_size=page_size,
+                    )
+                    free_mask = row_offsets >= keep_slots[:, None]
+                    batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
 
-                keep_mask = row_offsets < commit_lens[:, None]
-                batch.out_cache_loc = out_cache_loc[keep_mask]
+                    keep_mask = row_offsets < commit_lens[:, None]
+                    batch.out_cache_loc = out_cache_loc[keep_mask]
 
-        # Update req-level KV cache accounting.
-        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
-            req.kv_committed_len += commit_len
-            req.kv_allocated_len = req.kv_committed_len
+        with torch.profiler.record_function("DFlashVerify.kv_accounting_cpu_loop"):
+            # Update req-level KV cache accounting.
+            for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
+                req.kv_committed_len += commit_len
+                req.kv_allocated_len = req.kv_committed_len
 
-        # Update req_to_token pool mapping for newly committed tokens.
-        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
-        )
-
-        # Update batch seq lens.
-        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-        batch.seq_lens_cpu.add_(
-            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
-        )
-        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
-        batch.seq_lens_sum += sum(commit_lens_cpu)
-
-        # Build next-step context features from the committed verify-input tokens.
-        hidden = logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError(
-                "DFLASH verify requires target hidden states, but got None."
+        with torch.profiler.record_function("DFlashVerify.assign_req_to_token"):
+            # Update req_to_token pool mapping for newly committed tokens.
+            end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
+                bs,
             )
-        hidden = hidden.view(bs, self.draft_token_num, -1)
-        segments: List[torch.Tensor] = []
-        for i, ln in enumerate(commit_lens_cpu):
-            if ln > 0:
-                if is_tree_verify:
-                    indices = accept_index[i, : ln].to(hidden.device)
-                    segments.append(hidden[i].index_select(0, indices))
-                else:
-                    segments.append(hidden[i, :ln, :])
-        next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
+
+        with torch.profiler.record_function("DFlashVerify.update_seq_lens"):
+            # Update batch seq lens.
+            batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+            batch.seq_lens_cpu.add_(
+                torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+            )
+            # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
+            batch.seq_lens_sum += sum(commit_lens_cpu)
+
+        with torch.profiler.record_function("DFlashVerify.build_next_target_hidden"):
+            # Build next-step context features from the committed verify-input tokens.
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError(
+                    "DFLASH verify requires target hidden states, but got None."
+                )
+            hidden = hidden.view(bs, self.draft_token_num, -1)
+            segments: List[torch.Tensor] = []
+            for i, ln in enumerate(commit_lens_cpu):
+                if ln > 0:
+                    if is_tree_verify:
+                        indices = accept_index[i, :ln].to(hidden.device)
+                        segments.append(hidden[i].index_select(0, indices))
+                    else:
+                        segments.append(hidden[i, :ln, :])
+            next_target_hidden = (
+                torch.cat(segments, dim=0) if segments else hidden[:0]
+            )
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None
