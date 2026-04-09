@@ -558,13 +558,14 @@ class CudaGraphRunner:
             full_block_size = (
                 self.model_runner.server_args.speculative_num_draft_tokens
             )
-            # DFLASH target model: capture multiple CUDA graphs for different
-            # verify block sizes to support dynamic per-request truncation.
             self.num_tokens_per_bs = full_block_size
             if (
                 model_runner.spec_algorithm.is_dflash()
                 and not self.model_runner.is_draft_worker
+                and self.model_runner.server_args.speculative_dflash_dynamic_vbs
             ):
+                # DFLASH target model: capture multiple CUDA graphs for different
+                # verify block sizes to support dynamic per-request truncation.
                 self.dflash_verify_buckets = [4, 6, 8, 12, full_block_size]
             else:
                 self.dflash_verify_buckets = None

@@ -175,12 +175,13 @@ class DFlashWorker:
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s, dynamic_vbs=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
+                server_args.speculative_dflash_dynamic_vbs,
             )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
@@ -190,12 +191,25 @@ class DFlashWorker:
             )
 
         # Dynamic verify block size: per-request truncation based on draft confidence.
-        # CUDA graphs are captured for each bucket size; batch uses max bucket.
-        self.use_dynamic_verify = True
+        # CUDA graphs are captured for each bucket size; the batch uses the max bucket.
+        self.use_dynamic_verify = bool(server_args.speculative_dflash_dynamic_vbs)
         self.dynamic_verify_margin = 2
         self.dynamic_verify_confidence_scale = 0.5  # power < 1 compresses toward 1
         # Must match dflash_verify_buckets in cuda_graph_runner.py.
-        self.dynamic_verify_buckets = [4, 6, 8, 12, self.block_size]
+        self.dynamic_verify_buckets = sorted(
+            {b for b in (4, 6, 8, 12, self.block_size) if b <= self.block_size}
+        )
+        self._dynamic_verify_bucket_lookup = [self.block_size] * (self.block_size + 1)
+        bucket_idx = 0
+        for tokens_per_bs in range(self.block_size + 1):
+            while (
+                bucket_idx + 1 < len(self.dynamic_verify_buckets)
+                and tokens_per_bs > self.dynamic_verify_buckets[bucket_idx]
+            ):
+                bucket_idx += 1
+            self._dynamic_verify_bucket_lookup[tokens_per_bs] = (
+                self.dynamic_verify_buckets[bucket_idx]
+            )
 
         # Cache target model components accessed every iteration.
         target_model = self.target_worker.model_runner.model
@@ -220,6 +234,9 @@ class DFlashWorker:
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        self._dynamic_verify_tokens_buf: Optional[torch.Tensor] = None
+        self._dynamic_verify_positions_buf: Optional[torch.Tensor] = None
+        self._dynamic_verify_vbs_cumsum_buf: Optional[torch.Tensor] = None
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -342,6 +359,28 @@ class DFlashWorker:
         )
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
+        )
+
+    def _ensure_dynamic_verify_buffers(self, bs: int) -> None:
+        cap = (
+            0
+            if self._dynamic_verify_vbs_cumsum_buf is None
+            else int(self._dynamic_verify_vbs_cumsum_buf.shape[0]) - 1
+        )
+        if cap >= int(bs):
+            return
+
+        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        max_tokens = new_cap * int(self.block_size)
+        device = self.device
+        self._dynamic_verify_tokens_buf = torch.empty(
+            (max_tokens,), dtype=torch.long, device=device
+        )
+        self._dynamic_verify_positions_buf = torch.empty(
+            (max_tokens,), dtype=torch.int64, device=device
+        )
+        self._dynamic_verify_vbs_cumsum_buf = torch.empty(
+            (new_cap + 1,), dtype=torch.int32, device=device
         )
 
     def __getattr__(self, name):
@@ -669,18 +708,23 @@ class DFlashWorker:
         if self.use_dynamic_verify:
             # Sample all block_size-1 draft positions with confidence estimation.
             sample_len = self.block_size - 1
+            hidden_states = draft_hidden[:, 1 : 1 + sample_len, :].reshape(
+                -1, draft_hidden.shape[-1]
+            )
             draft_next, confidence = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1 : 1 + sample_len, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
+                hidden_states=hidden_states,
                 lm_head=lm_head,
                 return_confidence=True,
             )
             draft_next = draft_next.view(bs, sample_len)
             confidence = confidence.view(bs, sample_len)
+            block_ids[:, 1 : 1 + sample_len].copy_(draft_next)
 
             # Scale confidence to counteract cumprod amplification of miscalibration.
-            scaled_conf = confidence ** self.dynamic_verify_confidence_scale
+            if self.dynamic_verify_confidence_scale == 0.5:
+                scaled_conf = torch.sqrt(confidence)
+            else:
+                scaled_conf = confidence ** self.dynamic_verify_confidence_scale
             cum_conf = torch.cumprod(scaled_conf, dim=1)  # [bs, sample_len]
             est_accept = cum_conf.sum(dim=1)  # [bs]
 
@@ -690,66 +734,58 @@ class DFlashWorker:
             raw_vbs = torch.ceil(est_accept + self.dynamic_verify_margin).clamp(
                 min=buckets[0], max=self.block_size
             ).int()
-            per_req_vbs = raw_vbs.to(device)
+            per_req_vbs = raw_vbs
 
-            # Pack tokens tightly: each request contributes per_req_vbs[i] tokens.
-            full_draft_tokens = torch.cat(
-                [block_ids[:, 0:1], draft_next], dim=1
-            )  # [bs, block_size]
-
-            # Cumulative sum for indexing.
-            vbs_cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-            vbs_cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
-            total_real = int(vbs_cumsum[-1].item())
-
-            # Vectorized packing: build row/col indices for gather.
-            row_idx = torch.repeat_interleave(
-                torch.arange(bs, device=device), per_req_vbs
-            )
-            col_idx = torch.arange(total_real, device=device) - torch.repeat_interleave(
-                vbs_cumsum[:bs], per_req_vbs
-            )
-
-            # Determine effective_tpbs for CUDA graph: ceil(total / bs) → bucket.
-            effective_tpbs = -(-total_real // bs)  # ceil division
-            for b in buckets:
-                if effective_tpbs <= b:
-                    effective_tpbs = b
-                    break
-            else:
-                effective_tpbs = self.block_size
-
-            # Pre-allocate padded tensors and fill real tokens via gather.
+            total_real = int(per_req_vbs.sum().item())
+            effective_tpbs = self._dynamic_verify_bucket_lookup[
+                min((total_real + bs - 1) // bs, self.block_size)
+            ]
             total_padded = bs * effective_tpbs
-            padded_tokens = torch.zeros(total_padded, dtype=full_draft_tokens.dtype, device=device)
-            padded_positions = torch.zeros(total_padded, dtype=positions_2d.dtype, device=device)
-            padded_tokens[:total_real] = full_draft_tokens[row_idx, col_idx]
-            padded_positions[:total_real] = positions_2d[row_idx, col_idx]
 
-            if not hasattr(self, '_bucket_counter'):
-                self._bucket_counter = {}
-                self._per_req_vbs_counter = {}
-                self._bucket_log_interval = 100
-                self._bucket_log_count = 0
-            self._bucket_counter[effective_tpbs] = self._bucket_counter.get(effective_tpbs, 0) + 1
-            for v in per_req_vbs.cpu().tolist():
-                v = int(v)
-                self._per_req_vbs_counter[v] = self._per_req_vbs_counter.get(v, 0) + 1
-            self._bucket_log_count += 1
-            if self._bucket_log_count % self._bucket_log_interval == 0:
-                sorted_vbs = dict(sorted(self._per_req_vbs_counter.items()))
-                logger.info("Dynamic VBS bucket distribution: %s (last %d steps)",
-                           self._bucket_counter, self._bucket_log_count)
-                logger.info("Per-request VBS distribution: %s", sorted_vbs)
+            if total_real == total_padded:
+                # Full rectangular bucket: reuse the regular fixed-shape verify path.
+                verify_input = DFlashVerifyInput(
+                    draft_token=block_ids[:, :effective_tpbs].reshape(-1),
+                    positions=positions_2d[:, :effective_tpbs].contiguous().reshape(-1),
+                    draft_token_num=effective_tpbs,
+                )
+            else:
+                # Mixed per-request VBS: keep the tight-packed dynamic verify layout.
+                self._ensure_dynamic_verify_buffers(bs)
+                assert self._dynamic_verify_tokens_buf is not None
+                assert self._dynamic_verify_positions_buf is not None
+                assert self._dynamic_verify_vbs_cumsum_buf is not None
+                vbs_cumsum = self._dynamic_verify_vbs_cumsum_buf[: bs + 1]
+                vbs_cumsum[0] = 0
+                vbs_cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
 
-            verify_input = DFlashVerifyInput(
-                draft_token=padded_tokens,
-                positions=padded_positions,
-                draft_token_num=effective_tpbs,
-                per_request_vbs=per_req_vbs,
-                per_request_vbs_cumsum=vbs_cumsum,
-                total_real_tokens=total_real,
-            )
+                padded_tokens = self._dynamic_verify_tokens_buf[:total_padded]
+                padded_positions = self._dynamic_verify_positions_buf[:total_padded]
+                padded_tokens.zero_()
+                padded_positions.zero_()
+                if bs == 1:
+                    padded_tokens[:total_real].copy_(block_ids[0, :total_real])
+                    padded_positions[:total_real].copy_(positions_2d[0, :total_real])
+                else:
+                    # Vectorized packing: build row/col indices for gather.
+                    row_idx = torch.repeat_interleave(
+                        torch.arange(bs, device=device), per_req_vbs
+                    )
+                    col_idx = torch.arange(
+                        total_real, device=device
+                    ) - torch.repeat_interleave(vbs_cumsum[:bs], per_req_vbs)
+
+                    padded_tokens[:total_real] = block_ids[row_idx, col_idx]
+                    padded_positions[:total_real] = positions_2d[row_idx, col_idx]
+
+                verify_input = DFlashVerifyInput(
+                    draft_token=padded_tokens,
+                    positions=padded_positions,
+                    draft_token_num=effective_tpbs,
+                    per_request_vbs=per_req_vbs,
+                    per_request_vbs_cumsum=vbs_cumsum,
+                    total_real_tokens=total_real,
+                )
         else:
             # Fixed verify block size fallback.
             vbs = self.block_size
@@ -760,9 +796,8 @@ class DFlashWorker:
                 ),
                 lm_head=lm_head,
             ).view(bs, sample_len)
-            draft_tokens_flat = torch.cat(
-                [block_ids[:, 0:1], draft_next], dim=1
-            ).reshape(-1)
+            block_ids[:, 1 : 1 + sample_len].copy_(draft_next)
+            draft_tokens_flat = block_ids.reshape(-1)
             positions_flat = positions_2d[:, :vbs].contiguous().reshape(-1)
 
             verify_input = DFlashVerifyInput(

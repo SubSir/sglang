@@ -203,16 +203,20 @@ class DFlashVerifyInput(SpecInput):
         # Per-request end offsets for KV cache allocation.
         if tight:
             end_offset = batch.seq_lens + self.per_request_vbs.to(batch.seq_lens.dtype)
-            end_offset_cpu = batch.seq_lens_cpu + self.per_request_vbs.cpu().to(batch.seq_lens_cpu.dtype)
         else:
             end_offset = batch.seq_lens + self.draft_token_num
-            end_offset_cpu = batch.seq_lens_cpu + self.draft_token_num
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache, len(batch.input_ids)
             )
         else:
+            if tight:
+                end_offset_cpu = batch.seq_lens_cpu + self.per_request_vbs.cpu().to(
+                    batch.seq_lens_cpu.dtype
+                )
+            else:
+                end_offset_cpu = batch.seq_lens_cpu + self.draft_token_num
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
             last_loc = get_last_loc(
@@ -413,7 +417,6 @@ class DFlashVerifyInput(SpecInput):
 
         if tight:
             # Unpack from tight packing to (bs, max_vbs) for acceptance computation.
-            max_vbs = int(self.per_request_vbs.max().item())
             cumsum = self.per_request_vbs_cumsum
             total_real = self.total_real_tokens
 
@@ -422,18 +425,29 @@ class DFlashVerifyInput(SpecInput):
             all_logits = logits_output.next_token_logits
             packed_predict = torch.argmax(all_logits[:total_real], dim=-1)  # [total_real]
 
-            # Vectorized scatter: build row/col indices for unpacking.
-            row_idx = torch.repeat_interleave(
-                torch.arange(bs, device=device), self.per_request_vbs
-            )
-            col_idx = torch.arange(total_real, device=device) - torch.repeat_interleave(
-                cumsum[:bs], self.per_request_vbs
-            )
+            if bs == 1:
+                max_vbs = total_real
+                candidates_2d = self.draft_token[:total_real].view(1, max_vbs)
+                target_predict_2d = packed_predict.view(1, max_vbs)
+            else:
+                max_vbs = int(self.per_request_vbs.max().item())
 
-            candidates_2d = torch.zeros(bs, max_vbs, dtype=self.draft_token.dtype, device=device)
-            target_predict_2d = torch.zeros(bs, max_vbs, dtype=torch.int64, device=device)
-            candidates_2d[row_idx, col_idx] = self.draft_token[:total_real]
-            target_predict_2d[row_idx, col_idx] = packed_predict
+                # Vectorized scatter: build row/col indices for unpacking.
+                row_idx = torch.repeat_interleave(
+                    torch.arange(bs, device=device), self.per_request_vbs
+                )
+                col_idx = torch.arange(total_real, device=device) - torch.repeat_interleave(
+                    cumsum[:bs], self.per_request_vbs
+                )
+
+                candidates_2d = torch.zeros(
+                    bs, max_vbs, dtype=self.draft_token.dtype, device=device
+                )
+                target_predict_2d = torch.zeros(
+                    bs, max_vbs, dtype=torch.int64, device=device
+                )
+                candidates_2d[row_idx, col_idx] = self.draft_token[:total_real]
+                target_predict_2d[row_idx, col_idx] = packed_predict
 
             # Greedy acceptance on the unpacked 2D layout.
             accept_len, bonus = compute_dflash_accept_len_and_bonus(
@@ -544,15 +558,26 @@ class DFlashVerifyInput(SpecInput):
 
             # Vectorized per-request KV freeing within real tokens.
             real_cache_loc = batch.out_cache_loc[:total_real]
-            # Build offset-within-request for each packed token.
-            offset_in_req = torch.arange(total_real, device=device) - torch.repeat_interleave(
-                self.per_request_vbs_cumsum[:bs], self.per_request_vbs
-            )
-            # Each token is committed if its offset < commit_lens[request_id].
-            committed = offset_in_req < torch.repeat_interleave(commit_lens, self.per_request_vbs)
+            if bs == 1:
+                commit_len0 = int(commit_lens_cpu[0])
+                committed = (
+                    torch.arange(total_real, device=device) < commit_len0
+                )
+                if commit_len0 < total_real:
+                    batch.token_to_kv_pool_allocator.free(real_cache_loc[commit_len0:])
+                batch.out_cache_loc = real_cache_loc[:commit_len0]
+            else:
+                # Build offset-within-request for each packed token.
+                offset_in_req = torch.arange(total_real, device=device) - torch.repeat_interleave(
+                    self.per_request_vbs_cumsum[:bs], self.per_request_vbs
+                )
+                # Each token is committed if its offset < commit_lens[request_id].
+                committed = offset_in_req < torch.repeat_interleave(
+                    commit_lens, self.per_request_vbs
+                )
 
-            batch.token_to_kv_pool_allocator.free(real_cache_loc[~committed])
-            batch.out_cache_loc = real_cache_loc[committed]
+                batch.token_to_kv_pool_allocator.free(real_cache_loc[~committed])
+                batch.out_cache_loc = real_cache_loc[committed]
         elif page_size == 1:
             out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
             keep_mask = (

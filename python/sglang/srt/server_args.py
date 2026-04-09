@@ -499,6 +499,7 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
+    speculative_dflash_dynamic_vbs: bool = True
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -4975,6 +4976,13 @@ class ServerArgs:
             "local cache (paged backends may retain up to one extra page on the left "
             "for alignment). Default is full context.",
             default=ServerArgs.speculative_dflash_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-dynamic-vbs",
+            default=ServerArgs.speculative_dflash_dynamic_vbs,
+            action=argparse.BooleanOptionalAction,
+            help="DFLASH only. Enable dynamic verify block size truncation. "
+            "Use --no-speculative-dflash-dynamic-vbs to force fixed verify block size.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
