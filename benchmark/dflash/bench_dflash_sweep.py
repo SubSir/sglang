@@ -586,7 +586,8 @@ def main() -> None:
 
     # Pre-load all datasets and prompts
     dataset_prompts = {}
-    enable_thinking = "qwen3.5" in args.target_model.lower()
+    is_qwen35_model = "qwen3.5" in args.target_model.lower()
+    enable_thinking = is_qwen35_model
     for dname in data_names:
         print(f"Loading dataset: {dname}")
         ds = load_and_process_dataset(dname)
@@ -653,6 +654,10 @@ def main() -> None:
                         )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
+            if is_qwen35_model:
+                common_server_args.extend(
+                    ["--mamba-scheduler-strategy", "extra_buffer"]
+                )
 
             # baseline
             if not args.skip_baseline:

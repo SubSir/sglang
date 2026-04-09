@@ -101,7 +101,6 @@ def run_dataset_sweep(
         # "--piecewise-cuda-graph-max-tokens",
         # str(piecewise_cuda_graph_max_tokens)
         # "--samples-per-concurrency-base", "256",
-        "--disable-radix-cache",
         "--speculative-eagle-topk", str(tree_verify_topk),
         "--speculative-dflash-block-size", str(speculative_dflash_block_size),
     ]
@@ -180,8 +179,8 @@ def run_dataset_sweep(
 @app.local_entrypoint()
 def main(
     data_names: str = "gsm8k,mt-bench",
-    target_model: str = "Qwen/Qwen3-8B",
-    draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+    target_model: str = "Qwen/Qwen3.5-27B",
+    draft_model: str = "z-lab/Qwen3.5-27B-DFlash",
     offset: int = 2,
     warmup: int = 0,
     speculative_dflash_block_size: int = 16,
