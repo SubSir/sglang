@@ -12,7 +12,7 @@ base_image = (
 local_image = (
     base_image
     .run_commands(
-        "echo 60 > /tmp/build_time",
+        "echo 80 > /tmp/build_time",
         "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
         "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
@@ -39,11 +39,11 @@ local_image = (
 )
 
 @app.function(
-    gpu="H200",
+    gpu="B200",
     timeout=7200,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    cloud="aws"
+    # cloud="aws"
 )
 def run_dataset_sweep(
     target_model: str,
@@ -95,7 +95,7 @@ def run_dataset_sweep(
         "--concurrencies", "32",
         "--output-md", output_path,
         "--max-running-requests", str(max_concurrency),
-        "--attention-backends", "fa3",
+        "--attention-backends", "fa4",
         "--mem-fraction-static", "0.9",
         # "--enable-piecewise-cuda-graph",
         # "--piecewise-cuda-graph-max-tokens",

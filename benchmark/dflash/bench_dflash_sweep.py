@@ -569,7 +569,7 @@ def main() -> None:
     is_blackwell = _is_blackwell()
     device_sm = get_device_sm()
     if is_blackwell:
-        attention_backends = [b for b in attention_backends if b == "flashinfer"]
+        attention_backends = [b for b in attention_backends if b == "flashinfer" or b == "fa4" or b == "trtllm_mha"]
     if device_sm < 90:
         attention_backends = [b for b in attention_backends if b != "fa3"]
     attention_backends = attention_backends or ["flashinfer"]
@@ -616,11 +616,14 @@ def main() -> None:
     for backend in attention_backends:
         for tp in tp_sizes:
             port_base = find_available_port(20000)
+            speculative_draft_attention_backend = "fa4" if is_blackwell else "fa3"
 
             common_server_args: list[str] = [
                 "--trust-remote-code",
                 "--attention-backend",
                 backend,
+                "--speculative-draft-attention-backend",
+                speculative_draft_attention_backend,
                 "--tp-size",
                 str(tp),
                 "--dtype",

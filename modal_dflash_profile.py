@@ -20,7 +20,7 @@ base_image = (
 local_image = (
     base_image
     .run_commands(
-        "echo 60 > /tmp/build_time",
+        "echo 80 > /tmp/build_time",
         "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
         "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
