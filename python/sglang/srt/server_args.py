@@ -123,6 +123,7 @@ QUANTIZATION_CHOICES = [
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
+DFLASH_DYNAMIC_VBS_PREDICTOR_CHOICES = ["confidence", "mlp_head"]
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -500,6 +501,9 @@ class ServerArgs:
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_dflash_dynamic_vbs: bool = True
+    speculative_dflash_dynamic_vbs_predictor: Literal[
+        "confidence", "mlp_head"
+    ] = "confidence"
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -3008,6 +3012,13 @@ class ServerArgs:
                 raise ValueError(
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
                 )
+            predictor = str(self.speculative_dflash_dynamic_vbs_predictor).strip()
+            if predictor not in DFLASH_DYNAMIC_VBS_PREDICTOR_CHOICES:
+                raise ValueError(
+                    "DFLASH requires --speculative-dflash-dynamic-vbs-predictor to be "
+                    f"one of {DFLASH_DYNAMIC_VBS_PREDICTOR_CHOICES}, got {predictor!r}."
+                )
+            self.speculative_dflash_dynamic_vbs_predictor = predictor
 
             # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
             # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
@@ -4983,6 +4994,16 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             help="DFLASH only. Enable dynamic verify block size truncation. "
             "Use --no-speculative-dflash-dynamic-vbs to force fixed verify block size.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-dynamic-vbs-predictor",
+            type=str,
+            default=ServerArgs.speculative_dflash_dynamic_vbs_predictor,
+            choices=DFLASH_DYNAMIC_VBS_PREDICTOR_CHOICES,
+            help="DFLASH only. Predictor used to estimate dynamic verify block size. "
+            "'confidence' uses LM-head confidence heuristics; 'mlp_head' uses the "
+            "draft model's learned verify head. The draft model must expose "
+            "verify-head weights when 'mlp_head' is selected.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

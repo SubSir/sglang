@@ -248,6 +248,169 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class DFlashVerifyHead(nn.Module):
+    """Shared-position MLP predictor for DFlash dynamic verify lengths."""
+
+    def __init__(self, config, *, hidden_ratio: int, block_size: int) -> None:
+        super().__init__()
+        hidden_size = int(config.hidden_size)
+        block_size = int(block_size)
+        if block_size <= 1:
+            raise ValueError(
+                f"DFLASH verify head requires block_size > 1, got {block_size}."
+            )
+
+        hidden_ratio = max(1, int(hidden_ratio))
+        bottleneck_size = max(1, hidden_size // hidden_ratio)
+        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.position_embeddings = nn.Embedding(block_size, hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, bottleneck_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(bottleneck_size, 1, bias=True),
+        )
+        self.register_buffer(
+            "_position_projection_cache",
+            torch.empty((0, 0)),
+            persistent=False,
+        )
+
+    def refresh_position_projection_cache(self) -> None:
+        """Precompute first-layer position contributions after checkpoint load."""
+        weight = self.mlp[0].weight
+        with torch.no_grad():
+            position_embeddings = self.position_embeddings.weight.to(
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+            self._position_projection_cache = F.linear(
+                position_embeddings, weight, None
+            )
+
+    def _get_position_projection_cache(
+        self, *, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        cache = self._position_projection_cache
+        expected_shape = (
+            int(self.position_embeddings.num_embeddings),
+            int(self.mlp[0].out_features),
+        )
+        if (
+            cache.shape != expected_shape
+            or cache.device != device
+            or cache.dtype != dtype
+        ):
+            self.refresh_position_projection_cache()
+            cache = self._position_projection_cache
+        return cache
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        proposal_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = self.mlp[0](self.norm(hidden_states))
+        position_projection = self._get_position_projection_cache(
+            device=x.device,
+            dtype=x.dtype,
+        )
+        if proposal_offsets is None:
+            num_proposals = int(hidden_states.shape[1])
+            offset_projection = position_projection[1 : 1 + num_proposals].unsqueeze(0)
+        else:
+            if proposal_offsets.device != x.device:
+                proposal_offsets = proposal_offsets.to(device=x.device)
+            offset_projection = position_projection[proposal_offsets]
+        x = x + offset_projection
+        x = self.mlp[1](x)
+        return self.mlp[2](x).squeeze(-1)
+
+    def expected_accept_lens(self, proposal_hidden: torch.Tensor) -> torch.Tensor:
+        hazard_logits = self(proposal_hidden)
+        survival_probs = torch.sigmoid(hazard_logits.float()).cumprod(dim=1)
+        return survival_probs.sum(dim=1) + 1.0
+
+
+class _DFlashPerPositionVerifyHead(nn.Module):
+    """A single position-specific MLP predictor head."""
+
+    def __init__(self, hidden_size: int, *, hidden_ratio: int, eps: float) -> None:
+        super().__init__()
+        hidden_ratio = max(1, int(hidden_ratio))
+        bottleneck_size = max(1, hidden_size // hidden_ratio)
+        self.norm = RMSNorm(hidden_size, eps=eps)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, bottleneck_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(bottleneck_size, 1, bias=True),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = self.norm(hidden_states)
+        return self.mlp(x).squeeze(-1)
+
+
+class DFlashMultiVerifyHead(nn.Module):
+    """Per-position MLP heads for DFlash dynamic verify lengths."""
+
+    def __init__(
+        self,
+        config,
+        *,
+        hidden_ratio: int,
+        num_heads: int,
+        block_size: int,
+    ) -> None:
+        super().__init__()
+        hidden_size = int(config.hidden_size)
+        block_size = int(block_size)
+        if block_size <= 1:
+            raise ValueError(
+                f"DFLASH verify head requires block_size > 1, got {block_size}."
+            )
+
+        num_heads = int(num_heads)
+        if num_heads <= 0:
+            raise ValueError(
+                f"DFLASH multi verify head requires num_heads > 0, got {num_heads}."
+            )
+
+        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.heads = nn.ModuleList(
+            [
+                _DFlashPerPositionVerifyHead(
+                    hidden_size,
+                    hidden_ratio=hidden_ratio,
+                    eps=rms_norm_eps,
+                )
+                for _ in range(num_heads)
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_proposals = int(hidden_states.shape[1])
+        if num_proposals > len(self.heads):
+            raise ValueError(
+                "DFLASH multi verify head received more proposal positions than "
+                f"configured heads. num_proposals={num_proposals}, "
+                f"num_heads={len(self.heads)}."
+            )
+        logits = [
+            head(hidden_states[:, idx, :])
+            for idx, head in enumerate(self.heads[:num_proposals])
+        ]
+        if not logits:
+            return hidden_states.new_empty((hidden_states.shape[0], 0))
+        return torch.stack(logits, dim=1)
+
+    def expected_accept_lens(self, proposal_hidden: torch.Tensor) -> torch.Tensor:
+        hazard_logits = self(proposal_hidden)
+        survival_probs = torch.sigmoid(hazard_logits.float()).cumprod(dim=1)
+        return survival_probs.sum(dim=1) + 1.0
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model (no embedding / lm_head weights).
 
@@ -291,6 +454,71 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+        dflash_config = getattr(config, "dflash_config", {}) or {}
+        verify_head_enabled = bool(dflash_config.get("verify_head_enabled", False))
+        verify_head_hidden_ratio = int(dflash_config.get("verify_head_hidden_ratio", 8))
+        raw_verify_head_mode = dflash_config.get("verify_head_mode", None)
+        raw_verify_head_num_heads = dflash_config.get("verify_head_num_heads", None)
+
+        if raw_verify_head_mode is None:
+            verify_head_mode = (
+                "multi"
+                if raw_verify_head_num_heads not in (None, 1)
+                else "shared"
+            )
+        else:
+            verify_head_mode = str(raw_verify_head_mode).strip().lower()
+        if verify_head_mode not in ("shared", "multi"):
+            raise ValueError(
+                "DFLASH verify_head_mode must be one of {'shared', 'multi'}, "
+                f"got {verify_head_mode!r}."
+            )
+
+        if raw_verify_head_num_heads is None:
+            verify_head_num_heads = 1 if verify_head_mode == "shared" else (self.block_size - 1)
+        else:
+            verify_head_num_heads = int(raw_verify_head_num_heads)
+
+        if verify_head_mode == "shared" and verify_head_num_heads != 1:
+            raise ValueError(
+                "DFLASH shared verify head requires verify_head_num_heads == 1, "
+                f"got {verify_head_num_heads}."
+            )
+        if verify_head_mode == "multi" and verify_head_num_heads <= 0:
+            raise ValueError(
+                "DFLASH multi verify head requires verify_head_num_heads > 0, "
+                f"got {verify_head_num_heads}."
+            )
+
+        self.verify_head_mode = verify_head_mode if verify_head_enabled else None
+        self.verify_head_num_heads = verify_head_num_heads if verify_head_enabled else 0
+        self.verify_head = (
+            DFlashVerifyHead(
+                config,
+                hidden_ratio=verify_head_hidden_ratio,
+                block_size=self.block_size,
+            )
+            if verify_head_enabled and verify_head_mode == "shared"
+            else None
+        )
+        self.verify_heads = (
+            DFlashMultiVerifyHead(
+                config,
+                hidden_ratio=verify_head_hidden_ratio,
+                num_heads=verify_head_num_heads,
+                block_size=self.block_size,
+            )
+            if verify_head_enabled and verify_head_mode == "multi"
+            else None
+        )
+        if self.has_verify_head_predictor():
+            logger.info(
+                "DFLASH verify head enabled. mode=%s, hidden_ratio=%s, num_heads=%s, block_size=%s",
+                self.verify_head_mode,
+                verify_head_hidden_ratio,
+                self.verify_head_num_heads,
+                self.block_size,
+            )
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
@@ -305,6 +533,34 @@ class DFlashDraftModel(nn.Module):
                 "the draft checkpoint/config expects."
             )
         return self.hidden_norm(self.fc(target_hidden))
+
+    def has_verify_head_predictor(self) -> bool:
+        return self.verify_head is not None or self.verify_heads is not None
+
+    def predict_verify_head_expected_accept_lens(
+        self, block_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict expected verify length, including the current token."""
+        if not self.has_verify_head_predictor():
+            raise RuntimeError(
+                "DFLASH verify head is not enabled for this draft model."
+            )
+        if block_hidden.ndim != 3:
+            raise ValueError(
+                "DFLASH verify head expects block_hidden to be 3D, "
+                f"got shape={tuple(block_hidden.shape)}."
+            )
+        if int(block_hidden.shape[1]) <= 1:
+            raise ValueError(
+                "DFLASH verify head requires at least one proposal token after the "
+                f"current token, got block_hidden.shape={tuple(block_hidden.shape)}."
+            )
+
+        proposal_hidden = block_hidden[:, 1:, :]
+        if self.verify_head is not None:
+            return self.verify_head.expected_accept_lens(proposal_hidden)
+        assert self.verify_heads is not None
+        return self.verify_heads.expected_accept_lens(proposal_hidden)
 
     @torch.no_grad()
     def forward(
@@ -394,6 +650,9 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+        if self.verify_head is not None:
+            self.verify_head.refresh_position_projection_cache()
 
 
 EntryClass = DFlashDraftModel

@@ -190,11 +190,27 @@ class DFlashWorker:
                 self._mask_token_id_override,
             )
 
-        # Dynamic verify block size: per-request truncation based on draft confidence.
+        # Dynamic verify block size: per-request truncation with a selectable predictor.
         # CUDA graphs are captured for each bucket size; the batch uses the max bucket.
         self.use_dynamic_verify = bool(server_args.speculative_dflash_dynamic_vbs)
+        self.dynamic_verify_predictor = str(
+            server_args.speculative_dflash_dynamic_vbs_predictor
+        )
         self.dynamic_verify_margin = 2
         self.dynamic_verify_confidence_scale = 0.5  # power < 1 compresses toward 1
+        if (
+            self.use_dynamic_verify
+            and self.dynamic_verify_predictor == "mlp_head"
+            and not getattr(
+                self.draft_model,
+                "has_verify_head_predictor",
+                lambda: False,
+            )()
+        ):
+            raise RuntimeError(
+                "DFLASH dynamic VBS predictor 'mlp_head' requires the draft model to "
+                "enable a verify head in dflash_config and load its weights."
+            )
         # Must match dflash_verify_buckets in cuda_graph_runner.py.
         self.dynamic_verify_buckets = sorted(
             {b for b in (4, 6, 8, 12, self.block_size) if b <= self.block_size}
@@ -209,6 +225,13 @@ class DFlashWorker:
                 bucket_idx += 1
             self._dynamic_verify_bucket_lookup[tokens_per_bs] = (
                 self.dynamic_verify_buckets[bucket_idx]
+            )
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH dynamic verify predictor=%s, margin=%s, confidence_scale=%s",
+                self.dynamic_verify_predictor,
+                self.dynamic_verify_margin,
+                self.dynamic_verify_confidence_scale,
             )
 
         # Cache target model components accessed every iteration.
@@ -706,27 +729,12 @@ class DFlashWorker:
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
         if self.use_dynamic_verify:
-            # Sample all block_size-1 draft positions with confidence estimation.
             sample_len = self.block_size - 1
-            hidden_states = draft_hidden[:, 1 : 1 + sample_len, :].reshape(
-                -1, draft_hidden.shape[-1]
-            )
-            draft_next, confidence = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=hidden_states,
+            draft_next, est_accept = self._estimate_dynamic_verify_accept(
+                draft_hidden=draft_hidden,
                 lm_head=lm_head,
-                return_confidence=True,
             )
-            draft_next = draft_next.view(bs, sample_len)
-            confidence = confidence.view(bs, sample_len)
             block_ids[:, 1 : 1 + sample_len].copy_(draft_next)
-
-            # Scale confidence to counteract cumprod amplification of miscalibration.
-            if self.dynamic_verify_confidence_scale == 0.5:
-                scaled_conf = torch.sqrt(confidence)
-            else:
-                scaled_conf = confidence ** self.dynamic_verify_confidence_scale
-            cum_conf = torch.cumprod(scaled_conf, dim=1)  # [bs, sample_len]
-            est_accept = cum_conf.sum(dim=1)  # [bs]
 
             # Per-request VBS: each request gets its own verify block size.
             device = draft_hidden.device
@@ -821,6 +829,58 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+    def _estimate_dynamic_verify_accept(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        lm_head,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample draft tokens and estimate accepted draft-token count per request."""
+        sample_len = self.block_size - 1
+        hidden_states = draft_hidden[:, 1 : 1 + sample_len, :].reshape(
+            -1, draft_hidden.shape[-1]
+        )
+
+        if self.dynamic_verify_predictor == "confidence":
+            draft_next, confidence = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden_states,
+                lm_head=lm_head,
+                return_confidence=True,
+            )
+            draft_next = draft_next.view(draft_hidden.shape[0], sample_len)
+            confidence = confidence.view(draft_hidden.shape[0], sample_len)
+
+            # Scale confidence to counteract cumprod amplification of miscalibration.
+            if self.dynamic_verify_confidence_scale == 0.5:
+                scaled_conf = torch.sqrt(confidence)
+            else:
+                scaled_conf = confidence ** self.dynamic_verify_confidence_scale
+            cum_conf = torch.cumprod(scaled_conf, dim=1)
+            est_accept = cum_conf.sum(dim=1)
+            return draft_next, est_accept
+
+        if self.dynamic_verify_predictor == "mlp_head":
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden_states,
+                lm_head=lm_head,
+            ).view(draft_hidden.shape[0], sample_len)
+            with torch.inference_mode():
+                predicted_verify_lens = (
+                    self.draft_model.predict_verify_head_expected_accept_lens(
+                        draft_hidden
+                    )
+                )
+            est_accept = (predicted_verify_lens - 1.0).clamp(
+                min=0.0,
+                max=float(sample_len),
+            )
+            return draft_next, est_accept
+
+        raise ValueError(
+            "Unsupported DFLASH dynamic VBS predictor: "
+            f"{self.dynamic_verify_predictor!r}."
+        )
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
