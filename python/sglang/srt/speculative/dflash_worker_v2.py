@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import List, Optional
 
@@ -97,6 +98,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        # Sectioned CUDA-event timing for the spec-decode breakdown (SGLANG_DFLASH_TIMING=1). Read the
+        # env ONCE here (never in the forward path). Used by _t_start/_t_stop.
+        self._timing = os.environ.get("SGLANG_DFLASH_TIMING") == "1"
+        self._timing_every = int(os.environ.get("SGLANG_DFLASH_TIMING_EVERY", "256"))
+        self._t_sec = {}  # name -> [sum_ms, n]
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
@@ -607,6 +613,102 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
+
+    def _t_start(self):
+        """Begin a CUDA-event section timer (SGLANG_DFLASH_TIMING=1). Returns a start event or None.
+        Sectioned GPU timing for the spec-decode breakdown (draft_fwd / refine / verify / kv_append /
+        ...). Each section is synced at _t_stop so the per-section GPU time is isolated; use a separate
+        timing run (NOT for max throughput)."""
+        if not self._timing:
+            return None
+        e0 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        return e0
+
+    def _t_stop(self, e0, name: str, report_every: int = 256):
+        if e0 is None:
+            return
+        report_every = self._timing_every
+        e1 = torch.cuda.Event(enable_timing=True)
+        e1.record()
+        e1.synchronize()
+        s = self._t_sec.setdefault(name, [0.0, 0])
+        s[0] += e0.elapsed_time(e1)
+        s[1] += 1
+        if name == "verify" and s[1] % report_every == 0:
+            parts = []
+            tot = 0.0
+            for k, (sm, n) in self._t_sec.items():
+                avg = sm / max(n, 1)
+                tot += avg
+                parts.append(f"{k}={avg:.4f}ms")
+            v = self._t_sec.get("verify", [0.0, 1])
+            vavg = v[0] / max(v[1], 1)
+            ratios = " ".join(
+                f"{k}/verify={ (sm/max(n,1)) / max(vavg,1e-9):.2f}"
+                for k, (sm, n) in self._t_sec.items() if k != "verify"
+            )
+            logger.info("DFLASH TIMING (window n=%d) %s | total=%.4fms | %s",
+                        report_every, "  ".join(parts), tot, ratios)
+            # WINDOWED: reset sums so each report is the steady-state over the LAST report_every
+            # steps (the cumulative average is otherwise dominated by the eager warmup first step).
+            for k in self._t_sec:
+                self._t_sec[k][0] = 0.0
+                self._t_sec[k][1] = 0
+
+    @torch.inference_mode()
+    def _domino_serial_predict(self, draft_hidden, anchor_tokens, lm_head, embed_module, dm, bs):
+        """Domino block prediction. shift_label => slot t predicts token a+1+t, so read the base
+        logits from slots 0..block-2 (the "+1" vs baseline DFlash's 1..block-1). The Domino head adds
+        a per-slot logit correction from a causal GRU over the block's tokens: gru_out[t]=GRU(prev_ids
+        0..t), prev_ids=[anchor, a+1, a+2, ...]. lm_head runs ONCE (parallel); only GRU+proj+argmax is
+        serial (cheap). corr applies to slots >= suffix_start. Returns draft_next [bs, block-1].
+        (TP=1 path: full-vocab logits + full-vocab embed_proj correction.)"""
+        block = int(self.block_size)
+        w = lm_head.weight  # [vocab, D]
+        # shift_label=False (baseline DFlash convention): block slot t's hidden predicts the token AT
+        # position t, so the predictions for positions 1..block-1 read hidden slots 1..block-1 (off=1)
+        # -- same as the non-domino path (draft_hidden[:, 1:]). shift_label=True: slot t predicts
+        # position t+1, read slots 0..block-2 (off=0). Both the base lm_head logits and the GRU+embed_proj
+        # correction must use the SAME shifted hidden, with the suffix threshold on the OUTPUT position
+        # (t+off). Mirrors training specforge/core/domino.py::_apply_domino_head. Hardcoding off=0 here
+        # made shift_label=False domino checkpoints predict garbage (acc_len ~1).
+        off = 0 if bool(getattr(dm, "shift_label", False)) else 1
+        base_h = draft_hidden[:, off : off + block - 1, :].to(w.dtype)  # [bs, block-1, D]
+        base_logits = torch.matmul(base_h, w.T).float()           # [bs, block-1, vocab]
+        suffix_start = int(getattr(dm, "domino_suffix_start", 1))
+        if os.environ.get("SGLANG_DFLASH_PREDICT_DBG") == "1":
+            self._dom_dbg_n = getattr(self, "_dom_dbg_n", 0) + 1
+            if self._dom_dbg_n <= 3:
+                # Raw per-slot LM-head argmax under BOTH hidden->token conventions, to expose a
+                # shift_label off-by-one: slots[0:b-1] is the shift_label=TRUE reading this code uses;
+                # slots[1:b] is the shift_label=FALSE (baseline DFlash) reading.
+                alt_logits = torch.matmul(
+                    draft_hidden[:, 1:block, :].to(w.dtype), w.T
+                ).float()
+                logger.info(
+                    "DOMINO-DBG[%d] shift_label=%s suffix_start=%d anchor=%d | slots[0:b-1].argmax=%s | slots[1:b].argmax=%s",
+                    self._dom_dbg_n, getattr(dm, "shift_label", "?"), suffix_start,
+                    int(anchor_tokens[0]), base_logits[0].argmax(-1).tolist(),
+                    alt_logits[0].argmax(-1).tolist(),
+                )
+        gru_dtype = dm.prefix_gru.weight_ih_l0.dtype
+        # process prev_ids[0] = anchor -> gru_out[0] (state carried; slot 0 has no correction)
+        e = embed_module(anchor_tokens).unsqueeze(1).to(gru_dtype)  # [bs,1,D]
+        _, h = dm.prefix_gru(e)
+        preds = []
+        prev = base_logits[:, 0].argmax(-1)                        # slot 0 = a+1 (no corr)
+        preds.append(prev)
+        for t in range(1, block - 1):
+            e = embed_module(prev).unsqueeze(1).to(gru_dtype)      # prev_ids[t] = a+t = preds[t-1]
+            out, h = dm.prefix_gru(e, h)                           # gru_out[t]
+            logit = base_logits[:, t]
+            if (t + off) >= suffix_start:
+                feat = torch.cat([draft_hidden[:, t + off].to(gru_dtype), out[:, 0]], dim=-1)
+                logit = logit + dm.embed_proj(feat).float()        # [bs, vocab]
+            prev = logit.argmax(-1)
+            preds.append(prev)
+        return torch.stack(preds, dim=1)                          # [bs, block-1]
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1197,6 +1299,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
+    # --- DFLASH+MTP refiner hooks (no-ops in plain DFLASH; overridden by DFlashMtpWorkerV2). ---
+    def _maybe_refine_block(self, **kwargs):
+        return
+
+    def _maybe_extend_mtp_kv_decode(self, **kwargs):
+        return
+
+    def _maybe_extend_mtp_kv_prefill(self, **kwargs):
+        return
+
     def forward_batch_generation(
         self,
         model_worker_batch: ScheduleBatch,
@@ -1265,6 +1377,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=model_worker_batch.out_cache_loc,
                 positions=positions,
+            )
+
+            # Optional MTP prefix-KV extend hook (DFlashMtpWorkerV2): fill the MTP nextn-states KV
+            # over the prompt tokens (using the captured final hidden). No-op in plain DFLASH.
+            self._maybe_extend_mtp_kv_prefill(
+                model_worker_batch=model_worker_batch,
+                next_token_ids=next_token_ids,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -1481,23 +1600,64 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+        _te = self._t_start()
         with torch.inference_mode():
             draft_logits_output = self.draft_model_runner.forward(
                 forward_batch
             ).logits_output
+        self._t_stop(_te, "draft_fwd")
 
+        # The draft block prediction (target lm_head over the draft hidden -> argmax) lives between
+        # draft_fwd and refine and was previously UNTIMED (excluded from total). Time it as "draft_head"
+        # so dflash vs mtp totals are apples-to-apples (mtp's lm_head is counted inside "refine").
+        _th = self._t_start()
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, int(self.block_size) - 1)
+        _dm = getattr(self.draft_model_runner, "model", None)
+        if getattr(_dm, "projector_type", None) == "domino":
+            # DOMINO: shift_label (slot t -> a+1+t, read slots 0..block-2) + serial GRU logit
+            # correction (lm_head runs once; only the cheap GRU+proj+argmax is per-slot serial).
+            draft_next = self._domino_serial_predict(
+                draft_hidden, block_ids[:, 0], lm_head, embed_module, _dm, bs
+            )
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+
+        if os.environ.get("SGLANG_DFLASH_PREDICT_DBG") == "1":
+            self._predict_dbg_n = getattr(self, "_predict_dbg_n", 0) + 1
+            if self._predict_dbg_n <= 3:
+                # First few decode blocks of sample 0: anchor + the draft's predicted block. Compare
+                # base vs domino on the same prompt/block (anchor is identical for the same target).
+                logger.info(
+                    "PREDICT-DBG[%d] proj=%s shift_label=%s anchor=%d block_pred=%s",
+                    self._predict_dbg_n, getattr(_dm, "projector_type", None),
+                    getattr(_dm, "shift_label", "?"), int(block_ids[0, 0]),
+                    draft_tokens[0].tolist(),
+                )
+
+        self._t_stop(_th, "draft_head")
+
+        # Optional MTP-refine hook (DFlashMtpWorkerV2): refine slots 1.. in place before verify,
+        # using the per-slot draft hidden + the MTP prefix-KV. No-op in plain DFLASH.
+        _tr = self._t_start()
+        self._maybe_refine_block(
+            draft_hidden=draft_hidden,
+            draft_tokens=draft_tokens,
+            model_worker_batch=model_worker_batch,
+            block_positions_2d=positions_2d,
+            block_cache_loc_2d=verify_out_cache_loc_2d,
+            bs=bs,
+        )
+        self._t_stop(_tr, "refine")
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1531,18 +1691,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
+        _tp = self._t_start()
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
+        self._t_stop(_tp, "verify_prep")
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
+        _tv = self._t_start()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        self._t_stop(_tv, "verify")
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -1659,6 +1823,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
+        _tk = self._t_start()
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_out_cache_loc,
@@ -1666,6 +1831,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             positions=positions,
             commit_lens=commit_lens,
         )
+        self._t_stop(_tk, "kv_append")
+
+        # Optional MTP prefix-KV extend hook (DFlashMtpWorkerV2): extend the MTP nextn-states KV
+        # with the committed verified tokens' final hidden (captured via the target norm hook).
+        self._maybe_extend_mtp_kv_decode(commit_lens=commit_lens, bs=bs)
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

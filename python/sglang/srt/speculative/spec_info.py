@@ -200,6 +200,17 @@ class SpeculativeAlgorithm(Enum):
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
+            # DFlash + native Qwen3.5-MTP multi-round refiner (own-KV) when enabled:
+            # a DFlashWorkerV2 subclass (so is_dflash() stays True everywhere).
+            import os
+
+            if int(os.environ.get("SGLANG_DFLASH_MTP_REFINE_ROUNDS", "0")) > 0:
+                from sglang.srt.speculative.dflash_mtp_worker_v2 import (
+                    DFlashMtpWorkerV2,
+                )
+
+                return DFlashMtpWorkerV2
+
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2

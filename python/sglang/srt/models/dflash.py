@@ -349,6 +349,45 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
+        # DOMINO head (projector_type="domino"): a causal GRU over the block's token embeddings +
+        # an MLP that produces a per-slot logit CORRECTION added to the base lm_head logits at slots
+        # >= suffix_start. shift_label=True => block slot j predicts token anchor+1+j (the "+1 bias"
+        # vs baseline DFlash's anchor+j). suffix_start = pure_prefix (shift) or 1+pure_prefix.
+        dcfg = getattr(config, "dflash_config", {}) or {}
+        self.projector_type = dcfg.get("projector_type", None)
+        self.shift_label = bool(dcfg.get("shift_label", False))
+        self.pure_draft_prefix_len = int(dcfg.get("pure_draft_prefix_len", 0))
+        self.domino_suffix_start = (
+            self.pure_draft_prefix_len if self.shift_label else (1 + self.pure_draft_prefix_len)
+        )
+        if self.projector_type == "domino":
+            emb_dim = int(dcfg["emb_dim"])
+            gru_hidden = int(dcfg["gru_hidden_dim"])
+            vocab_size = int(config.vocab_size)
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size, hidden_size=gru_hidden,
+                num_layers=1, batch_first=True, bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(hidden_size + gru_hidden, emb_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(emb_dim, vocab_size, bias=False),
+            )
+
+    @torch.no_grad()
+    def domino_logit_correction(
+        self, hidden4d: torch.Tensor, block_emb: torch.Tensor
+    ) -> torch.Tensor:
+        """Domino correction added to base logits. hidden4d/block_emb: [N, block, D]. block_emb =
+        target-embedding of the block's per-position tokens (causal GRU input). Returns [N, block,
+        vocab] (zero before suffix_start). Caller adds this to the base lm_head logits."""
+        gru_out, _ = self.prefix_gru(block_emb)  # [N, block, gru_hidden]
+        corr = self.embed_proj(torch.cat([hidden4d, gru_out], dim=-1))  # [N, block, vocab]
+        s = int(self.domino_suffix_start)
+        if s > 0:
+            corr[:, :s, :] = 0.0
+        return corr
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
 
