@@ -61,16 +61,12 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
         self._mtp_refine_start = int(os.environ.get("SGLANG_DFLASH_MTP_REFINE_START", "2"))
         # CUDA-GRAPH refine (bs=1): the 2-round MTP forward is the only un-graphed piece of the
         # decode chain (~1.5ms eager = pure per-forward launch overhead). Capture it into a single
-        # graph -> ~0.3ms. Lazy capture on the Nth bs=1 call (after a couple eager warmups so
-        # cublas/flashinfer are initialized); falls back to eager on any capture failure or bs>1.
-        # NOTE: default OFF -- capture succeeds but a rare cuda-graph KV-gather OOB remains under
-        # investigation (eager refine is the validated path, accept 4.298). Opt in with =1 to debug.
-        # 0=off (eager refine), 1=capture into a cuda graph, 2=EAGER-RUN discriminator (same direct
-        # model.forward + out_graph metadata path as the graph, but NOT captured -> reproduces under
-        # CUDA_LAUNCH_BLOCKING=1 to pinpoint the OOB kernel without the graph hiding the launch site).
-        self._refine_mode = int(os.environ.get("SGLANG_DFLASH_REFINE_GRAPH", "0") or "0")
+        # graph -> ~0.9ms. ponytail: default OFF (eager refine is the validated path, accept 4.298) --
+        # the graph captures but a long-sequence KV corruption remains open; opt in with
+        # SGLANG_DFLASH_REFINE_GRAPH=1.
         self._refine_use_graph = (
-            not self.server_args.disable_cuda_graph and self._refine_mode > 0
+            not self.server_args.disable_cuda_graph
+            and os.environ.get("SGLANG_DFLASH_REFINE_GRAPH") == "1"
         )
         self._refine_graph = None
         self._refine_static = None
@@ -238,7 +234,7 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
             try:
                 self._capture_refine_graph_startup()
                 if self.tp_rank == 0:
-                    logger.info("DFLASH-MTP refine graph captured at STARTUP (mode=%d)", self._refine_mode)
+                    logger.info("DFLASH-MTP refine graph captured at STARTUP")
             except Exception as e:  # noqa: BLE001
                 import traceback
                 logger.warning(
@@ -502,65 +498,10 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
             s.seq_lens_cpu.copy_(s.seq_lens.to("cpu"))
         s.req_pool_indices.copy_(mwb.req_pool_indices[:1])
         fb.seq_lens_sum = int(s.seq_lens_cpu.item())  # cpu .item() -> no GPU sync
-        if os.environ.get("SGLANG_DFLASH_REFINE_DBG") == "1":
-            torch.cuda.synchronize()
-            rt = self._mtp_runner.req_to_token_pool.req_to_token
-            sl = int(s.seq_lens.item()); rp = int(s.req_pool_indices.item())
-            ptbl = rt[rp, :sl]
-            kvsz = int(getattr(self._mtp_runner.token_to_kv_pool, "size", 0)) or 2**31
-            vmax = int(self._mtp_runner.model_config.vocab_size)
-            maxpos = int(getattr(self._mtp_runner.model_config, "context_len", 0)) or 262144
-            tmin, tmax = int(s.block_tokens.min()), int(s.block_tokens.max())
-            pmin, pmax = int(s.positions.min()), int(s.positions.max())
-            ptmin, ptmax = int(ptbl.min()), int(ptbl.max())
-            oclmin, oclmax = int(s.out_cache_loc.min()), int(s.out_cache_loc.max())
-            bad = (tmin < 0 or tmax >= vmax or pmin < 0 or pmax >= maxpos
-                   or ptmin < 0 or ptmax >= kvsz or rp < 0 or rp >= rt.shape[0]
-                   or oclmin < 0 or oclmax >= kvsz)  # store_kvcache asserts out_cache_loc in [0,size)
-            # Throttled trend log of the KV write target vs the MTP pool size, to catch the long-seq
-            # step where the refine's out_cache_loc grows past the pool (-> store_kvcache OOB).
-            self._refine_dbg_n = getattr(self, "_refine_dbg_n", 0) + 1
-            if bad or self._refine_dbg_n % 200 == 1:
-                logger.info(
-                    "REFINE-DBG%s tok[%d,%d]/v%d pos[%d,%d]/m%d seqlen=%d req=%d/%d ocl[%d,%d] ptbl[%d,%d]/kv%d",
-                    "-BAD" if bad else "", tmin, tmax, vmax, pmin, pmax, maxpos, sl, rp, rt.shape[0],
-                    oclmin, oclmax, ptmin, ptmax, kvsz,
-                )
         # refresh the draft-extend page table from the new prefix, then replay the baked graph.
         self._refine_attn_backend.init_forward_metadata_out_graph(fb, in_capture=False)
         # Re-assign OUR draft-extend metadata (a seed/decode on this backend may have clobbered it).
         self._refine_attn_backend.forward_metadata = self._refine_fwd_meta
-        if self._refine_graph == "EAGER":  # discriminator: run the same path WITHOUT the graph
-            from sglang.srt.model_executor.forward_context import (
-                ForwardContext,
-                forward_context,
-            )
-            be = self._refine_hybrid_be
-            _orig_full = getattr(be, "full_attn_backend", None) if self._refine_is_hybrid else None
-            if self._refine_is_hybrid:
-                be.full_attn_backend = self._refine_be
-            try:
-                with forward_context(ForwardContext(attn_backend=be)):
-                    self._refine_run()
-            finally:
-                if self._refine_is_hybrid:
-                    be.full_attn_backend = _orig_full
-            draft_tokens.reshape(-1).copy_(s.block_tokens)
-            return True
-        if os.environ.get("SGLANG_DFLASH_REFINE_DBG") == "1":
-            torch.cuda.synchronize()  # surfaces the PREVIOUS replay's async OOB here
-            be_dbg = self._refine_attn_backend
-            kvsz = int(getattr(self._mtp_runner.token_to_kv_pool, "size", 0)) or 2**31
-            ocl_mn, ocl_mx = int(s.out_cache_loc.min()), int(s.out_cache_loc.max())
-            kvbuf = getattr(be_dbg, "cuda_graph_kv_indices", None)
-            sl2 = int(s.seq_lens.item())
-            kmn = kmx = -1
-            if kvbuf is not None and len(kvbuf) > 0:  # the actual KV gather indices the kernel reads
-                kvi = kvbuf[0][:sl2]
-                kmn, kmx = int(kvi.min()), int(kvi.max())
-            if ocl_mx >= kvsz or ocl_mn < 0 or kmx >= kvsz or kmn < 0:
-                logger.info("REFINE-DBG-KVI OOB! ocl[%d,%d] kvidx[%d,%d] seqlen=%d kvpool=%d",
-                            ocl_mn, ocl_mx, kmn, kmx, sl2, kvsz)
         self._refine_graph.replay()
         draft_tokens.reshape(-1).copy_(s.block_tokens)
         return True
@@ -738,12 +679,6 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
             fb.dp_local_start_pos = fb.dp_local_num_tokens = None
             set_dp_buffer_len(None, block, fb.dp_padding_mode.is_max_len(), None)
             set_is_extend_in_batch(False)
-            # DIAGNOSTIC (mode 2 only, not graph-safe): run the FULL runner.forward (== mode 0's clean
-            # path) instead of model.forward, to isolate whether bug 3 is the forward wrapper setup or
-            # the hand-built fb. Gated by SGLANG_DFLASH_REFINE_USE_RUNNER=1.
-            _use_runner = self._refine_mode == 2 and os.environ.get(
-                "SGLANG_DFLASH_REFINE_USE_RUNNER"
-            ) == "1"
             for _r in range(rounds):  # round 2+ reuses the same fb (input_ids updated in place)
                 # model.forward MUTATES fb.out_cache_loc and fb.spec_info.hidden_states (the draft-extend
                 # repoints them mid-forward). Back up and restore around EVERY forward exactly like the
@@ -752,10 +687,7 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
                 # the verify) write KV to garbage slots -> progressive KV-pool corruption (bug 3).
                 _ocl_bak = fb.out_cache_loc
                 _hs_bak = fb.spec_info.hidden_states
-                if _use_runner:
-                    out = runner.forward(fb).logits_output
-                else:
-                    out = runner.model.forward(fb.input_ids, fb.positions, fb)
+                out = runner.model.forward(fb.input_ids, fb.positions, fb)
                 fb.out_cache_loc = _ocl_bak
                 fb.spec_info.hidden_states = _hs_bak
                 nt = out.next_token_logits[:, :vlim].view(1, block, -1)
@@ -765,7 +697,6 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
         # Route the hybrid wrapper's full sub-backend to the DEDICATED refine backend for the whole
         # capture so the model forward (through the hybrid) uses the dedicated wrappers, then restore
         # so the per-step eager MTP KV-extend keeps using the original shared backend.
-        self._refine_hybrid_be = be
         if self._refine_is_hybrid:
             be.full_attn_backend = self._refine_be
         try:
@@ -776,13 +707,6 @@ class DFlashMtpWorkerV2(DFlashWorkerV2):
                     # Stash our draft-extend metadata; re-assigned before every replay as belt-and-suspenders
                     # (the dedicated backend is not shared, so nothing should clobber it).
                     self._refine_fwd_meta = self._refine_be.forward_metadata
-                    if self._refine_mode == 2:
-                        # EAGER-RUN: skip capture; run _run() eagerly each step (CUDA_LAUNCH_BLOCKING-friendly).
-                        self._refine_run = _run
-                        self._refine_static, self._refine_fb, self._refine_graph = s, fb, "EAGER"
-                        if self.tp_rank == 0:
-                            logger.info("DFLASH-MTP refine EAGER-RUN mode (no capture; OOB localization)")
-                        return
                     stream = torch.cuda.Stream()
                     stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(stream):

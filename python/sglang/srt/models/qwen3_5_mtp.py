@@ -16,7 +16,6 @@
 
 import copy
 import logging
-import os as _os
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
@@ -40,8 +39,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
-# Read the debug flag ONCE at import (never in the forward path).
-_MTP_HID_DBG = _os.environ.get("SGLANG_MTP_HID_DBG") == "1"
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -179,14 +176,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 input_embeds = self.model.embed_tokens(input_ids)
 
             hidden_states = forward_batch.spec_info.hidden_states
-
-            if _MTP_HID_DBG and hidden_states is not None:
-                import logging as _lg
-                _f = hidden_states.detach().float().flatten()
-                _lg.getLogger(__name__).info(
-                    "MTP-IN hidden_states shape=%s mean=%.5f min=%.5f max=%.5f [0]=%.5f [1]=%.5f",
-                    tuple(hidden_states.shape), _f.mean().item(), _f.min().item(),
-                    _f.max().item(), _f[0].item(), _f[1].item())
 
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)

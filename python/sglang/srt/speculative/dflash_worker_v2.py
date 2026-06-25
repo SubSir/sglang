@@ -677,21 +677,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         base_h = draft_hidden[:, off : off + block - 1, :].to(w.dtype)  # [bs, block-1, D]
         base_logits = torch.matmul(base_h, w.T).float()           # [bs, block-1, vocab]
         suffix_start = int(getattr(dm, "domino_suffix_start", 1))
-        if os.environ.get("SGLANG_DFLASH_PREDICT_DBG") == "1":
-            self._dom_dbg_n = getattr(self, "_dom_dbg_n", 0) + 1
-            if self._dom_dbg_n <= 3:
-                # Raw per-slot LM-head argmax under BOTH hidden->token conventions, to expose a
-                # shift_label off-by-one: slots[0:b-1] is the shift_label=TRUE reading this code uses;
-                # slots[1:b] is the shift_label=FALSE (baseline DFlash) reading.
-                alt_logits = torch.matmul(
-                    draft_hidden[:, 1:block, :].to(w.dtype), w.T
-                ).float()
-                logger.info(
-                    "DOMINO-DBG[%d] shift_label=%s suffix_start=%d anchor=%d | slots[0:b-1].argmax=%s | slots[1:b].argmax=%s",
-                    self._dom_dbg_n, getattr(dm, "shift_label", "?"), suffix_start,
-                    int(anchor_tokens[0]), base_logits[0].argmax(-1).tolist(),
-                    alt_logits[0].argmax(-1).tolist(),
-                )
         gru_dtype = dm.prefix_gru.weight_ih_l0.dtype
         # process prev_ids[0] = anchor -> gru_out[0] (state carried; slot 0 has no correction)
         e = embed_module(anchor_tokens).unsqueeze(1).to(gru_dtype)  # [bs,1,D]
@@ -1631,18 +1616,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-
-        if os.environ.get("SGLANG_DFLASH_PREDICT_DBG") == "1":
-            self._predict_dbg_n = getattr(self, "_predict_dbg_n", 0) + 1
-            if self._predict_dbg_n <= 3:
-                # First few decode blocks of sample 0: anchor + the draft's predicted block. Compare
-                # base vs domino on the same prompt/block (anchor is identical for the same target).
-                logger.info(
-                    "PREDICT-DBG[%d] proj=%s shift_label=%s anchor=%d block_pred=%s",
-                    self._predict_dbg_n, getattr(_dm, "projector_type", None),
-                    getattr(_dm, "shift_label", "?"), int(block_ids[0, 0]),
-                    draft_tokens[0].tolist(),
-                )
 
         self._t_stop(_th, "draft_head")
 
