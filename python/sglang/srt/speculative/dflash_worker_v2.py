@@ -303,6 +303,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        # Pre-allocate the per-step draft block buffers at their max-bs size NOW, BEFORE any cuda-graph
+        # capture -- otherwise they're first allocated lazily on the first decode (AFTER the graphs are
+        # captured at startup), so the caching allocator can hand them memory the graph pool reserved
+        # as scratch, and a later replay overwrites them. Claiming the addresses up front removes that.
+        sa = self.server_args
+        _max_bs = max(int(sa.max_running_requests or 256), int(sa.cuda_graph_config.decode.max_bs))
+        self._ensure_draft_block_buffers(_max_bs)
+        self._ensure_accept_bonus_buffers(_max_bs)
+
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1808,7 +1817,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Optional MTP prefix-KV extend hook (DFlashMtpWorkerV2): extend the MTP nextn-states KV
         # with the committed verified tokens' final hidden (captured via the target norm hook).
-        self._maybe_extend_mtp_kv_decode(commit_lens=commit_lens, bs=bs)
+        self._maybe_extend_mtp_kv_decode(
+            commit_lens=commit_lens, bs=bs,
+            req_pool_indices=model_worker_batch.req_pool_indices,
+        )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
