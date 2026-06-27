@@ -31,6 +31,8 @@ local_image = (
         # sglang-kernel is NOT a pyproject dep; the Dockerfile installs it separately.
         "pip install sglang-kernel==0.4.1",
         "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
+        # the April fork's transformers is too old to recognize gemma4; upgrade it.
+        "pip install --upgrade transformers",
     )
     .add_local_dir("./python", remote_path="/root/sglang_local/python_local", copy=True)
     .add_local_dir("./benchmark", remote_path="/root/sglang_local/benchmark_local", copy=True)
