@@ -15,6 +15,9 @@ import modal
 
 app = modal.App("dflash-tree-vs-chain")
 
+# Persist v1 results so they survive local session/meeting interruptions.
+v1_vol = modal.Volume.from_name("dflash-v1-results", create_if_missing=True)
+
 base_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "libnuma-dev")
@@ -40,9 +43,10 @@ local_image = (
 
 @app.function(
     gpu="B200",
-    timeout=5400,
+    timeout=10800,
     image=local_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={"/results": v1_vol},
 )
 def run(
     target_model: str,
@@ -56,6 +60,10 @@ def run(
     backend: str,
     mem_fraction: float = 0.85,
     disable_cuda_graph: bool = False,
+    concurrencies: str = "1",
+    skip_baseline: bool = True,
+    tp: int = 1,
+    result_tag: str | None = None,
 ):
     import sys, importlib.util
 
@@ -64,17 +72,20 @@ def run(
         "--data-names", data_names,
         "--target-model", target_model,
         "--draft-model", draft_model,
-        "--tp-sizes", "1",
-        "--concurrencies", "1",
+        "--tp-sizes", str(tp),
+        "--concurrencies", str(concurrencies),
         "--samples-per-concurrency-base", str(samples_base),
-        "--max-samples-per-config", str(samples_base),
+        "--max-samples-per-config", str(samples_base * 64),
         "--max-new-tokens", "1024",
         "--attention-backends", backend,
         "--mem-fraction-static", str(mem_fraction),
         "--speculative-eagle-topk", str(topk),
         "--speculative-dflash-block-size", str(block_size),
-        "--skip-baseline",
+        "--max-running-requests",
+        str(max(int(c) for c in str(concurrencies).split(","))),
     ]
+    if skip_baseline:
+        args.append("--skip-baseline")
     if disable_cuda_graph:
         args.append("--disable-cuda-graph")
     if num_draft_tokens is not None:
@@ -101,7 +112,91 @@ def run(
     spec.loader.exec_module(mod)
     mod.main()
     with open(out_path) as f:
-        return f.read()
+        res = f.read()
+    if result_tag:
+        with open(f"/results/{result_tag}.md", "w") as f:
+            f.write(res)
+        v1_vol.commit()
+    return res
+
+
+def _v1_tables(res):
+    out = []
+    lines = res.splitlines()
+    header = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("| tp\\conc"):
+            header = line
+        if "acceptance length" in line.lower() or "DFLASH output tok/s" in line or "Speedup" in line:
+            for j in range(i + 1, min(i + 7, len(lines))):
+                if lines[j].startswith("| 1 |"):
+                    lbl = ("accept" if "accept" in line.lower()
+                           else ("speedup" if "Speedup" in line else "tok/s"))
+                    out.append(f"  {lbl:8s} {header}  ->  {lines[j]}")
+                    break
+    return "\n".join(out)
+
+
+# Three target models on the V1 fork (working tree verify). v1 has gpt_oss/gemma4/
+# qwen3_5 model files; Qwen3.6 is unavailable in v1 so Qwen3.5-27B stands in.
+V1_MODELS = [
+    ("openai/gpt-oss-120b", "z-lab/gpt-oss-120b-DFlash", 10, 1, 0.82),
+    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.82),
+    ("Qwen/Qwen3.5-27B", "z-lab/Qwen3.5-27B-DFlash", 16, 1, 0.82),
+]
+
+
+@app.local_entrypoint()
+def three_v1(concurrencies: str = "1,8,32",
+             data_names: str = "gsm8k,mt-bench",
+             samples_base: int = 8,
+             models: str = ""):
+    """V1-fork tree-verify sweep on the 3 target models. cuda graph ON.
+    Per model: chain@blocksize (WITH baseline, same card) + tree budgets."""
+    sel = set(m.strip() for m in models.split(",") if m.strip())
+    os.makedirs("v1_tree_results", exist_ok=True)
+    calls = []
+    for target, draft, bsz, tp, memf in V1_MODELS:
+        mtag = target.split("/")[-1]
+        if sel and mtag not in sel and target not in sel:
+            continue
+        budgets = [10, 16, 32, 64] if bsz == 10 else (
+            [8, 16, 32, 64] if bsz <= 8 else [16, 32, 64])
+        configs = [("chain", False, 1, bsz, False)]
+        for b in budgets:
+            configs.append((f"tree_b{b}", True, 4, b, True))
+        for label, tv, topk, ndt, skip_bl in configs:
+            print(f">>> spawn {mtag}/{label} budget={ndt} baseline={not skip_bl}")
+            calls.append((mtag, label, ndt, run.spawn(
+                target, draft, data_names, tv, topk, bsz, ndt, samples_base,
+                "flashinfer", memf, False, concurrencies, skip_bl, tp,
+                f"{mtag}_{label}")))
+    for mtag, label, ndt, c in calls:
+        try:
+            res = c.get()
+            with open(f"v1_tree_results/{mtag}_{label}.md", "w") as f:
+                f.write(res)
+            print(f"\n===== {mtag} / {label} (budget={ndt}) =====\n{_v1_tables(res)}")
+        except Exception as e:
+            print(f">>> FAILED {mtag}/{label}: {e}")
+
+
+@app.function(image=local_image, volumes={"/results": v1_vol})
+def _v1_list():
+    import os as _os
+    return {fn: open(f"/results/{fn}").read()
+            for fn in sorted(_os.listdir("/results")) if fn.endswith(".md")}
+
+
+@app.local_entrypoint()
+def pull_v1():
+    os.makedirs("v1_tree_results", exist_ok=True)
+    out = _v1_list.remote()
+    for fn, content in out.items():
+        with open(f"v1_tree_results/{fn}", "w") as f:
+            f.write(content)
+        print(f"\n===== {fn} =====\n{_v1_tables(content)}")
+    print(f"\npulled {len(out)} files")
 
 
 @app.local_entrypoint()
