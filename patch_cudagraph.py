@@ -17,9 +17,11 @@ p = _os.path.join(
 )
 s = open(p).read()
 
-# Ensure `os` is importable inside the module.
+# Ensure `os` is importable inside the module (insert after the first stdlib import,
+# which sits after `from __future__`).
 if "\nimport os\n" not in s:
-    s = s.replace("\nimport sglang", "\nimport os\nimport sglang", 1) if "\nimport sglang" in s else ("import os\n" + s)
+    assert "\nimport contextlib\n" in s, "expected `import contextlib` anchor"
+    s = s.replace("\nimport contextlib\n", "\nimport contextlib\nimport os\n", 1)
 
 needle = (
     "            _, build_custom_mask = resolve_dflash_verify_mask_policy(\n"
