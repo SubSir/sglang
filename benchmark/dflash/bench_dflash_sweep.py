@@ -572,7 +572,7 @@ def main() -> None:
     is_blackwell = _is_blackwell()
     device_sm = get_device_sm()
     if is_blackwell:
-        attention_backends = [b for b in attention_backends if b == "flashinfer" or b == "fa4" or b == "trtllm_mha"]
+        attention_backends = [b for b in attention_backends if b in ("flashinfer", "fa4", "trtllm_mha", "triton")]
     if device_sm < 90:
         attention_backends = [b for b in attention_backends if b != "fa3"]
     attention_backends = attention_backends or ["flashinfer"]

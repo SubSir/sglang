@@ -96,7 +96,7 @@ def run(
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "0" if tree_verify else "1"
     # fa4's cute kernel is broken in this image (flash_attn/cutlass-dsl fmax mismatch);
     # force the draft attention backend to match the (flashinfer) main backend.
-    env["DFLASH_DRAFT_ATTN_BACKEND"] = backend
+    env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"  # draft is a small qwen3-arch model; flashinfer is safe
 
     out_path = f"/root/out_{'tree' if tree_verify else 'chain'}_{topk}.md"
     args += ["--output-md", out_path]
@@ -140,9 +140,12 @@ def _v1_tables(res):
 # Three target models on the V1 fork (working tree verify). v1 has gpt_oss/gemma4/
 # qwen3_5 model files; Qwen3.6 is unavailable in v1 so Qwen3.5-27B stands in.
 V1_MODELS = [
-    ("openai/gpt-oss-120b", "z-lab/gpt-oss-120b-DFlash", 10, 1, 0.82),
-    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.82),
-    ("Qwen/Qwen3.5-27B", "z-lab/Qwen3.5-27B-DFlash", 16, 1, 0.82),
+    # (target, draft, block_size, tp, mem_fraction, backend). v1 tree verify is
+    # validated-correct. Per-model backend: gemma rejects flashinfer (needs triton,
+    # which also supports the tree mask). Qwen3-8B uses flashinfer (fast).
+    ("Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", 16, 1, 0.82, "flashinfer"),
+    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.6, "triton"),
+    ("Qwen/Qwen3.5-27B", "z-lab/Qwen3.5-27B-DFlash", 16, 1, 0.6, "flashinfer"),
 ]
 
 
@@ -156,7 +159,7 @@ def three_v1(concurrencies: str = "1,8,32",
     sel = set(m.strip() for m in models.split(",") if m.strip())
     os.makedirs("v1_tree_results", exist_ok=True)
     calls = []
-    for target, draft, bsz, tp, memf in V1_MODELS:
+    for target, draft, bsz, tp, memf, backend in V1_MODELS:
         mtag = target.split("/")[-1]
         if sel and mtag not in sel and target not in sel:
             continue
@@ -166,10 +169,10 @@ def three_v1(concurrencies: str = "1,8,32",
         for b in budgets:
             configs.append((f"tree_b{b}", True, 4, b, True))
         for label, tv, topk, ndt, skip_bl in configs:
-            print(f">>> spawn {mtag}/{label} budget={ndt} baseline={not skip_bl}")
+            print(f">>> spawn {mtag}/{label} budget={ndt} baseline={not skip_bl} backend={backend}")
             calls.append((mtag, label, ndt, run.spawn(
                 target, draft, data_names, tv, topk, bsz, ndt, samples_base,
-                "flashinfer", memf, False, concurrencies, skip_bl, tp,
+                backend, memf, False, concurrencies, skip_bl, tp,
                 f"{mtag}_{label}")))
     for mtag, label, ndt, c in calls:
         try:
