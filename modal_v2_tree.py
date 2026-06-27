@@ -220,12 +220,13 @@ def main(target_model: str = "Qwen/Qwen3-8B",
 
 """Target models for the three-model study (z-lab internal drafts via HF secret)."""
 THREE_MODELS = [
-    # (target, draft, block_size, tp, mem_fraction)
-    # mem_fraction lowered: leaves room for cuda-graph activations + tree mask buffer
-    # (the OOM was graph/mask memory, not model weights).
-    ("openai/gpt-oss-120b", "z-lab/gpt-oss-120b-DFlash", 10, 1, 0.7),
-    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.6),
-    ("Qwen/Qwen3.6-27B", "z-lab/Qwen3.6-27B-DFlash", 16, 1, 0.6),
+    # (target, draft, block_size, tp, mem_fraction, backend)
+    # backend: gemma rejects flashinfer (triton supports tree mask); Qwen3.6 is hybrid
+    # GDN -> Blackwell full-attn layers need triton/trtllm_mha/fa4 (triton has tree mask).
+    # gpt-oss-120b dropped (per request: fa4-cute broken, rejects flashinfer).
+    ("Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", 16, 1, 0.85, "flashinfer"),
+    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.6, "triton"),
+    ("Qwen/Qwen3.6-27B", "z-lab/Qwen3.6-27B-DFlash", 16, 1, 0.6, "triton"),
 ]
 
 
@@ -273,19 +274,20 @@ def three(concurrencies: str = "1,8,32",
     sel = set(m.strip() for m in models.split(",") if m.strip())
     os.makedirs("v2_tree_results", exist_ok=True)
     calls = []
-    for target, draft, bsz, tp, memf in THREE_MODELS:
+    for target, draft, bsz, tp, memf, backend in THREE_MODELS:
         if sel and target.split("/")[-1] not in sel and target not in sel:
             continue
         mtag = target.split("/")[-1]
-        configs = [("chain", False, 1, bsz, False)]
+        # chain + tree budgets; no no-spec baseline (chain is the reference).
+        configs = [("chain", False, 1, bsz, True)]
         if not chain_only:
             for b in _budgets_for(bsz):
                 configs.append((f"tree_b{b}", True, 4, b, True))
         for label, tv, topk, ndt, skip_bl in configs:
-            print(f">>> spawn {mtag}/{label} budget={ndt} baseline={not skip_bl}")
+            print(f">>> spawn {mtag}/{label} budget={ndt} backend={backend}")
             calls.append((mtag, label, ndt, run.spawn(
                 target, draft, data_names, tv, topk, bsz, ndt, samples_base,
-                concurrencies, "flashinfer", memf, tp, tp, skip_bl, f"{mtag}_{label}")))
+                concurrencies, backend, memf, tp, tp, skip_bl, f"{mtag}_{label}")))
     summary = {}
     for mtag, label, ndt, c in calls:
         try:
