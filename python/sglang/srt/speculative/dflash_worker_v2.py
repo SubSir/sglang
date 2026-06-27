@@ -194,8 +194,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             if server_args.speculative_eagle_topk is not None
             else 1
         )
-        # Tree verify uses the same draft token count as the chain block size.
-        self._tree_num_draft_tokens: int = int(self.block_size)
+        # Tree verify node budget = --speculative-num-draft-tokens (may exceed the
+        # draft block_size); falls back to block_size when unset.
+        self._tree_num_draft_tokens: int = int(
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_num_draft_tokens is not None
+            else self.block_size
+        )
         if self._tree_verify_enabled and self._tree_verify_topk <= 1:
             # No tree to build with topk<=1; fall back to chain verify.
             if self.tp_rank == 0:
