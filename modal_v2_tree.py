@@ -21,42 +21,25 @@ results_vol = modal.Volume.from_name("dflash-v2-results", create_if_missing=True
 WT = "/Users/subsir/Desktop/Studio/Python/sglang-v2-tree"
 UPSTREAM_COMMIT = "e0c0c0a45"
 
+# Official same-day (2026-06-27) nightly: deep_gemm / nvrtc / sgl-kernel / flashinfer
+# / rust all prebuilt and consistent. We only overlay our tree-verify port.
 base_image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("git", "wget", "curl", "libnuma-dev", "build-essential",
-                 "pkg-config", "protobuf-compiler")
-    .run_commands(
-        "echo v2tree2 > /tmp/build_time",
-        # Upstream now builds a Rust gRPC extension via setuptools-rust.
-        "curl --proto '=https' --tlsv1.2 --retry 3 -sSf https://sh.rustup.rs | sh -s -- -y",
-        "git clone https://github.com/sgl-project/sglang.git /root/sglang_local",
-        f"cd /root/sglang_local && git checkout {UPSTREAM_COMMIT}",
-        "cd /root/sglang_local && PATH=/root/.cargo/bin:$PATH pip install -e \"python\"",
-        "pip install sglang-kernel==0.4.4",
-        "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
-        # upstream deep_gemm dlopens libnvrtc.so.13 (CUDA 13) at runtime; the 12.8
-        # base only ships libnvrtc.so.12. Install the cu13 nvrtc wheel and expose the
-        # bare soname on the loader path (keep deep_gemm; gpt-oss MXFP4 may need it).
-        "pip install nvidia-cuda-nvrtc-cu13",
-        "ls -la /usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/",
-        "cd /usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/ && "
-        "([ -e libnvrtc.so.13 ] || ln -s libnvrtc.so.13.* libnvrtc.so.13) && "
-        "echo $PWD > /etc/ld.so.conf.d/nvrtc13.conf && ldconfig && ldconfig -p | grep nvrtc",
+    modal.Image.from_registry(
+        "lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96"
     )
-    .env({
-        "LD_LIBRARY_PATH": "/usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
-    })
-    # Overlay the tree-verify port (speculative dir from the worktree = upstream + port).
+    .run_commands("echo v2tree3 > /tmp/build_time")
+    # Overlay the tree-verify port (the speculative dir from the worktree).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
-        remote_path="/root/sglang_local/python/sglang/srt/speculative",
+        remote_path="/tmp/port_speculative",
         copy=True,
     )
-    # Overlay the fork's patched bench harness.
-    .add_local_dir(
-        "./benchmark",
-        remote_path="/root/sglang_local/benchmark",
-        copy=True,
+    .add_local_dir("./benchmark", remote_path="/root/benchmark", copy=True)
+    .run_commands(
+        "SGLANG_DIR=$(python3 -c 'import sglang,os;print(os.path.dirname(sglang.__file__))') && "
+        "echo \"sglang at $SGLANG_DIR\" && "
+        "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
+        "echo overlaid tree-verify port"
     )
 )
 
@@ -99,11 +82,10 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
     env["DFLASH_DRAFT_ATTN_BACKEND"] = backend  # avoid broken fa4
 
-    sys.path.insert(0, "/root/sglang_local/python")
-    os.chdir("/root/sglang_local")
+    os.chdir("/root")
     sys.argv = [a for a in args if a]
     spec = importlib.util.spec_from_file_location(
-        "bench", "/root/sglang_local/benchmark/dflash/bench_dflash_sweep.py")
+        "bench", "/root/benchmark/dflash/bench_dflash_sweep.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["bench"] = mod
     spec.loader.exec_module(mod)
