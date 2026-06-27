@@ -34,7 +34,10 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    move_accept_tokens_to_target_kvcache,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -1793,34 +1796,44 @@ class DFlashWorkerV2(BaseSpecWorker):
             last_col = accept_len.to(torch.int64)  # commit_lens - 1
             bonus = out_tokens.gather(1, last_col[:, None]).squeeze(1).to(torch.int64)
 
-            # Re-point req_to_token at the accepted slots in committed order. The
-            # tree verify wrote target KV at the scattered block slots
-            # verify_out_cache_loc_2d[accept_index_local]; gather those into a
-            # contiguous prefix and rewrite the mapping. No physical KV move is
-            # needed since the values already live at those slots; the unaccepted
-            # tail slots become orphaned (reclaimed by the next allocation), the
-            # same lifecycle the chain path relies on.
+            # Compact the accepted tree path to the contiguous front of each
+            # per-req verify block. EAGLE v2 (_finalize_accept_tree_path) does the
+            # same and for the same reason: the tree accepts are SCATTERED across
+            # the block, but committed positions [prefix, prefix+commit) must map to
+            # contiguous front slots. The chain path needs no move (accepts are
+            # already the front prefix), which is why it works as-is.
+            #
+            # A bare re-point of req_to_token to the scattered slots is NOT enough
+            # and is non-lossless: an accepted node at block index k >= commit keeps
+            # its slot referenced at req_to_token[prefix+k], which lies inside the
+            # NEXT step's verify window [prefix+commit, prefix+commit+vnt). The next
+            # verify then overwrites that physical slot -> committed KV corruption.
+            # Physically moving accepted KV to the front [prefix, prefix+commit)
+            # (outside the next window) is what makes tree verify lossless.
             accept_local_safe = torch.where(
                 valid,
                 accept_index_local.to(torch.long),
                 torch.zeros_like(accept_index_local, dtype=torch.long),
             )
-            committed_cache_loc_2d = torch.gather(
-                verify_out_cache_loc_2d, 1, accept_local_safe
-            )  # [bs, block_size]; cols >= commit_lens are don't-care
-            # assign_req_to_token_pool reads out_cache_loc with a RAGGED offset
-            # (sum of prior reqs' lengths), so pack the accepted slots row-major.
-            committed_cache_loc_packed = committed_cache_loc_2d[valid]
-            block_end = prefix_lens + commit_lens.to(prefix_lens.dtype)
-            assign_req_to_token_pool_func(
-                model_worker_batch.req_pool_indices,
-                self.model_runner.req_to_token_pool.req_to_token,
-                prefix_lens,
-                block_end,
-                committed_cache_loc_packed,
-                bs,
+            # model_worker_batch.out_cache_loc is still the full verify window here
+            # (set before the verify forward); move accepted target KV to the front.
+            # The move reads batch.req_to_token_pool; the rest of this branch
+            # addresses the target table via self.model_runner, so pin it explicitly.
+            if model_worker_batch.req_to_token_pool is None:
+                model_worker_batch.req_to_token_pool = (
+                    self.model_runner.req_to_token_pool
+                )
+            move_accept_tokens_to_target_kvcache(
+                model_worker_batch,
+                accept_index,
+                accept_len,  # num_correct_drafts (excl bonus); move advances by +1
+                model_worker_batch.token_to_kv_pool_allocator,
             )
-            model_worker_batch.out_cache_loc = committed_cache_loc_packed
+            # After the move, req_to_token[prefix, prefix+commit) already maps to the
+            # front window slots verify_out_cache_loc_2d[:, :commit] (the window was
+            # assigned contiguously), so no req_to_token rewrite is needed. The draft
+            # KV must use those same front slots.
+            model_worker_batch.out_cache_loc = verify_out_cache_loc
 
             if need_mamba_verify_commit:
                 assert seq_lens_pre_verify is not None
@@ -1849,6 +1862,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH verify requires target hidden states, but got None."
                 )
             hidden = hidden.view(bs, block_size, -1)
+            # gathered_hidden[:, k] = hidden at the k-th accepted node (front-compacted,
+            # same layout as EAGLE's _compact_accept_to_front).
             gathered_hidden = torch.gather(
                 hidden,
                 1,
@@ -1857,10 +1872,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             committed_positions = (
                 prefix_lens.to(torch.int64)[:, None] + col
             ).reshape(-1)
+            # Write the accepted hidden into the FRONT verify-window slots (the same
+            # contiguous front slots the target KV was just moved to), so the draft KV
+            # and target KV agree and both sit outside the next verify window.
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=gathered_hidden.reshape(-1, hidden.shape[-1]),
-                cache_loc=committed_cache_loc_2d.reshape(-1),
-                cache_loc_2d=committed_cache_loc_2d,
+                cache_loc=verify_out_cache_loc_2d.reshape(-1),
+                cache_loc_2d=verify_out_cache_loc_2d,
                 positions=committed_positions,
                 commit_lens=commit_lens,
             )
