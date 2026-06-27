@@ -131,12 +131,11 @@ class DFlashVerifyInput(SpecInput):
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-        # TODO(tree-cudagraph): wiring the tree custom_mask into the cuda-graph
-        # captured buffer is non-trivial; force the verify step eager when a tree
-        # mask is present so the flashinfer verify path reads the per-step mask.
+        # The DFLASH verify graph is captured mask-capable for tree verify (see the
+        # get_spec_info mask patch / v1 fork), so tree verify replays the graph with
+        # its per-step custom mask. No eager fallback needed.
         can_run_cuda_graph = bool(
-            self.custom_mask is None
-            and target_worker.model_runner.decode_cuda_graph_runner
+            target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )

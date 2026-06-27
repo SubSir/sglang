@@ -183,6 +183,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        # Number of tokens the TARGET verifies per request. Chain == block_size;
+        # tree == the (possibly larger) verify node budget (--speculative-num-draft-tokens).
+        # The verify cache buffers, allocation, and accept logic are sized by this,
+        # while the DRAFT block forward stays at block_size.
+        self._verify_num_tokens = int(
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_num_draft_tokens is not None
+            else self.block_size
+        )
 
         # EAGLE-style tree verify (opt-in). When disabled the worker keeps the
         # byte-for-byte chain verify path. topk comes from --speculative-eagle-topk.
@@ -441,7 +450,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             (new_cap, block_size), dtype=torch.long, device=device
         )
         self._draft_verify_out_cache_loc_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.int64, device=device
+            (new_cap, int(self._verify_num_tokens)), dtype=torch.int64, device=device
         )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
@@ -1429,6 +1438,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         block_size = int(self.block_size)
+        vnt = int(self._verify_num_tokens)  # target verify token count (tree budget or block_size)
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -1466,17 +1476,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._block_pos_offsets,
                     out=positions_2d,
                 )
-                end_offset = prefix_lens + block_size
+                end_offset = prefix_lens + vnt
                 verify_out_cache_loc = assign_extend_cache_locs_func(
                     req_pool_indices=model_worker_batch.req_pool_indices,
                     req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                     start_offset=prefix_lens,
                     end_offset=end_offset,
                     batch_size=bs,
-                    draft_token_num=block_size,
+                    draft_token_num=vnt,
                     device=device,
                 )
-                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, vnt))
         else:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
@@ -1485,17 +1495,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets,
                 out=positions_2d,
             )
-            end_offset = prefix_lens + block_size
+            end_offset = prefix_lens + vnt
             verify_out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=model_worker_batch.req_pool_indices,
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 start_offset=prefix_lens,
                 end_offset=end_offset,
                 batch_size=bs,
-                draft_token_num=block_size,
+                draft_token_num=vnt,
                 device=device,
             )
-            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, vnt))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -1719,7 +1729,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # --- EAGLE-style tree accept (greedy only). ---
             from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 
-            block_size = int(self.block_size)
+            # Tree accept dims follow the VERIFY token count (budget), not block_size.
+            block_size = int(verify_input.draft_token_num)
             target_predict = torch.argmax(
                 logits_output.next_token_logits, dim=-1
             ).view(bs, block_size)
