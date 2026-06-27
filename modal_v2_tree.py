@@ -218,9 +218,11 @@ def main(target_model: str = "Qwen/Qwen3-8B",
 """Target models for the three-model study (z-lab internal drafts via HF secret)."""
 THREE_MODELS = [
     # (target, draft, block_size, tp, mem_fraction)
-    ("openai/gpt-oss-120b", "z-lab/gpt-oss-120b-DFlash", 10, 1, 0.8),
-    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.72),
-    ("Qwen/Qwen3.6-27B", "z-lab/Qwen3.6-27B-DFlash", 16, 1, 0.72),
+    # mem_fraction lowered: leaves room for cuda-graph activations + tree mask buffer
+    # (the OOM was graph/mask memory, not model weights).
+    ("openai/gpt-oss-120b", "z-lab/gpt-oss-120b-DFlash", 10, 1, 0.7),
+    ("google/gemma-4-31b-it", "z-lab/gemma-4-31B-it-DFlash", 16, 1, 0.6),
+    ("Qwen/Qwen3.6-27B", "z-lab/Qwen3.6-27B-DFlash", 16, 1, 0.6),
 ]
 
 
