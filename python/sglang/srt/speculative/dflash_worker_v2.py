@@ -1132,18 +1132,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
         commit_lens: torch.Tensor,
+        last_correct_step_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
 
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
+
+        For chain verify the last accepted step is the linear position
+        `commit_lens - 1`. For tree verify the accepted tokens sit at scattered
+        block positions, so the caller passes the deepest accepted node's block
+        position via `last_correct_step_indices`.
         """
         attn_backend = self.target_worker.model_runner.attn_backend
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        if last_correct_step_indices is None:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        else:
+            last_correct_step_indices = last_correct_step_indices.to(torch.int64)
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -1710,9 +1719,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_index=accept_index,
                 accept_token_num=accept_token_num,
                 candidates=candidates,
-                retrieve_index=verify_input.retrive_index,
-                retrieve_next_token=verify_input.retrive_next_token,
-                retrieve_next_sibling=verify_input.retrive_next_sibling,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=int(self._tree_verify_topk),
             )
@@ -1770,10 +1779,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             if need_mamba_verify_commit:
                 assert seq_lens_pre_verify is not None
+                # Tree: the deepest accepted node's BLOCK position (not the linear
+                # commit_lens-1) holds the correct cached recurrent state.
+                tree_last_step = accept_index_local.gather(
+                    1, accept_len.to(torch.int64)[:, None]
+                ).squeeze(1)
                 self._update_target_mamba_state_after_verify(
                     batch=model_worker_batch,
                     seq_lens_pre_verify=seq_lens_pre_verify,
                     commit_lens=commit_lens,
+                    last_correct_step_indices=tree_last_step,
                 )
 
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)

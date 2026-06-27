@@ -43,9 +43,9 @@ class DFlashVerifyInput(SpecInput):
     # builds the tree mask / positions / retrieve buffers via the EAGLE kernel.
     tree_parent_list: Optional[torch.Tensor] = None  # Full topk-tree parent list
     tree_selected_index: Optional[torch.Tensor] = None  # Selected indices in full tree
-    retrive_index: Optional[torch.Tensor] = None
-    retrive_next_token: Optional[torch.Tensor] = None
-    retrive_next_sibling: Optional[torch.Tensor] = None
+    retrieve_index: Optional[torch.Tensor] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
@@ -98,9 +98,9 @@ class DFlashVerifyInput(SpecInput):
             (
                 tree_mask,
                 positions,
-                retrive_index,
-                retrive_next_token,
-                retrive_next_sibling,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
                 draft_tokens,
             ) = build_tree_kernel_efficient(
                 bonus_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 0],
@@ -118,9 +118,9 @@ class DFlashVerifyInput(SpecInput):
             self.draft_token = draft_tokens
             self.custom_mask = tree_mask
             self.positions = positions
-            self.retrive_index = retrive_index
-            self.retrive_next_token = retrive_next_token
-            self.retrive_next_sibling = retrive_next_sibling
+            self.retrieve_index = retrieve_index
+            self.retrieve_next_token = retrieve_next_token
+            self.retrieve_next_sibling = retrieve_next_sibling
 
         batch.spec_info = self
         batch.forward_mode = (
