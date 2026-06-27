@@ -256,7 +256,8 @@ def _budgets_for(block_size):
 def three(concurrencies: str = "1,8,32",
           data_names: str = "gsm8k,mt-bench",
           samples_base: int = 8,
-          models: str = ""):
+          models: str = "",
+          chain_only: bool = False):
     """Run all 3 target models concurrently (one container/card each spawn).
 
     Per model: chain@blocksize (WITH baseline, same card) + tree at each budget.
@@ -271,8 +272,9 @@ def three(concurrencies: str = "1,8,32",
             continue
         mtag = target.split("/")[-1]
         configs = [("chain", False, 1, bsz, False)]
-        for b in _budgets_for(bsz):
-            configs.append((f"tree_b{b}", True, 4, b, True))
+        if not chain_only:
+            for b in _budgets_for(bsz):
+                configs.append((f"tree_b{b}", True, 4, b, True))
         for label, tv, topk, ndt, skip_bl in configs:
             print(f">>> spawn {mtag}/{label} budget={ndt} baseline={not skip_bl}")
             calls.append((mtag, label, ndt, run.spawn(

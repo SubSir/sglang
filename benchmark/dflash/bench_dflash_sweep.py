@@ -677,6 +677,11 @@ def main() -> None:
                     ["--mamba-scheduler-strategy", "extra_buffer"]
                 )
 
+            # Tree verify forces the verify step eager, which desyncs the spec-v2
+            # overlap pipeline; run synchronously when tree verify is on.
+            if os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1":
+                common_server_args.append("--disable-overlap-schedule")
+
             # baseline
             if not args.skip_baseline:
                 print(f"\n=== backend={backend} tp={tp} (baseline) ===")
