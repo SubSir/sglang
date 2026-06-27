@@ -34,11 +34,17 @@ base_image = (
         remote_path="/tmp/port_speculative",
         copy=True,
     )
+    .add_local_dir(
+        f"{WT}/python/sglang/srt/arg_groups",
+        remote_path="/tmp/port_arg_groups",
+        copy=True,
+    )
     .add_local_dir("./benchmark", remote_path="/root/benchmark", copy=True)
     .run_commands(
         "SGLANG_DIR=$(python3 -c 'import sglang,os;print(os.path.dirname(sglang.__file__))') && "
         "echo \"sglang at $SGLANG_DIR\" && "
         "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
+        "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && "
         "echo overlaid tree-verify port"
     )
 )
@@ -100,6 +106,49 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
     return res
 
 
+@app.function(gpu="B200", timeout=1200, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")])
+def debug(target_model="Qwen/Qwen3-8B", draft_model="z-lab/Qwen3-8B-DFlash-b16",
+          block_size=16, num_draft_tokens=32, topk=4, tree=True):
+    """Launch the DFLASH tree server directly, capture stdout+stderr, print the tail."""
+    import subprocess, os, time
+    cmd = [
+        "python", "-m", "sglang.launch_server",
+        "--model-path", target_model, "--trust-remote-code",
+        "--attention-backend", "flashinfer",
+        "--speculative-draft-attention-backend", "flashinfer",
+        "--tp-size", "1", "--dtype", "bfloat16",
+        "--mem-fraction-static", "0.8", "--max-running-requests", "32",
+        "--page-size", "1", "--cuda-graph-max-bs", "32",
+        "--speculative-algorithm", "DFLASH",
+        "--speculative-draft-model-path", draft_model,
+        "--speculative-dflash-block-size", str(block_size),
+        "--speculative-num-draft-tokens", str(num_draft_tokens),
+        "--speculative-eagle-topk", str(topk),
+        "--port", "30000",
+    ]
+    env = dict(os.environ)
+    env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree else "0"
+    env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"
+    print("CMD:", " ".join(cmd), "TREE=", env["SGLANG_DFLASH_TREE_VERIFY"])
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+    lines = []
+    t0 = time.time()
+    for line in p.stdout:
+        lines.append(line.rstrip())
+        if p.poll() is not None or time.time() - t0 > 600:
+            break
+        if "The server is fired up" in line or "Uvicorn running" in line:
+            lines.append(">>> SERVER UP OK")
+            p.terminate(); break
+    try:
+        p.wait(timeout=10)
+    except Exception:
+        p.kill()
+    return "\n".join(lines[-120:])
+
+
 def _tables(res):
     """Pull the per-conc accept-length and tok/s table rows (tp=1) for a quick echo."""
     out = []
@@ -115,6 +164,11 @@ def _tables(res):
                     out.append(f"  {label:7s} {header}  ->  {lines[j]}")
                     break
     return "\n".join(out)
+
+
+@app.local_entrypoint()
+def dbg(tree: bool = True):
+    print(debug.remote(tree=tree))
 
 
 @app.local_entrypoint()
