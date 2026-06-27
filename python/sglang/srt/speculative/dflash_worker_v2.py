@@ -1728,7 +1728,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                # verify produced verify_input.draft_token_num logits/req (tree budget),
+                # not block_size (the draft count).
+                draft_token_num=int(verify_input.draft_token_num),
             )
 
         new_seq_lens = None
