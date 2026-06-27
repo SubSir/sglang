@@ -17,6 +17,7 @@ Example usage:
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -202,7 +203,9 @@ def build_prompts_from_turns(
 
 def _is_blackwell() -> bool:
     # Prefer explicit env var, but also infer from compute capability (SM100+).
-    if envs.IS_BLACKWELL.get():
+    # ponytail: IS_BLACKWELL may be absent on this fork's environ; SM check is enough.
+    is_blackwell_env = getattr(envs, "IS_BLACKWELL", None)
+    if is_blackwell_env is not None and is_blackwell_env.get():
         return True
     return get_device_sm() >= 100
 
@@ -616,7 +619,12 @@ def main() -> None:
     for backend in attention_backends:
         for tp in tp_sizes:
             port_base = find_available_port(20000)
-            speculative_draft_attention_backend = "fa4" if is_blackwell else "fa3"
+            # ponytail: allow overriding the draft backend (fa4's cute kernel can break
+            # on flash_attn/cutlass-dsl version drift; flashinfer is a safe fallback).
+            speculative_draft_attention_backend = os.environ.get(
+                "DFLASH_DRAFT_ATTN_BACKEND",
+                "fa4" if is_blackwell else "fa3",
+            )
 
             common_server_args: list[str] = [
                 "--trust-remote-code",

@@ -15,6 +15,8 @@ local_image = (
         "echo 80 > /tmp/build_time",
         "git clone https://github.com/SubSir/sglang.git /root/sglang_local",
         "cd /root/sglang_local && pip install -e \"python\"",
+        # sglang-kernel is not a pyproject dep; install it like docker/Dockerfile does (cu128).
+        "pip install sglang-kernel==0.4.1",
         "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
     )
 )
