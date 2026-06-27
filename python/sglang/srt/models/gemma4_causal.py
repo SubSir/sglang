@@ -602,6 +602,9 @@ class Gemma4TextModel(PreTrainedModel):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
+        # DFLASH aux hidden-state capture: indices of layers whose INPUT hidden state
+        # (= output of the previous layer = HF "after layer k") is captured.
+        self.layers_to_capture: List[int] = []
 
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
@@ -759,7 +762,11 @@ class Gemma4TextModel(PreTrainedModel):
 
         hidden_states = input_embeds
 
+        aux_hidden_states: List[torch.Tensor] = []
         for layer_idx, layer in enumerate(self.layers):
+            # DFLASH: capture the hidden state entering a target layer.
+            if layer_idx in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
             else:
@@ -778,7 +785,13 @@ class Gemma4TextModel(PreTrainedModel):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = list(layers_to_capture)
 
 
 class Gemma4ForCausalLM(PreTrainedModel):

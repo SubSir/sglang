@@ -167,7 +167,7 @@ def three_v1(concurrencies: str = "1,8,32",
             continue
         budgets = [10, 16, 32, 64] if bsz == 10 else (
             [8, 16, 32, 64] if bsz <= 8 else [16, 32, 64])
-        configs = [("chain", False, 1, bsz, False)]
+        configs = [("chain", False, 1, bsz, True)]  # skip no-spec baseline; chain is the reference
         for b in budgets:
             configs.append((f"tree_b{b}", True, 4, b, True))
         for label, tv, topk, ndt, skip_bl in configs:

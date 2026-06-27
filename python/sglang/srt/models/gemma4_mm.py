@@ -222,6 +222,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
 
+        # DFLASH aux hidden-state capture (set via set_dflash_layers_to_capture).
+        self.capture_aux_hidden_states = False
+
         self.post_init()
 
     def pad_input_ids(
@@ -569,9 +572,30 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             **kwargs,
         )
 
+        # DFLASH: language model returns (hidden, aux) when capturing; unpack.
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         # Process hidden states through logits processor
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
+            input_ids,
+            hidden_states,
+            self.language_model.embed_tokens,
+            forward_batch,
+            aux_hidden_states,
+        )
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i"; to capture HF "after layer k", capture
+        # before layer k+1.
+        self.language_model.set_dflash_layers_to_capture(
+            [val + 1 for val in layer_ids]
         )
 
     def tie_weights(self, recompute_mapping=False):
