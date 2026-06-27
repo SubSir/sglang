@@ -97,7 +97,7 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
     env["DFLASH_DRAFT_ATTN_BACKEND"] = backend  # avoid broken fa4
     # VL models (Qwen3.6-VL) need a non-cute vision-attention backend.
     if any(k in target_model.lower() for k in ("qwen3.6", "qwen3.5", "-vl")):
-        env["DFLASH_MM_ATTN_BACKEND"] = "fa3"
+        env["DFLASH_MM_ATTN_BACKEND"] = "triton_attn"
 
     os.chdir("/root")
     sys.argv = [a for a in args if a]
