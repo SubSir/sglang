@@ -1710,16 +1710,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         # kernel layout; use that as the candidate matrix. The chain path keeps
         # the contiguous block buffer.
         if self._tree_verify_enabled:
-            if not getattr(self, "_dbg_printed", False):
-                print(
-                    f"[DFLASH-TREE-DBG] bs={bs} block_size={self.block_size} "
-                    f"tree_ndt={self._tree_num_draft_tokens} verify_dtn={verify_input.draft_token_num} "
-                    f"draft_token_numel={verify_input.draft_token.numel()} "
-                    f"logits_rows={logits_output.next_token_logits.shape[0]} "
-                    f"voc2d={tuple(verify_out_cache_loc_2d.shape)}",
-                    flush=True,
-                )
-                self._dbg_printed = True
             _dtn = int(verify_input.draft_token_num)
             candidates = verify_input.draft_token.view(bs, _dtn)
         else:
@@ -1752,21 +1742,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict=target_predict,
                 topk=int(self._tree_verify_topk),
             )
-            if getattr(self, "_dbg_n", 0) < 3:
-                self._dbg_n = getattr(self, "_dbg_n", 0) + 1
-                try:
-                    with open("/results/treedbg.txt", "a") as _fd:
-                        _fd.write(
-                            f"dtn={_dtn} topk={self._tree_verify_topk} "
-                            f"atn={accept_token_num.tolist()[:6]} "
-                            f"atn_mean={accept_token_num.float().mean().item():.2f} "
-                            f"cand0={candidates[0,:8].tolist()} "
-                            f"tgt0={target_predict[0,:8].tolist()} "
-                            f"ridx0={verify_input.retrieve_index[0,:8].tolist()} "
-                            f"rnt0={verify_input.retrieve_next_token[0,:8].tolist()}\n"
-                        )
-                except Exception as _e:
-                    print("treedbg write err", _e, flush=True)
             # accept_index is absolute (row offset baked in); make it block-local.
             accept_len = accept_token_num  # [bs] number of accepted drafts (excl bonus)
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
