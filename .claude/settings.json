@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('modal_v2_tree.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(modal run *)"
+    ]
+  }
+}

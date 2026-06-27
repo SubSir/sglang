@@ -200,13 +200,14 @@ def main(target_model: str = "Qwen/Qwen3-8B",
          draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
          block_size: int = 16):
     """Quick validation: chain vs tree(budget32) at conc=1, gsm8k, cuda graph ON."""
-    configs = [("chain", False, 1, block_size), ("tree_b32", True, 4, 32)]
+    configs = [("tree_b32", True, 4, 32)]
     os.makedirs("v2_tree_results", exist_ok=True)
     for label, tv, topk, ndt in configs:
         print(f">>> {label}")
         try:
             res = run.remote(target_model, draft_model, "gsm8k", tv, topk,
-                             block_size, ndt, 24, "1")
+                             block_size, ndt, 24, "1", "flashinfer", 0.8, 1, 1, True,
+                             f"validate_{label}")
             with open(f"v2_tree_results/validate_{label}_{target_model.split('/')[-1]}.md", "w") as f:
                 f.write(res)
             print(_tables(res))
