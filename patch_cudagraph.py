@@ -1,35 +1,62 @@
-"""Build-time patch: force DFLASH tree verify to run eager.
+"""Build-time patch: make the DFLASH verify CUDA graph mask-capable for tree verify.
 
-The upstream DFLASH decode cuda graph is captured chain-style (custom_mask=None),
-so it cannot replay a tree-verify batch (which carries a custom tree mask) — the
-copy path hits an unset `raw_num_token`. Make `can_run_graph` return False for
-DFLASH batches that carry a custom tree mask so they take the eager flashinfer
-path (which consumes spec_info.custom_mask via generate_attn_arg_prefill).
+Upstream's DFLASH verify graph is captured chain-style (custom_mask=None for
+flashinfer), so a tree-verify batch (which carries a tree mask) can't be replayed
+and the verify runs maskless -> wrong target predictions -> tiny accept length.
 
-EAGLE is unaffected (gated on is_dflash()). Base decode / draft / prefill still
-use cuda graphs; only the tree-verify step runs eager.
+The v1 fork (which runs tree verify correctly under CUDA graph) forces
+build_custom_mask=True for DFLASH tree in get_spec_info, so the captured graph has
+a custom-mask buffer and mask-capable flashinfer wrappers. Replicate that here.
 """
-import os
+import os as _os
 import sglang
 
-p = os.path.join(
-    os.path.dirname(sglang.__file__),
+p = _os.path.join(
+    _os.path.dirname(sglang.__file__),
     "srt/model_executor/runner/decode_cuda_graph_runner.py",
 )
 s = open(p).read()
-needle = "def can_run_graph(self, forward_batch: ForwardBatch):"
-assert needle in s, "can_run_graph signature not found; upstream changed"
-guard = (
-    needle
-    + "\n        # DFLASH tree verify carries a custom tree mask the chain graph"
-    + "\n        # cannot replay; force eager (base decode/draft graphs unaffected)."
-    + "\n        if self.model_runner.spec_algorithm.is_dflash() and (\n"
-    + '            getattr(forward_batch.spec_info, "custom_mask", None) is not None\n'
-    + "        ):\n            return False"
+
+# Ensure `os` is importable inside the module.
+if "\nimport os\n" not in s:
+    s = s.replace("\nimport sglang", "\nimport os\nimport sglang", 1) if "\nimport sglang" in s else ("import os\n" + s)
+
+needle = (
+    "            _, build_custom_mask = resolve_dflash_verify_mask_policy(\n"
+    "                self.model_runner.attn_backend\n"
+    "            )\n"
 )
-if "DFLASH tree verify carries a custom tree mask" not in s:
-    s = s.replace(needle, guard, 1)
-    open(p, "w").write(s)
-    print("PATCHED can_run_graph for DFLASH tree eager")
-else:
-    print("can_run_graph already patched")
+patch = needle + (
+    "            # DFLASH tree verify needs a mask-capable verify graph (mirror v1 fork).\n"
+    "            if (\n"
+    "                not self.model_runner.is_draft_worker\n"
+    "                and os.environ.get(\"SGLANG_DFLASH_TREE_VERIFY\", \"0\") == \"1\"\n"
+    "            ):\n"
+    "                build_custom_mask = True\n"
+)
+assert needle in s, "DFLASH get_spec_info mask-policy block not found; upstream changed"
+if "DFLASH tree verify needs a mask-capable verify graph" not in s:
+    s = s.replace(needle, patch, 1)
+
+# Also carry the tree topk into the capture spec_info so the verify graph metadata
+# matches tree mode (the chain default topk=1 differs). The DFLASH constructor in
+# get_spec_info passes custom_mask via a ternary; add topk right after it.
+mask_ctor = (
+    "                custom_mask=(\n"
+    "                    None\n"
+    "                    if (self.model_runner.is_draft_worker or not build_custom_mask)\n"
+    "                    else self.buffers.custom_mask\n"
+    "                ),\n"
+)
+mask_ctor_with_topk = mask_ctor + (
+    "                topk=(\n"
+    "                    self.model_runner.server_args.speculative_eagle_topk\n"
+    "                    if build_custom_mask\n"
+    "                    else 1\n"
+    "                ),\n"
+)
+if mask_ctor in s and "speculative_eagle_topk\n                    if build_custom_mask" not in s:
+    s = s.replace(mask_ctor, mask_ctor_with_topk, 1)
+
+open(p, "w").write(s)
+print("PATCHED get_spec_info: DFLASH tree verify graph is mask-capable")
