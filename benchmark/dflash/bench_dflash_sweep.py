@@ -682,6 +682,13 @@ def main() -> None:
             if os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1":
                 common_server_args.append("--disable-overlap-schedule")
 
+            # VL models (e.g. Qwen3.6-VL) route their vision tower through
+            # flash_attn.cute (fa4), which is broken in some images; force a
+            # working vision-attention backend. Ignored by text-only models.
+            mm_backend = os.environ.get("DFLASH_MM_ATTN_BACKEND")
+            if mm_backend:
+                common_server_args.extend(["--mm-attention-backend", mm_backend])
+
             # baseline
             if not args.skip_baseline:
                 print(f"\n=== backend={backend} tp={tp} (baseline) ===")
