@@ -145,6 +145,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # The draft worker drafts a fixed block of `speculative_dflash_block_size`
+        # tokens (its trained block length), independent of the tree/verify budget
+        # in `speculative_num_draft_tokens`. Size the draft attention backend by the
+        # block length and force chain topk so its TARGET_VERIFY metadata matches the
+        # block-size draft forward. Mirrors v1. Without this the draft backend plans
+        # for the larger budget and runs the draft out-of-distribution.
+        if server_args.speculative_dflash_block_size is not None:
+            draft_server_args.speculative_num_draft_tokens = int(
+                server_args.speculative_dflash_block_size
+            )
+        draft_server_args.speculative_eagle_topk = 1
         saved_server_args = get_global_server_args()
         self._draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -166,7 +177,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if server_args.speculative_num_draft_tokens is None:
+        if server_args.speculative_dflash_block_size is not None:
+            # DRAFT block length (the trained checkpoint block). Decoupled from the
+            # tree/verify budget so the draft runs at its trained size (e.g. 16)
+            # while the target verifies a larger tree (e.g. 32). Mirrors v1.
+            self.block_size = int(server_args.speculative_dflash_block_size)
+            model_block_size = draft_config.block_size
+        elif server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
@@ -1451,7 +1468,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens = model_worker_batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
-        if self._use_triton_prepare_block:
+        # The fused triton prepare fills cache_loc only block_size-wide (it keys off
+        # block_ids.shape[1]); when the verify window is larger than the draft block
+        # (tree budget > block_size) it would leave the tail verify slots stale, so
+        # fall back to the eager path which fills the full vnt window.
+        if self._use_triton_prepare_block and block_size == vnt:
             try:
                 _prepare_dflash_draft_block_unchecked(
                     bonus_tokens=draft_input.bonus_tokens.view(-1),
@@ -1512,6 +1533,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        # The DRAFT block runs at block_size; the TARGET verify uses the full vnt
+        # window. When tree verify decouples them (block_size < vnt), the draft
+        # forward must only consume its first block_size slots/positions. When
+        # equal (chain), these slices are no-ops.
+        draft_block_cache_loc = verify_out_cache_loc_2d[:, :block_size].reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -1544,7 +1570,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.draft_model_runner.req_to_token_pool.req_to_token,
                 draft_prefix_lens,
                 block_end,
-                verify_out_cache_loc,
+                draft_block_cache_loc,
                 bs,
             )
             draft_seq_lens = draft_prefix_lens
@@ -1577,7 +1603,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=model_worker_batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_block_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
