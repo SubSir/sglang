@@ -121,6 +121,23 @@ class DFlashVerifyInput(SpecInput):
             self.retrieve_index = retrieve_index
             self.retrieve_next_token = retrieve_next_token
             self.retrieve_next_sibling = retrieve_next_sibling
+            try:
+                import os as _os
+                if _os.path.isdir("/results") and (
+                    not _os.path.exists("/results/maskdbg.txt")
+                    or _os.path.getsize("/results/maskdbg.txt") < 800
+                ):
+                    with open("/results/maskdbg.txt", "a") as _f:
+                        _f.write(
+                            f"mask_shape={tuple(tree_mask.shape)} numel={tree_mask.numel()} "
+                            f"true_frac={tree_mask.float().mean().item():.3f} "
+                            f"dtn={self.draft_token_num} depth={depth} topk={self.topk} "
+                            f"parent_list={tuple(self.tree_parent_list.shape)} "
+                            f"sel_idx={tuple(self.tree_selected_index.shape)} "
+                            f"pos0={positions[:8].tolist()} seqlen0={int(batch.seq_lens[0])}\n"
+                        )
+            except Exception:
+                pass
 
         batch.spec_info = self
         batch.forward_mode = (
