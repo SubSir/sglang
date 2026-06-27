@@ -50,8 +50,10 @@ base_image = (
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
         num_draft_tokens, samples_base, concurrencies, backend="flashinfer",
-        mem_fraction=0.8, tp=1, gpu_count=1):
-    """One server launch; bench internally sweeps all concurrencies x datasets."""
+        mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True):
+    """One server launch; bench internally sweeps all concurrencies x datasets.
+    When skip_baseline is False, the bench runs the target-only baseline on the
+    SAME GPU (serially) before DFLASH, yielding the speedup denominator."""
     import sys, importlib.util
 
     args = [
@@ -68,8 +70,9 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
         "--mem-fraction-static", str(mem_fraction),
         "--speculative-eagle-topk", str(topk),
         "--speculative-dflash-block-size", str(block_size),
-        "--skip-baseline",
     ]
+    if skip_baseline:
+        args.append("--skip-baseline")
     if num_draft_tokens is not None:
         args += ["--speculative-num-draft-tokens", str(num_draft_tokens)]
 
@@ -149,19 +152,21 @@ def sweep(target_model: str = "Qwen/Qwen3-8B",
     else:
         budget_list = [16, 32, 64]
 
-    configs = [("chain", False, 1, block_size)]
+    # chain at budget=block_size ALSO runs the no-spec baseline (same GPU, serial),
+    # giving the speedup denominator. Tree budgets skip baseline (same value).
+    configs = [("chain", False, 1, block_size, False)]
     for b in budget_list:
-        configs.append((f"tree_b{b}", True, 4, b))
+        configs.append((f"tree_b{b}", True, 4, b, True))
 
     os.makedirs("v2_tree_results", exist_ok=True)
     mtag = target_model.split("/")[-1]
     # Spawn all configs in parallel (each is its own container/GPU).
     calls = []
-    for label, tv, topk, ndt in configs:
-        print(f">>> spawning {label} (budget={ndt}, conc={concurrencies}, data={data_names})")
+    for label, tv, topk, ndt, skip_bl in configs:
+        print(f">>> spawning {label} (budget={ndt}, conc={concurrencies}, data={data_names}, baseline={not skip_bl})")
         calls.append((label, ndt, run.spawn(
             target_model, draft_model, data_names, tv, topk, block_size,
-            ndt, samples_base, concurrencies, "flashinfer", mem_fraction, tp, tp)))
+            ndt, samples_base, concurrencies, "flashinfer", mem_fraction, tp, tp, skip_bl)))
     for label, ndt, c in calls:
         try:
             res = c.get()
