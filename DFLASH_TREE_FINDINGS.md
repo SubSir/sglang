@@ -95,16 +95,37 @@ Qwen3-8B tree_b16 3.23 → **7.05**, matching v1.
 | tree b32 | 7.91 / 7.75 / 7.89 | 426 / 1,183 / 2,154 | | 2.49 / 4.73 / 4.37 |
 | tree b64 | 8.34 / 8.66 / 8.32 | 403 / 783 / 1,430 | | 2.65 / 5.68 / 5.04 |
 
-**Headline (v2, the requested setup — cuda graph ON, tree-vs-chain):**
-- Tree raises accept length on BOTH models (Qwen3-8B 5.79→7.51, gemma 6.92→8.34 at conc1, gsm8k).
-- **Small model (Qwen3-8B):** tree costs throughput at high concurrency (conc32: chain 10.6k > tree-b64
-  3.3k tok/s) — latency-bound win only.
-- **Large model (gemma-31B):** at conc1, tree is a NET WIN on both accept AND throughput (tree-b16 418 >
-  chain 382 tok/s) — the verify overhead is small relative to the 31B forward, so the extra accept pays
-  off. → **bigger models favor trees; smaller models / high concurrency favor chain or small budgets →
-  dynamic block size.**
-- gpt-oss-120b dropped (per request; fa4-cute broken). Qwen3.6-27B is a VL model — its vision tower needs
-  a non-cute backend (`--mm-attention-backend triton_attn`); the tree-verify path itself is unaffected.
+**Qwen3.6-27B (v2, triton + triton_attn vision, cuda graph ON) — HYBRID GDN/mamba + tree:**
+
+| gsm8k | accept c1/c8/c32 | tok/s c1/c8/c32 |   | mt-bench accept c1/c8/c32 |
+|---|---|---|---|---|
+| chain | 6.98 / 7.22 / 7.30 | 324 / 1,446 / 1,619 | | 2.58 / 3.38 / 4.45 |
+| tree b16 | 7.79 / 7.92 / 8.14 | 376 / 1,124 / **1,868** | | 2.94 / 5.56 / 5.07 |
+| tree b32 | 8.48 / 7.76 / 7.97 | 353 / 820 / 1,098 | | 3.15 / 5.48 / 5.00 |
+| tree b64 | **8.63 / 8.77 / 9.03** | 271 / 476 / 533 | | 3.19 / 6.21 / 5.69 |
+
+**Headline (v2, the requested setup — cuda graph ON, tree-vs-chain, all 3 models):**
+- Tree raises accept length on ALL three (gsm8k conc1: Qwen3-8B 5.79→7.51, gemma 6.92→8.34, Qwen3.6
+  6.98→8.63). **Mamba/hybrid (Qwen3.6) tree verify works correctly** — the GDN layers handle the tree mask
+  and the mamba state commits at the deepest accepted node's block position (port fix).
+- **Small dense model (Qwen3-8B):** tree costs throughput at high concurrency (conc32: chain 10.6k >
+  tree-b64 3.3k tok/s) — latency-bound win only.
+- **Large / hybrid models (gemma-31B, Qwen3.6-27B):** tree is a NET WIN at low concurrency on BOTH accept
+  and throughput (gemma tree-b16 418 > chain 382 tok/s @c1; Qwen3.6 tree-b16 1,868 > chain 1,619 tok/s even
+  @conc32). The verify overhead is small relative to the big/hybrid forward, so the extra accept pays off.
+  → **bigger / hybrid models favor trees; small dense models + high concurrency favor chain or small
+  budgets → dynamic block size is the right knob.**
+- gpt-oss-120b dropped (per request; fa4-cute broken). Qwen3.6-27B is a VL model whose vision tower needs
+  `--mm-attention-backend triton_attn` (fa4/cute broken, fa3 unsupported on Blackwell) — the tree-verify
+  path itself is unaffected.
+
+**Per-model server recipe (v2, what actually works on B200):**
+- Qwen3-8B: `--attention-backend flashinfer`.
+- gemma-4-31B-it: `--attention-backend triton` (gemma rejects flashinfer).
+- Qwen3.6-27B: `--attention-backend triton --mm-attention-backend triton_attn --mamba-scheduler-strategy extra_buffer`.
+- All: `--speculative-algorithm DFLASH`, `SGLANG_DFLASH_TREE_VERIFY=1`, `--speculative-eagle-topk 4`,
+  `--speculative-num-draft-tokens <budget>`, `--speculative-dflash-block-size 16`, `--disable-overlap-schedule`,
+  draft attention backend flashinfer, mem-fraction ~0.6 for the 27-31B (cuda-graph + tree-mask buffer headroom).
 
 ## Attention-backend capability matrix (from `docs/advanced_features/attention_backend.md`)
 
