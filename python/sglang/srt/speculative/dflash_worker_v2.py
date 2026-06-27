@@ -1700,7 +1700,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         # kernel layout; use that as the candidate matrix. The chain path keeps
         # the contiguous block buffer.
         if self._tree_verify_enabled:
-            candidates = verify_input.draft_token.view(bs, int(self.block_size))
+            if not getattr(self, "_dbg_printed", False):
+                print(
+                    f"[DFLASH-TREE-DBG] bs={bs} block_size={self.block_size} "
+                    f"tree_ndt={self._tree_num_draft_tokens} verify_dtn={verify_input.draft_token_num} "
+                    f"draft_token_numel={verify_input.draft_token.numel()} "
+                    f"logits_rows={logits_output.next_token_logits.shape[0]} "
+                    f"voc2d={tuple(verify_out_cache_loc_2d.shape)}",
+                    flush=True,
+                )
+                self._dbg_printed = True
+            _dtn = int(verify_input.draft_token_num)
+            candidates = verify_input.draft_token.view(bs, _dtn)
         else:
             candidates = draft_tokens
 
