@@ -1,7 +1,8 @@
 import logging
 import math
+import os
 from copy import deepcopy
-from typing import List, Optional
+from typing import List, Optional, Tuple, cast
 
 import torch
 
@@ -25,6 +26,7 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
+    build_tree_verify_tokens,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -181,6 +183,28 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+
+        # EAGLE-style tree verify (opt-in). When disabled the worker keeps the
+        # byte-for-byte chain verify path. topk comes from --speculative-eagle-topk.
+        self._tree_verify_enabled: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0"))
+        )
+        self._tree_verify_topk: int = int(
+            server_args.speculative_eagle_topk
+            if server_args.speculative_eagle_topk is not None
+            else 1
+        )
+        # Tree verify uses the same draft token count as the chain block size.
+        self._tree_num_draft_tokens: int = int(self.block_size)
+        if self._tree_verify_enabled and self._tree_verify_topk <= 1:
+            # No tree to build with topk<=1; fall back to chain verify.
+            if self.tp_rank == 0:
+                logger.warning(
+                    "SGLANG_DFLASH_TREE_VERIFY=1 requires --speculative-eagle-topk > 1; "
+                    "got topk=%s. Falling back to chain verify.",
+                    self._tree_verify_topk,
+                )
+            self._tree_verify_enabled = False
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -612,16 +636,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_topk: Optional[int] = None,
+    ):
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+
+        When `return_topk` is set (tree verify), returns
+        `(out_tokens, topk_ids, topk_probs)`. Top-k is only supported for the
+        single-rank base-vocab fast path (tp_size == 1, no added vocab); other
+        configurations raise (tree verify is not supported there yet).
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            empty = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            if return_topk is not None:
+                return empty, empty, empty
+            return empty
 
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
@@ -634,6 +667,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         if not hasattr(lm_head, "shard_indices"):
+            if return_topk is not None:
+                k = int(return_topk)
+                out_topk_ids = torch.empty(
+                    (num_tokens, k), dtype=torch.long, device=hidden_states.device
+                )
+                out_topk_probs = torch.empty(
+                    (num_tokens, k), dtype=weight_dtype, device=hidden_states.device
+                )
+                for start in range(0, num_tokens, int(chunk_size)):
+                    end = min(num_tokens, start + int(chunk_size))
+                    hs = _cast_hs(hidden_states[start:end])
+                    logits = torch.matmul(hs, weight.T)
+                    topk_vals, topk_idx = torch.topk(logits, k=k, dim=-1)
+                    out_topk_probs[start:end] = torch.softmax(topk_vals, dim=-1).to(
+                        weight_dtype
+                    )
+                    out_topk_ids[start:end] = topk_idx.to(torch.long)
+                    out_tokens[start:end] = out_topk_ids[start:end, 0]
+                return out_tokens, out_topk_ids, out_topk_probs
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
@@ -653,6 +705,38 @@ class DFlashWorkerV2(BaseSpecWorker):
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
+
+        if return_topk is not None:
+            if tp_size != 1 or num_added != 0:
+                raise RuntimeError(
+                    "DFLASH tree verify return_topk only supports tp_size == 1 "
+                    "with no added vocab."
+                )
+            k = int(return_topk)
+            out_topk_ids = torch.empty(
+                (num_tokens, k), dtype=torch.long, device=hidden_states.device
+            )
+            out_topk_probs = torch.empty(
+                (num_tokens, k), dtype=weight_dtype, device=hidden_states.device
+            )
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                if num_org > 0:
+                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    topk_vals, topk_idx = torch.topk(base_logits, k=k, dim=-1)
+                    out_topk_probs[start:end] = torch.softmax(topk_vals, dim=-1).to(
+                        weight_dtype
+                    )
+                    out_topk_ids[start:end] = (
+                        topk_idx.to(torch.long) + org_vocab_start
+                    )
+                    out_tokens[start:end] = out_topk_ids[start:end, 0]
+                else:
+                    out_tokens[start:end] = 0
+                    out_topk_probs[start:end] = 0
+                    out_topk_ids[start:end] = 0
+            return out_tokens, out_topk_ids, out_topk_probs
 
         def _ensure_local_reduce_buffers(
             chunk_len: int,
@@ -1488,27 +1572,73 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, int(self.block_size) - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        if self._tree_verify_enabled:
+            # --- 2a) EAGLE-style tree verify input.
+            tree_topk = int(self._tree_verify_topk)
+            tree_num_draft_tokens = int(self._tree_num_draft_tokens)
+            num_steps = int(draft_hidden.shape[1]) - 1
+            topk_result = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+                return_topk=tree_topk,
+            )
+            _, draft_topk_ids, draft_topk_probs = cast(
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
+            )
+            draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
+            draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
 
-        # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
-        custom_mask = None
+            (
+                tree_draft_tokens,
+                tree_parent_list,
+                tree_selected_index,
+            ) = build_tree_verify_tokens(
+                verified_id=block_ids[:, 0],  # [bs]
+                topk_probs=draft_topk_probs,
+                topk_ids=draft_topk_ids,
+                topk=tree_topk,
+                num_draft_tokens=tree_num_draft_tokens,
+            )
+            # positions=None / custom_mask=None signals prepare_for_verify to run
+            # build_tree_kernel_efficient, which fills positions, custom_mask, the
+            # retrieve buffers, and reorders draft_token into kernel layout.
+            verify_input = DFlashVerifyInput(
+                draft_token=tree_draft_tokens,
+                positions=None,
+                draft_token_num=tree_num_draft_tokens,
+                custom_mask=None,
+                topk=tree_topk,
+                tree_parent_list=tree_parent_list,
+                tree_selected_index=tree_selected_index,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, int(self.block_size) - 1)
 
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+
+            # --- 2) Target verify.
+            # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+            custom_mask = None
+
+            verify_input_ids = draft_tokens.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=verify_input_ids,
+                positions=positions,
+                draft_token_num=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
 
         model_worker_batch.out_cache_loc = verify_out_cache_loc
         sampling_info = model_worker_batch.sampling_info
@@ -1551,8 +1681,151 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=int(self.block_size),
             )
 
-        candidates = draft_tokens
         new_seq_lens = None
+        # For tree verify, prepare_for_verify reordered draft_token into the
+        # kernel layout; use that as the candidate matrix. The chain path keeps
+        # the contiguous block buffer.
+        if self._tree_verify_enabled:
+            candidates = verify_input.draft_token.view(bs, int(self.block_size))
+        else:
+            candidates = draft_tokens
+
+        if self._tree_verify_enabled:
+            # --- EAGLE-style tree accept (greedy only). ---
+            from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+
+            block_size = int(self.block_size)
+            target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, block_size)
+            predicts = torch.empty(
+                (bs * block_size,), device=device, dtype=torch.int32
+            )
+            accept_index = torch.full(
+                (bs, block_size), -1, device=device, dtype=torch.int32
+            )
+            accept_token_num = torch.zeros((bs,), device=device, dtype=torch.int32)
+            predicts, accept_index, accept_token_num = verify_tree_greedy_func(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrieve_index=verify_input.retrive_index,
+                retrieve_next_token=verify_input.retrive_next_token,
+                retrieve_next_sibling=verify_input.retrive_next_sibling,
+                target_predict=target_predict,
+                topk=int(self._tree_verify_topk),
+            )
+            # accept_index is absolute (row offset baked in); make it block-local.
+            accept_len = accept_token_num  # [bs] number of accepted drafts (excl bonus)
+            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+            batch_offsets = (
+                torch.arange(bs, device=device, dtype=accept_index.dtype) * block_size
+            ).unsqueeze(1)
+            accept_index_local = accept_index - batch_offsets  # -1 stays out of range
+
+            # out_tokens[i, j] = predicts at the j-th accepted node (target prediction
+            # following accepted draft j). Gather predicts along accepted positions.
+            col = torch.arange(block_size, device=device)[None, :]
+            valid = col < commit_lens[:, None]
+            safe_abs = torch.where(valid, accept_index, batch_offsets)  # in-range fill
+            out_tokens = (
+                predicts[safe_abs.reshape(-1).to(torch.long)]
+                .view(bs, block_size)
+                .to(torch.int64)
+            )
+            out_tokens = torch.where(valid, out_tokens, torch.zeros_like(out_tokens))
+            # bonus token = last accepted node's target prediction (per request).
+            last_col = accept_len.to(torch.int64)  # commit_lens - 1
+            bonus = out_tokens.gather(1, last_col[:, None]).squeeze(1).to(torch.int64)
+
+            # Re-point req_to_token at the accepted slots in committed order. The
+            # tree verify wrote target KV at the scattered block slots
+            # verify_out_cache_loc_2d[accept_index_local]; gather those into a
+            # contiguous prefix and rewrite the mapping. No physical KV move is
+            # needed since the values already live at those slots; the unaccepted
+            # tail slots become orphaned (reclaimed by the next allocation), the
+            # same lifecycle the chain path relies on.
+            accept_local_safe = torch.where(
+                valid,
+                accept_index_local.to(torch.long),
+                torch.zeros_like(accept_index_local, dtype=torch.long),
+            )
+            committed_cache_loc_2d = torch.gather(
+                verify_out_cache_loc_2d, 1, accept_local_safe
+            )  # [bs, block_size]; cols >= commit_lens are don't-care
+            # assign_req_to_token_pool reads out_cache_loc with a RAGGED offset
+            # (sum of prior reqs' lengths), so pack the accepted slots row-major.
+            committed_cache_loc_packed = committed_cache_loc_2d[valid]
+            block_end = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            assign_req_to_token_pool_func(
+                model_worker_batch.req_pool_indices,
+                self.model_runner.req_to_token_pool.req_to_token,
+                prefix_lens,
+                block_end,
+                committed_cache_loc_packed,
+                bs,
+            )
+            model_worker_batch.out_cache_loc = committed_cache_loc_packed
+
+            if need_mamba_verify_commit:
+                assert seq_lens_pre_verify is not None
+                self._update_target_mamba_state_after_verify(
+                    batch=model_worker_batch,
+                    seq_lens_pre_verify=seq_lens_pre_verify,
+                    commit_lens=commit_lens,
+                )
+
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            if on_publish is not None:
+                on_publish(new_seq_lens)
+
+            # --- Materialize accepted verify-input tokens into draft KV cache. ---
+            # Gather the accepted target hidden states (scattered by accept_index_local)
+            # into the contiguous committed slots.
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError(
+                    "DFLASH verify requires target hidden states, but got None."
+                )
+            hidden = hidden.view(bs, block_size, -1)
+            gathered_hidden = torch.gather(
+                hidden,
+                1,
+                accept_local_safe[:, :, None].expand(-1, -1, hidden.shape[-1]),
+            )  # [bs, block_size, H]; rows >= commit_lens are masked by commit_lens
+            committed_positions = (
+                prefix_lens.to(torch.int64)[:, None] + col
+            ).reshape(-1)
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=gathered_hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=committed_cache_loc_2d.reshape(-1),
+                cache_loc_2d=committed_cache_loc_2d,
+                positions=committed_positions,
+                commit_lens=commit_lens,
+            )
+
+            logits_output.hidden_states = None
+
+            next_draft_input = self._make_next_draft_input_decode(
+                bonus_tokens=bonus,
+                new_seq_lens=new_seq_lens,
+                cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+            )
+            verify_done = torch.get_device_module(device).Event()
+            verify_done.record()
+            next_draft_input.verify_done = verify_done
+
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=out_tokens.reshape(-1),
+                accept_lens=commit_lens,
+                can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
+                speculative_num_draft_tokens=int(self.block_size),
+                new_seq_lens=new_seq_lens,
+            )
+
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy

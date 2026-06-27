@@ -38,6 +38,15 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # EAGLE-style tree verify metadata (only set when SGLANG_DFLASH_TREE_VERIFY=1
+    # and topk > 1). When present and `positions is None`, prepare_for_verify
+    # builds the tree mask / positions / retrieve buffers via the EAGLE kernel.
+    tree_parent_list: Optional[torch.Tensor] = None  # Full topk-tree parent list
+    tree_selected_index: Optional[torch.Tensor] = None  # Selected indices in full tree
+    retrive_index: Optional[torch.Tensor] = None
+    retrive_next_token: Optional[torch.Tensor] = None
+    retrive_next_sibling: Optional[torch.Tensor] = None
+
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
@@ -62,6 +71,57 @@ class DFlashVerifyInput(SpecInput):
         `skip_attn_backend_init=True`.
         """
         batch.input_ids = self.draft_token
+
+        # EAGLE-style tree verify: build the tree mask / positions / retrieve
+        # buffers from the pruned-tree metadata before constructing the forward
+        # batch. `generate_attn_arg_prefill` consumes `self.custom_mask`, so the
+        # verify forward picks up the tree mask automatically.
+        is_tree_verify = (
+            self.positions is None
+            and self.tree_parent_list is not None
+            and self.tree_parent_list.numel() > 0
+            and self.tree_selected_index is not None
+            and self.tree_selected_index.numel() > 0
+        )
+        if is_tree_verify and not batch.forward_mode.is_idle():
+            from sglang.srt.speculative.eagle_utils import (
+                TreeMaskMode,
+                build_tree_kernel_efficient,
+            )
+
+            bs = batch.batch_size()
+            depth = int((self.tree_parent_list.size(1) - 1) / int(self.topk)) + 1
+            # The tree mask buffer is sized from sum(seq_lens); the caller may have
+            # temporarily set batch.seq_lens_sum to an over-allocated planning value,
+            # so recompute the true sum here for a correctly sized FULL_MASK.
+            true_seq_lens_sum = int(batch.seq_lens.sum().item())
+            (
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                bonus_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 0],
+                parent_list=self.tree_parent_list,
+                top_scores_index=self.tree_selected_index,
+                draft_tokens=self.draft_token.view(bs, self.draft_token_num)[:, 1:],
+                seq_lens=batch.seq_lens,
+                seq_lens_sum=true_seq_lens_sum,
+                topk=int(self.topk),
+                spec_steps=depth,
+                num_verify_tokens=self.draft_token_num,
+                tree_mask_mode=TreeMaskMode.FULL_MASK,
+            )
+            batch.input_ids = draft_tokens
+            self.draft_token = draft_tokens
+            self.custom_mask = tree_mask
+            self.positions = positions
+            self.retrive_index = retrive_index
+            self.retrive_next_token = retrive_next_token
+            self.retrive_next_sibling = retrive_next_sibling
+
         batch.spec_info = self
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -71,8 +131,12 @@ class DFlashVerifyInput(SpecInput):
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
+        # TODO(tree-cudagraph): wiring the tree custom_mask into the cuda-graph
+        # captured buffer is non-trivial; force the verify step eager when a tree
+        # mask is present so the flashinfer verify path reads the per-step mask.
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
+            self.custom_mask is None
+            and target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
