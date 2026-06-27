@@ -40,12 +40,14 @@ base_image = (
         copy=True,
     )
     .add_local_dir("./benchmark", remote_path="/root/benchmark", copy=True)
+    .add_local_file("./patch_cudagraph.py", remote_path="/tmp/patch_cudagraph.py", copy=True)
     .run_commands(
         "SGLANG_DIR=$(python3 -c 'import sglang,os;print(os.path.dirname(sglang.__file__))') && "
         "echo \"sglang at $SGLANG_DIR\" && "
         "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
         "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && "
-        "echo overlaid tree-verify port"
+        "echo overlaid tree-verify port",
+        "python3 /tmp/patch_cudagraph.py",
     )
 )
 
@@ -133,23 +135,42 @@ def debug(target_model="Qwen/Qwen3-8B", draft_model="z-lab/Qwen3-8B-DFlash-b16",
     env = dict(os.environ)
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree else "0"
     env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"
-    print("CMD:", " ".join(cmd), "TREE=", env["SGLANG_DFLASH_TREE_VERIFY"])
-    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, bufsize=1)
-    lines = []
-    t0 = time.time()
-    for line in p.stdout:
-        lines.append(line.rstrip())
-        if p.poll() is not None or time.time() - t0 > 600:
-            break
-        if "The server is fired up" in line or "Uvicorn running" in line:
-            lines.append(">>> SERVER UP OK")
-            p.terminate(); break
+    env["CUDA_LAUNCH_BLOCKING"] = "1"  # precise CUDA error location
+    print("CMD:", " ".join(cmd), "TREE=", env["SGLANG_DFLASH_TREE_VERIFY"], flush=True)
+    import threading, urllib.request, json as _json
+
+    def _send():
+        # poll health, then send a real generate to trigger the tree-verify forward
+        for _ in range(180):
+            try:
+                urllib.request.urlopen("http://127.0.0.1:30000/health_generate", timeout=3).read()
+                break
+            except Exception:
+                time.sleep(2)
+        print(">>> SERVER HEALTHY, sending generate", flush=True)
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:30000/generate",
+                data=_json.dumps({"text": "Solve 2+2 step by step.",
+                                  "sampling_params": {"temperature": 0, "max_new_tokens": 64}}).encode(),
+                headers={"Content-Type": "application/json"})
+            r = urllib.request.urlopen(req, timeout=180).read().decode()
+            print(">>> GENERATE OK: " + r[:300], flush=True)
+        except Exception as e:
+            print(f">>> GENERATE ERR: {e}", flush=True)
+
+    threading.Thread(target=_send, daemon=True).start()
+    # Inherit stdout/stderr so the scheduler subprocess crash lands in container logs.
+    p = subprocess.Popen(cmd, env=env)
     try:
-        p.wait(timeout=10)
+        p.wait(timeout=480)
+    except Exception:
+        pass
+    try:
+        p.terminate(); p.wait(timeout=10)
     except Exception:
         p.kill()
-    return "\n".join(lines[-120:])
+    return ">>> debug done (see container logs above)"
 
 
 def _tables(res):
