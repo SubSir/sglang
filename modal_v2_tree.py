@@ -75,6 +75,9 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
         "--mem-fraction-static", str(mem_fraction),
         "--speculative-eagle-topk", str(topk),
         "--speculative-dflash-block-size", str(block_size),
+        # cap running requests = max swept concurrency, so the bench only captures
+        # cuda graphs up to that bs (128 graphs OOMs tree verify).
+        "--max-running-requests", str(max(int(c) for c in str(concurrencies).split(","))),
     ]
     if skip_baseline:
         args.append("--skip-baseline")
