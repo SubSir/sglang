@@ -203,7 +203,7 @@ def main(target_model: str = "Qwen/Qwen3-8B",
          draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
          block_size: int = 16):
     """Quick validation: chain vs tree(budget32) at conc=1, gsm8k, cuda graph ON."""
-    configs = [("tree_b32", True, 4, 32)]
+    configs = [("tree_b16", True, 4, 16)]  # budget == block_size: isolate tree verify from decoupling
     os.makedirs("v2_tree_results", exist_ok=True)
     for label, tv, topk, ndt in configs:
         print(f">>> {label}")
