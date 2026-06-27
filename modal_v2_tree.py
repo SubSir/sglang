@@ -34,14 +34,18 @@ base_image = (
         "cd /root/sglang_local && PATH=/root/.cargo/bin:$PATH pip install -e \"python\"",
         "pip install sglang-kernel==0.4.4",
         "pip install --upgrade --force-reinstall nvidia-cudnn-cu12==9.16.0.29",
-        # deep_gemm's _C.so dlopens libnvrtc.so.13 (CUDA 13) which the 12.8 base
-        # lacks; sglang guards `import deep_gemm` with except ImportError, so
-        # removing the package makes it cleanly fall back (no FP8 deep gemm).
-        # pip uninstall misses it (no dist metadata) -> delete the dir directly.
-        "pip uninstall -y deep_gemm deep-gemm || true",
-        "rm -rf $(python3 -c 'import site;print(site.getsitepackages()[0])')/deep_gemm "
-        "$(python3 -c 'import site;print(site.getsitepackages()[0])')/deep_gemm-* || true",
+        # upstream deep_gemm dlopens libnvrtc.so.13 (CUDA 13) at runtime; the 12.8
+        # base only ships libnvrtc.so.12. Install the cu13 nvrtc wheel and expose the
+        # bare soname on the loader path (keep deep_gemm; gpt-oss MXFP4 may need it).
+        "pip install nvidia-cuda-nvrtc-cu13",
+        "ls -la /usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/",
+        "cd /usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/ && "
+        "([ -e libnvrtc.so.13 ] || ln -s libnvrtc.so.13.* libnvrtc.so.13) && "
+        "echo $PWD > /etc/ld.so.conf.d/nvrtc13.conf && ldconfig && ldconfig -p | grep nvrtc",
     )
+    .env({
+        "LD_LIBRARY_PATH": "/usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
+    })
     # Overlay the tree-verify port (speculative dir from the worktree = upstream + port).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
