@@ -63,6 +63,49 @@ tree budgets {16,32,64}:
    to chain. → **tree + dynamic block size** (big budget at low conc, small/chain at high conc) is the
    right design, matching the Slack discussion. mt-bench accept is lower (2.7–5.8, chattier/less draftable).
 
+## ★★ v2 (upstream `dflash_worker_v2`) tree verify — FIXED + results
+
+The tree-verify feature is now ported AND CORRECT on the upstream spec-v2 worker (branch
+`dflash-tree-v2-port`), running on the official `lmsysorg/sglang:nightly-...20260627` image. **The bug
+that made it wrong for ~20 cycles:** v2's verify KV slots are a standing per-req reservation
+(`committed + 2*block_size`), so adjacent verify windows OVERLAP in `req_to_token`. The "no-move
+re-pointing" of scattered tree-accept slots left an accepted node aliased into the NEXT verify window →
+overwritten → KV corruption → non-lossless → accept stuck ~4 (< chain). **Fix = EAGLE v2's
+`move_accept_tokens_to_target_kvcache`**: physically move the accepted tree-path KV to the contiguous
+FRONT of each block (chain needs no move — its accepts are already front-aligned). Plus: decouple draft
+block_size (16, the trained `-b16`) from the verify budget; size verify buffers/accept/logits-adjust by
+the budget; run with `--disable-overlap-schedule` (spec-v2 overlap is topk=1-only by design). Validated:
+Qwen3-8B tree_b16 3.23 → **7.05**, matching v1.
+
+**Qwen3-8B (v2, flashinfer, cuda graph ON):**
+
+| gsm8k | accept c1/c8/c32 | tok/s c1/c8/c32 |   | mt-bench accept c1/c8/c32 |
+|---|---|---|---|---|
+| chain | 5.79 / 6.37 / 6.38 | 904 / 4,571 / 10,579 | | 2.14 / 4.43 / 3.97 |
+| tree b16 | 6.54 / 7.21 / 7.18 | 832 / 2,005 / 6,218 | | 2.66 / 5.16 / 4.70 |
+| tree b32 | 7.23 / 7.33 / 7.36 | 797 / 1,049 / 4,074 | | 2.83 / 6.03 / 5.42 |
+| tree b64 | 7.51 / 8.09 / 7.66 | 806 / 1,333 / 3,338 | | 2.97 / 6.21 / 5.87 |
+
+**gemma-4-31B-it (v2, triton, cuda graph ON):**
+
+| gsm8k | accept c1/c8/c32 | tok/s c1/c8/c32 |   | mt-bench accept c1/c8/c32 |
+|---|---|---|---|---|
+| chain | 6.92 / 7.12 / 7.33 | 382 / 1,721 / 3,305 | | 2.07 / 4.45 / 4.01 |
+| tree b16 | 7.34 / 7.52 / 7.75 | **418** / 1,286 / 2,673 | | 2.39 / 4.78 / 4.36 |
+| tree b32 | 7.91 / 7.75 / 7.89 | 426 / 1,183 / 2,154 | | 2.49 / 4.73 / 4.37 |
+| tree b64 | 8.34 / 8.66 / 8.32 | 403 / 783 / 1,430 | | 2.65 / 5.68 / 5.04 |
+
+**Headline (v2, the requested setup — cuda graph ON, tree-vs-chain):**
+- Tree raises accept length on BOTH models (Qwen3-8B 5.79→7.51, gemma 6.92→8.34 at conc1, gsm8k).
+- **Small model (Qwen3-8B):** tree costs throughput at high concurrency (conc32: chain 10.6k > tree-b64
+  3.3k tok/s) — latency-bound win only.
+- **Large model (gemma-31B):** at conc1, tree is a NET WIN on both accept AND throughput (tree-b16 418 >
+  chain 382 tok/s) — the verify overhead is small relative to the 31B forward, so the extra accept pays
+  off. → **bigger models favor trees; smaller models / high concurrency favor chain or small budgets →
+  dynamic block size.**
+- gpt-oss-120b dropped (per request; fa4-cute broken). Qwen3.6-27B is a VL model — its vision tower needs
+  a non-cute backend (`--mm-attention-backend triton_attn`); the tree-verify path itself is unaffected.
+
 ## Attention-backend capability matrix (from `docs/advanced_features/attention_backend.md`)
 
 Upstream documents exactly which backends support the **custom tree mask** (the "Spec topk>1" column) and
