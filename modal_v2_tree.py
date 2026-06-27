@@ -57,7 +57,8 @@ base_image = (
               volumes={"/results": results_vol})
 def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
         num_draft_tokens, samples_base, concurrencies, backend="flashinfer",
-        mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None):
+        mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None,
+        disable_cuda_graph=False):
     """One server launch; bench internally sweeps all concurrencies x datasets.
     When skip_baseline is False, the bench runs the target-only baseline on the
     SAME GPU (serially) before DFLASH, yielding the speedup denominator."""
@@ -83,6 +84,8 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
     ]
     if skip_baseline:
         args.append("--skip-baseline")
+    if disable_cuda_graph:
+        args.append("--disable-cuda-graph")
     if num_draft_tokens is not None:
         args += ["--speculative-num-draft-tokens", str(num_draft_tokens)]
 
@@ -207,7 +210,7 @@ def main(target_model: str = "Qwen/Qwen3-8B",
         try:
             res = run.remote(target_model, draft_model, "gsm8k", tv, topk,
                              block_size, ndt, 24, "1", "flashinfer", 0.8, 1, 1, True,
-                             f"validate_{label}")
+                             f"validate_{label}", True)  # disable_cuda_graph=True (decisive mask test)
             with open(f"v2_tree_results/validate_{label}_{target_model.split('/')[-1]}.md", "w") as f:
                 f.write(res)
             print(_tables(res))
