@@ -646,12 +646,19 @@ def main() -> None:
             if args.disable_cuda_graph:
                 common_server_args.append("--disable-cuda-graph")
             else:
+                # Capturing 128 graphs OOMs for tree verify (larger verify blocks +
+                # draft model). A small power-of-2 set up to max_running_requests
+                # covers the swept concurrencies.
+                _max_bs = int(args.max_running_requests)
+                _cg_bs = [b for b in [1, 2, 4, 8, 16, 32, 64, 128] if b <= _max_bs]
+                if _max_bs not in _cg_bs:
+                    _cg_bs.append(_max_bs)
                 common_server_args.extend(
                     [
                         "--cuda-graph-bs",
-                        *[str(i) for i in range(1, 129)],
+                        *[str(b) for b in _cg_bs],
                         "--cuda-graph-max-bs",
-                        "128",
+                        str(_max_bs),
                     ]
                 )
                 if args.enable_piecewise_cuda_graph:
