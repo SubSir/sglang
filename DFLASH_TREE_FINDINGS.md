@@ -38,6 +38,49 @@ This fork (`dflash_fixed`) implements **tree verification on top of DFlash** in 
 
 ---
 
+## ★ Measured draft-tree results (v1, CORRECT) — Qwen3-8B, B200, cuda graph ON
+
+v1 tree verify is validated-correct (v2 port has an accept bug — see "v2 Tree-Verify Port").
+Qwen3-8B + `z-lab/Qwen3-8B-DFlash-b16`, block 16, flashinfer, gsm8k, conc {1,8,32}, baseline + chain +
+tree budgets {16,32,64}:
+
+| config | accept (c1/c8/c32) | tok/s (c1/c8/c32) | speedup vs baseline (c1/c8/c32) |
+|---|---|---|---|
+| baseline (no spec) | — | 227 / 1,413 / 4,901 | 1× |
+| chain (block 16) | 5.87 / 6.39 / 6.41 | 319 / 3,649 / 8,935 | **1.41 / 2.58 / 1.82** |
+| tree b16 | 6.65 / 7.14 / 7.20 | 318 / 2,148 / 6,382 | 1.40 / 1.52 / 1.30 |
+| tree b32 | 7.30 / 7.75 / 7.84 | 275 / 2,061 / 5,481 | 1.21 / 1.46 / 1.12 |
+| tree b64 | **7.74 / 8.12 / 8.22** | 344 / 1,967 / 4,281 | 1.52 / 1.39 / 0.87 |
+
+**Headline conclusions (the blog point):**
+1. Chain DFLASH alone gives 1.4–2.6× over baseline.
+2. **Tree raises accept length (6.4 → 8.2, +28%) but NOT throughput — and at serving concurrency it
+   HURTS throughput** (conc=32: chain 8,935 > tree-b16 6,382 > tree-b64 4,281; tree-b64 is even slower
+   than baseline, 0.87×). The bigger tree's verify FLOPs saturate the GPU at high batch, and the extra
+   accept length doesn't pay for it. This quantifies the team's original "accept length up, throughput
+   not" observation.
+3. **Tree is a low-concurrency / latency-bound win**; at high concurrency use a small budget or fall back
+   to chain. → **tree + dynamic block size** (big budget at low conc, small/chain at high conc) is the
+   right design, matching the Slack discussion. mt-bench accept is lower (2.7–5.8, chattier/less draftable).
+
+## Attention-backend capability matrix (from `docs/advanced_features/attention_backend.md`)
+
+Upstream documents exactly which backends support the **custom tree mask** (the "Spec topk>1" column) and
+the GDN target-verify path:
+
+**MHA — "Spec topk>1" = tree-mask support:** FlashInfer ✅, FA3 ✅, FA4 ✅, Triton ✅, **TRTLLM MHA ❌**,
+Torch-native/Flex/DualChunk/Wave/Intel ❌. (MLA backends: almost all ❌ for topk>1; only FA3/Triton ⚠️ at
+page_size=1.) **GDN/linear-attn target verify: only Triton ✅** (CuTe DSL ❌). On Blackwell, hybrid-GDN
+full-attn layers are restricted to `triton / trtllm_mha / fa4`.
+
+This confirms our backend choices: gemma rejects flashinfer → must use **triton** (trtllm_mha is ❌ for
+tree mask); Qwen3.5/3.6 linear layers need **triton** for target verify.
+
+**Critical:** the doc states **Spec V2 (overlap scheduling, the `dflash_worker_v2` lineage) requires
+`--speculative-eagle-topk 1` and only covers EAGLE/EAGLE3.** So upstream spec-v2 is **topk=1-only by
+design** — tree (topk>1) is not a supported spec-v2 path. This is the root reason the v2 tree port fights
+the framework, and why **v1 (non-overlap spec-v1) is the correct home for tree/topk>1 verify.**
+
 ## Goal 2 — Throughput, backends, and the linear-attention slowdown
 
 ### 2a. Which attention backends support the tree custom mask (CONFIRMED via code)
