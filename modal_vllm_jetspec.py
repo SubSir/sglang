@@ -30,11 +30,13 @@ image = (
         "uv pip install --system 'setuptools>=77,<81' wheel 'setuptools-scm>=8' ninja cmake packaging",
         "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
         # documented fork install: prebuilt vLLM wheel + fork python overlay (no CUDA rebuild)
-        # VLLM_DOCKER_BUILD_CONTEXT=1 makes the precompiled-wheel resolver return the
-        # curled latest upstream vllm main commit directly (the shallow clone has no git
-        # history to walk a merge-base), so it actually fetches vllm._C from wheels.vllm.ai.
+        # Non-editable pip install: builds a real wheel so VLLM_USE_PRECOMPILED extracts
+        # vllm._C into the package (editable -e + uv skipped that). VLLM_DOCKER_BUILD_CONTEXT=1
+        # makes the resolver return the curled latest upstream main commit (shallow clone has
+        # no history to walk a merge-base).
         "cd /root/vllm-jetspec && VLLM_DOCKER_BUILD_CONTEXT=1 VLLM_USE_PRECOMPILED=1 "
-        "uv pip install --system -e . --no-build-isolation --torch-backend=auto",
+        "pip install --no-build-isolation .",
+        "python -c 'import vllm._C; print(\"VLLM_C_OK\")'",
         "pip install datasets",
     )
 )
@@ -49,7 +51,7 @@ def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=
     env = dict(os.environ)
     env["VLLM_USE_V1"] = "1"
     args = [
-        "python", "examples/offline_inference/dflash_profiling.py",
+        "python", "/root/vllm-jetspec/examples/offline_inference/dflash_profiling.py",
         "--prompt-set", prompt_set, "--mode", mode, "--head-type", "causal",
         "--model", target, "--draft-model", draft,
         "--max-tokens", "1024", "--block-size", "16",
@@ -63,7 +65,7 @@ def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=
         "--profiler", "none",
     ]
     print(">>>", " ".join(args), flush=True)
-    p = subprocess.run(args, cwd="/root/vllm-jetspec", env=env, capture_output=True, text=True)
+    p = subprocess.run(args, cwd="/root", env=env, capture_output=True, text=True)
     out = p.stdout + "\n===STDERR(tail)===\n" + "\n".join(p.stderr.splitlines()[-50:])
     with open(f"/results/{tag}.txt", "w") as f:
         f.write(out)
