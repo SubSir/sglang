@@ -27,14 +27,14 @@ image = (
         # .py (spec_decode/dflash, tree_attn backend) replace stock. Avoids VLLM_USE_PRECOMPILED's
         # commit-resolution which silently failed to extract _C on a shallow clone.
         "pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly || pip install -U vllm",
-        "python -c 'import vllm._C; print(\"STOCK_C_OK\", __import__(\"vllm\").__version__)'",
         "pip install datasets",
         "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
-        # overlay the fork's python over the installed stock vllm package (keep stock .so files)
+        # overlay the fork's python over the installed stock vllm package (keep stock .so files).
+        # NOTE: can't `import vllm._C` here — image build has no GPU/libcuda.so.1; the runtime
+        # function validates the import instead.
         "SITE=$(python -c 'import vllm,os;print(os.path.dirname(vllm.__file__))') && "
-        "echo \"stock vllm at $SITE\" && "
-        "cp -rf /root/vllm-jetspec/vllm/. \"$SITE/\" && "
-        "python -c 'import vllm._C; from vllm import LLM; print(\"OVERLAY_OK\")'",
+        "echo \"stock vllm at $SITE\" && cp -rf /root/vllm-jetspec/vllm/. \"$SITE/\" && "
+        "echo overlaid fork python on stock vllm",
     )
 )
 
