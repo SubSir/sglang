@@ -153,6 +153,43 @@ for our EAGLE top-k tree (832 vs 954 tok/s).
 
 ---
 
+## Task 3b — vLLM-DFlash (linear) vs vLLM-JetSpec (tree), SAME vLLM engine
+
+`vllm-jetspec`'s spec `method="dflash"` is unified: `--tree-width 1` == linear DFlash (vLLM's
+DFlash), `--tree-width >1` == JetSpec parallel tree. Same engine, same head (`jetspec-qwen3-8b`),
+so this isolates the tree contribution INSIDE vLLM (the in-engine analogue of Task 1's HF-reference
+ablation). Built by overlaying the fork's python onto stock vLLM 0.23.0 (the fork adds no .cu, so
+stock `_C` is valid). Qwen3-8B, gsm8k, B200, batch=1, 32 samples.
+
+| config | tree kernel | KV layout | cuda-graph | accept_len | tok/s |
+|---|---|---|---|---|---|
+| **DFlash linear** (tw1) | — | — | ✅ piecewise | 5.60 | **955** |
+| JetSpec tree tw7/budget128 | triton | physical | ❌ (captures=0) | 6.80 | 226 |
+| JetSpec tree tw7/budget128 | triton | logical | ✅ full | 7.85 | 428 |
+| JetSpec tree tw4/budget32 | triton | logical | ✅ full | 6.86 | 287 |
+| JetSpec tree tw7/budget128 | **optimus** | logical | ✅ full | _TBD_ | _TBD_ |
+
+**Findings (triton kernel):**
+- **Inside vLLM, the linear DFlash is much faster than the JetSpec tree** (955 vs best-tree 428 tok/s),
+  even though the tree's accept length is higher (7.85 vs 5.60). This is the OPPOSITE of Task 1's HF
+  reference (where the tree won 4.69× vs 3.11×) and of JetSpec's own standalone engine (954 tok/s).
+- The tree config matters enormously: **cuda-graph + logical zero-copy KV nearly doubled the tree**
+  (226 → 428 tok/s). With captures=0 (default) the tree verify is NOT graphed while linear IS — an easy
+  way to mis-measure.
+- Counter-intuitively, budget 32 (287) was slower than budget 128 (428): the per-step overhead (draft
+  passes `max_draft_passes=5`, CPU tree build, draft-head forward) dominates over verify-forward size on
+  B200, so the smaller tree's lower accept (6.86 vs 7.85) means more steps and lower throughput.
+- The acceptance RATE is very low (5–19%): a 128-node tree accepting ~8 tokens wastes most draft work.
+- **Open question (optimus kernel):** JetSpec's headline tree throughput (954 tok/s, standalone engine)
+  uses the Optimus sparse-tree cutedsl kernel, not triton. Whether Optimus closes the gap in the vLLM
+  integration is the TBD row above.
+
+**Takeaway:** the JetSpec *tree algorithm* (higher accept) does not automatically beat linear DFlash in
+the vLLM integration with the triton kernel — the draft-pass + tree-build overhead per step outweighs the
+accept gain at batch=1. The tree's win in JetSpec's own numbers depends on its specific optimized engine
+(fused gemm, graphed drafter, and likely the Optimus kernel). Same lesson as Task 2/3: *the engine and
+kernel decide whether a better tree turns into wall-clock speedup.*
+
 ## Bottom line
 
 - **JetSpec leads on B200 batch=1** (954 tok/s, 5.73× on gsm8k) — trained head + optimized engine.
