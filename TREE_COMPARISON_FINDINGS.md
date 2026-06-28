@@ -212,3 +212,38 @@ kernel decide whether a better tree turns into wall-clock speedup.*
 - **Overhead lesson**: accept-length is necessary but not sufficient — only an optimized engine
   (cuda-graph, fused gemm, sparse tree attn, zero-copy KV) converts it to speedup (0.76 vs 0.34
   efficiency).
+
+## Task 3c — Reproducing JetSpec paper Table 11 (H100, Math-500, batch sweep) + the MISSING DFlash-linear column
+
+JetSpec's paper Table 11 (their ONLY throughput comparison) reports vLLM-serving JetSpec-tree vs AR on
+H100 / Math-500 / Qwen3-8B across batch sizes — but **omits the DFlash-linear baseline**. Reproduced their
+setting (H100, Math-500, Qwen3-8B, full_decode_only cuda graph, FLASH_ATTN) and added DFlash-linear + AR.
+
+| batch | paper AR | **my AR** | paper JetSpec (best budget) | **my DFlash-linear** | my JetSpec-tree b32 (triton) |
+|---|---|---|---|---|---|
+| 1 | 127.8 | 145 | 553 (b128) | **821** (acc 7.75) | 168 (acc 6.17) |
+| 2 | 163.3 | 218 | 622 (b128) | **1207** (acc 7.83) | 161 (acc 4.83) |
+| 4 | 203.8 | 379 | 743 (b128) | **1952** (acc 7.76) | 237 (acc 4.09) |
+| 8 | 246.2 | 600 | 859 (b64) | **2848** (acc 7.39) | 417 (acc 4.00) |
+| 16 | 287.3 | 773 | 1095 (b32) | **3779** (acc 7.31) | 553 (acc 4.12) |
+
+**Findings:**
+1. **Plain DFlash-linear beats the paper's JetSpec-tree at EVERY batch size** (1.48× at bs1 → 3.45× at bs16),
+   in absolute tok/s. By speedup-over-own-AR: my linear 5.66× (bs1) / 4.89× (bs16) > their tree 4.33× / 3.81×.
+2. **Their AR baseline scales poorly with batch** (127.8→287.3, only 2.25× over 16× batch) vs a
+   properly-configured vLLM AR (145→773, 5.65×). They MATCH at bs1 (145 vs 128 — setup comparable) and
+   DIVERGE at high batch — consistent with an attention-backend / cuda-graph / vLLM-version difference that
+   only bites once attention+KV-read dominates (high batch). Their low high-batch AR inflates their
+   high-batch speedup ratios.
+3. **Controlled (same vLLM/H100/triton): DFlash-linear ≫ JetSpec-tree** (821 vs 168 at bs1; 3779 vs 553 at
+   bs16) AND linear has HIGHER accept (7.75 vs 6.17). On predictable Math-500 a deep linear chain (depth 16)
+   out-accepts a branchy budget-32 tree — branching only pays when next-token is uncertain.
+4. Tree accept DROPS with batch (6.17→4.12) — the batched tree path is immature, matching the repo's own
+   "DraftHead drafting is N1-only [batch-1] for now" admission.
+5. Caveat: my tree uses triton (their published tree likely uses the private optimus SM90 kernel, so my
+   tree is a lower bound) — but their PUBLISHED tree (≤1095) is still crushed by plain DFlash-linear (3779).
+
+**Bottom line:** On the paper's own dataset/hardware, a properly-configured vLLM running plain **DFlash chain**
+beats the JetSpec **tree** at every batch size on throughput AND accept. The paper's headline speedups lean on
+(a) an under-optimized AR baseline (esp. at high batch) and (b) omitting the DFlash-linear comparison. The
+tree's value is real only in the narrow batch-1, uncertain-next-token regime — exactly where serving doesn't live.
