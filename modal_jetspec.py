@@ -25,10 +25,10 @@ image = (
         # avoids the slow/fragile sm_100 flash-attn source build).
         "cd /root/JetSpec && pip install -e '.[bench,kernel]' --no-build-isolation || "
         "pip install -e '.[bench,kernel]'",
-        # JetSpec's install pulls a newer `kernels` than the image's huggingface_hub
-        # supports (strict-dataclass `str | None` crash at transformers import). It's an
-        # optional fused-kernel helper; removing it lets transformers degrade gracefully.
-        "pip uninstall -y kernels || true",
+        # JetSpec's deps pull a newer `kernels` than the image's huggingface_hub
+        # supports (strict-dataclass `str | None` crash). Upgrade hf_hub so its strict
+        # dataclass validator accepts union types. (This image only runs JetSpec.)
+        "pip install -U huggingface_hub",
     )
 )
 
