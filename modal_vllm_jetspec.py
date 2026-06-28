@@ -25,7 +25,9 @@ image = (
         # torch + build deps must exist BEFORE building vllm (its setup.py imports torch;
         # uv build-isolation otherwise lacks it). Then build with --no-build-isolation.
         "uv pip install --system torch --torch-backend=auto",
-        "uv pip install --system setuptools wheel setuptools-scm ninja cmake packaging",
+        # setuptools pinned to the fork's range: >=77 for PEP-639 SPDX license string, <81
+        # because >=81 breaks its pyproject (project.license schema change).
+        "uv pip install --system 'setuptools>=77,<81' wheel 'setuptools-scm>=8' ninja cmake packaging",
         "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
         # documented fork install: prebuilt vLLM wheel + fork python overlay (no CUDA rebuild)
         "cd /root/vllm-jetspec && VLLM_USE_PRECOMPILED=1 uv pip install --system -e . "
