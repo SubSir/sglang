@@ -58,6 +58,18 @@ tree kernel is why.
 | ddtree_tb64 | 8.38 | 2.81× | 182 |
 | ddtree_tb128 | 8.64 | 2.05× | 133 |
 
+**DDTree reference — mt-bench** (48 samples, AR=59.3 tok/s) — same pattern as gsm8k:
+
+| method | accept_len | speedup vs AR |
+|---|---|---|
+| dflash chain | 4.14 | 2.13× |
+| ddtree_tb16 | 4.87 | 1.50× |
+| ddtree_tb64 | 5.60 | 1.72× |
+| ddtree_tb128 | 5.90 | 1.38× |
+
+(DDTree tree again has higher accept than its chain but lower speedup — overhead-bound. cf. JetSpec
+engine mt-bench: accept 3.45 but **2.83×** — the optimized engine wins on chat too.)
+
 **Our SGLang tree** (optimized engine, cuda-graph, conc=1; no-spec AR not run):
 
 | method | accept_len | tree tok/s |
