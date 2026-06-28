@@ -20,24 +20,21 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "build-essential", "curl")
     .run_commands(
-        "echo vj3 > /tmp/bt",
-        "pip install -U uv",
-        # torch + build deps must exist BEFORE building vllm (its setup.py imports torch;
-        # uv build-isolation otherwise lacks it). Then build with --no-build-isolation.
-        "uv pip install --system torch --torch-backend=auto",
-        # setuptools pinned to the fork's range: >=77 for PEP-639 SPDX license string, <81
-        # because >=81 breaks its pyproject (project.license schema change).
-        "uv pip install --system 'setuptools>=77,<81' wheel 'setuptools-scm>=8' ninja cmake packaging",
-        "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
-        # documented fork install: prebuilt vLLM wheel + fork python overlay (no CUDA rebuild)
-        # Non-editable pip install: builds a real wheel so VLLM_USE_PRECOMPILED extracts
-        # vllm._C into the package (editable -e + uv skipped that). VLLM_DOCKER_BUILD_CONTEXT=1
-        # makes the resolver return the curled latest upstream main commit (shallow clone has
-        # no history to walk a merge-base).
-        "cd /root/vllm-jetspec && VLLM_DOCKER_BUILD_CONTEXT=1 VLLM_USE_PRECOMPILED=1 "
-        "pip install --no-build-isolation .",
-        "python -c 'import vllm._C; print(\"VLLM_C_OK\")'",
+        "echo vj4 > /tmp/bt",
+        # Overlay approach (same as our SGLang v2 port): install STOCK vllm to get a working
+        # vllm._C (+ all B200 runtime deps), then copy the fork's python vllm/ over it. The
+        # fork adds NO .cu kernels, so stock's compiled _C.so stays valid; only the fork's
+        # .py (spec_decode/dflash, tree_attn backend) replace stock. Avoids VLLM_USE_PRECOMPILED's
+        # commit-resolution which silently failed to extract _C on a shallow clone.
+        "pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly || pip install -U vllm",
+        "python -c 'import vllm._C; print(\"STOCK_C_OK\", __import__(\"vllm\").__version__)'",
         "pip install datasets",
+        "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
+        # overlay the fork's python over the installed stock vllm package (keep stock .so files)
+        "SITE=$(python -c 'import vllm,os;print(os.path.dirname(vllm.__file__))') && "
+        "echo \"stock vllm at $SITE\" && "
+        "cp -rf /root/vllm-jetspec/vllm/. \"$SITE/\" && "
+        "python -c 'import vllm._C; from vllm import LLM; print(\"OVERLAY_OK\")'",
     )
 )
 
