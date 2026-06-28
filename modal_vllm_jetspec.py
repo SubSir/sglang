@@ -95,3 +95,13 @@ def pull():
         with open(f"vllm_jetspec_results/{fn}", "w") as f:
             f.write(c)
         print(f"\n===== {fn} =====\n" + "\n".join(c.splitlines()[-25:]))
+
+
+@app.function(image=image, timeout=300)
+def check_optimus():
+    import importlib
+    for m in ["optimus_cutedsl", "optimus_cutedsl.flash_attn", "quack_kernels", "cutlass"]:
+        try:
+            importlib.import_module(m); print(f"OK   {m}")
+        except Exception as e:
+            print(f"MISS {m}: {type(e).__name__}: {str(e)[:80]}")

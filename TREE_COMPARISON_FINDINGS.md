@@ -167,7 +167,7 @@ stock `_C` is valid). Qwen3-8B, gsm8k, B200, batch=1, 32 samples.
 | JetSpec tree tw7/budget128 | triton | physical | ❌ (captures=0) | 6.80 | 226 |
 | JetSpec tree tw7/budget128 | triton | logical | ✅ full | 7.85 | 428 |
 | JetSpec tree tw4/budget32 | triton | logical | ✅ full | 6.86 | 287 |
-| JetSpec tree tw7/budget128 | **optimus** | logical | ✅ full | _TBD_ | _TBD_ |
+| JetSpec tree tw7/budget128 | **optimus** | logical | ✅ full | — | engine-init failed: `optimus_cutedsl` not installed |
 
 **Findings (triton kernel):**
 - **Inside vLLM, the linear DFlash is much faster than the JetSpec tree** (955 vs best-tree 428 tok/s),
@@ -180,9 +180,12 @@ stock `_C` is valid). Qwen3-8B, gsm8k, B200, batch=1, 32 samples.
   passes `max_draft_passes=5`, CPU tree build, draft-head forward) dominates over verify-forward size on
   B200, so the smaller tree's lower accept (6.86 vs 7.85) means more steps and lower throughput.
 - The acceptance RATE is very low (5–19%): a 128-node tree accepting ~8 tokens wastes most draft work.
-- **Open question (optimus kernel):** JetSpec's headline tree throughput (954 tok/s, standalone engine)
-  uses the Optimus sparse-tree cutedsl kernel, not triton. Whether Optimus closes the gap in the vLLM
-  integration is the TBD row above.
+- **Optimus kernel could not be tested:** JetSpec's headline tree throughput (954 tok/s, standalone
+  engine) relies on the **Optimus sparse-tree cutedsl kernel**, not triton. It requires the
+  `optimus_cutedsl` package, which is NOT on PyPI / not in stock vLLM (confirmed: `ModuleNotFoundError`),
+  so the optimus path fails at engine init in this overlay. Reproducing JetSpec's tree speed in vLLM
+  would require building/obtaining that proprietary kernel — i.e. the tree's wall-clock win is gated on a
+  JetSpec-specific kernel, not available in the generally-installable vLLM stack.
 
 **Takeaway:** the JetSpec *tree algorithm* (higher accept) does not automatically beat linear DFlash in
 the vLLM integration with the triton kernel — the draft-pass + tree-build overhead per step outweighs the
