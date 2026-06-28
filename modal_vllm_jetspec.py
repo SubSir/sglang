@@ -39,30 +39,27 @@ image = (
 )
 
 
-@app.function(gpu="B200", timeout=10800, image=image,
-              secrets=[modal.Secret.from_name("huggingface-secret")],
-              volumes={"/results": vol})
-def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=16,
-        target="Qwen/Qwen3-8B", draft="JetSpec/jetspec-qwen3-8b",
-        kv_layout="physical", cuda_tree_captures=0, tree_attn_kernel="triton",
-        cudagraph_mode="default"):
+def _run_dflash(mode, tree_width, max_tree_budget, tag, prompt_set, max_samples,
+                target, draft, kv_layout, cuda_tree_captures, tree_attn_kernel,
+                cudagraph_mode, batch_sizes, max_tokens):
     import subprocess
     env = dict(os.environ)
     env["VLLM_USE_V1"] = "1"
+    max_bs = max(int(b) for b in batch_sizes.split())
     args = [
         "python", "/root/vllm-jetspec/examples/offline_inference/dflash_profiling.py",
         "--prompt-set", prompt_set, "--mode", mode, "--head-type", "causal",
         "--model", target, "--draft-model", draft,
-        "--max-tokens", "1024", "--block-size", "16",
+        "--max-tokens", str(max_tokens), "--block-size", "16",
         "--attention-backend", "FLASH_ATTN",
         "--tree-width", str(tree_width), "--max-tree-budget", str(max_tree_budget),
         "--tree-draft", "accum_logp", "--tree-attn-kernel", tree_attn_kernel,
         "--tree-kv-layout", kv_layout,
         "--num-cudagraph-tree-captures", str(cuda_tree_captures),
         "--cudagraph-mode", cudagraph_mode,
-        "--tp-sizes", "1", "--batch-sizes", "1", "--gpu-memory-utilization", "0.85",
+        "--tp-sizes", "1", "--batch-sizes", batch_sizes, "--gpu-memory-utilization", "0.85",
         "--max-num-batched-tokens", "51200", "--max-samples", str(max_samples),
-        "--max-num-seqs", "1", "--num-runs", "2", "--num-warmup-runs", "1",
+        "--max-num-seqs", str(max_bs), "--num-runs", "2", "--num-warmup-runs", "1",
         "--profiler", "none",
     ]
     print(">>>", " ".join(args), flush=True)
@@ -71,8 +68,46 @@ def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=
     with open(f"/results/{tag}.txt", "w") as f:
         f.write(out)
     vol.commit()
-    print(out[-5000:], flush=True)
+    print(out[-6000:], flush=True)
     return out[-1500:]
+
+
+@app.function(gpu="B200", timeout=10800, image=image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": vol})
+def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=16,
+        target="Qwen/Qwen3-8B", draft="JetSpec/jetspec-qwen3-8b",
+        kv_layout="physical", cuda_tree_captures=0, tree_attn_kernel="triton",
+        cudagraph_mode="default", batch_sizes="1", max_tokens=1024):
+    return _run_dflash(mode, tree_width, max_tree_budget, tag, prompt_set, max_samples,
+                       target, draft, kv_layout, cuda_tree_captures, tree_attn_kernel,
+                       cudagraph_mode, batch_sizes, max_tokens)
+
+
+@app.function(gpu="H100", timeout=10800, image=image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": vol})
+def run_h100(mode, tree_width, max_tree_budget, tag, prompt_set="math-500", max_samples=16,
+             target="Qwen/Qwen3-8B", draft="JetSpec/jetspec-qwen3-8b",
+             kv_layout="physical", cuda_tree_captures=0, tree_attn_kernel="triton",
+             cudagraph_mode="full_decode_only", batch_sizes="1", max_tokens=2048):
+    # H100 (SM90) = the paper's Table 11 setting. full cuda graph on by default.
+    return _run_dflash(mode, tree_width, max_tree_budget, tag, prompt_set, max_samples,
+                       target, draft, kv_layout, cuda_tree_captures, tree_attn_kernel,
+                       cudagraph_mode, batch_sizes, max_tokens)
+
+
+@app.local_entrypoint()
+def table11(max_samples: int = 16):
+    """Reproduce the paper's Table 11 setting (H100, Math-500, Qwen3-8B, batch sweep) for
+    the MISSING DFlash-linear column + AR, to compare against their JetSpec-tree numbers.
+    full_decode_only cuda graph on."""
+    bs = "1 2 4 8 16"
+    run_h100.spawn("ar", 1, 16, "t11_ar", "math-500", max_samples,
+                   batch_sizes=bs)
+    run_h100.spawn("dflash", 1, 16, "t11_dflash_linear", "math-500", max_samples,
+                   batch_sizes=bs)
+    print("launched Table-11 H100 sweep: AR + DFlash-linear on math-500, batch", bs)
 
 
 @app.local_entrypoint()
