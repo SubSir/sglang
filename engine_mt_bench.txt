@@ -1,0 +1,18 @@
+
+backend=triton_paged_tree_cudagraph_nogather  head=JetSpec/jetspec-qwen3-8b  algo=accum_logp
+model=Qwen/Qwen3-8B  attn_implementation=sdpa  draft_attn=sdpa  torch_compile=False  fused_moe_blocks=0
+samples=24 world_size=1 budget=127 tree_depth=15 width=7 max_tokens=2048
+AR    :  8361 tok   52.396s  ->     159.6 tok/s   (1x baseline)
+tree  :  8734 tok   19.375s  ->     450.8 tok/s   accept_len=3.45
+
+WALL-CLOCK spec speedup = 2.83x   (spec 451 tok/s vs AR 160 tok/s)
+
+===STDERR(tail)===
+
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:00<00:00, 259.53it/s]
+
+Generating train split:   0%|          | 0/80 [00:00<?, ? examples/s]
+Generating train split: 100%|██████████| 80/80 [00:00<00:00, 19404.60 examples/s]
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/compile_fx.py:322: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
