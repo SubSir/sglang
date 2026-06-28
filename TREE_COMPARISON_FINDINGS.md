@@ -163,7 +163,8 @@ stock `_C` is valid). Qwen3-8B, gsm8k, B200, batch=1, 32 samples.
 
 | config | tree kernel | KV layout | cuda-graph | accept_len | tok/s |
 |---|---|---|---|---|---|
-| **DFlash linear** (tw1) | — | — | ✅ piecewise | 5.60 | **955** |
+| **DFlash linear** (tw1), default mode | — | — | piecewise (default) | 5.60 | 955 |
+| **DFlash linear** (tw1), `full_decode_only` | — | — | ✅ **FULL** target replay (num_tokens=16) | 5.67 | **981** |
 | JetSpec tree tw7/budget128 | triton | physical | ❌ (captures=0) | 6.80 | 226 |
 | JetSpec tree tw7/budget128 | triton | logical | ✅ full | 7.85 | 428 |
 | JetSpec tree tw4/budget32 | triton | logical | ✅ full | 6.86 | 287 |
@@ -174,8 +175,14 @@ stock `_C` is valid). Qwen3-8B, gsm8k, B200, batch=1, 32 samples.
   even though the tree's accept length is higher (7.85 vs 5.60). This is the OPPOSITE of Task 1's HF
   reference (where the tree won 4.69× vs 3.11×) and of JetSpec's own standalone engine (954 tok/s).
 - The tree config matters enormously: **cuda-graph + logical zero-copy KV nearly doubled the tree**
-  (226 → 428 tok/s). With captures=0 (default) the tree verify is NOT graphed while linear IS — an easy
-  way to mis-measure.
+  (226 → 428 tok/s). With captures=0 (default) the tree verify is NOT graphed — an easy way to mis-measure.
+- **cuda-graph mode caveat (corrected):** DFlash linear's *target verify* CAN be a FULL cuda graph (like
+  SGLang) via `--cudagraph-mode full_decode_only` → 955 → 981 tok/s (target verify shows mode=FULL,
+  num_tokens=16). The default mode left it PIECEWISE; the gain from FULL is small here because the linear
+  verify is only 16 tokens. Note a hard design limit in vllm-jetspec: the **draft proposer forward is
+  always PIECEWISE-captured** ("The proposer itself uses PIECEWISE capture", `eagle.py:405`;
+  "Only supports PIECEWISE cudagraphs", `extract_hidden_states.py:217`) — only the target verify can be
+  FULL. This applies to both linear and tree, so it does not change the linear-vs-tree ranking.
 - Counter-intuitively, budget 32 (287) was slower than budget 128 (428): the per-step overhead (draft
   passes `max_draft_passes=5`, CPU tree build, draft-head forward) dominates over verify-forward size on
   B200, so the smaller tree's lower accept (6.86 vs 7.85) means more steps and lower throughput.
