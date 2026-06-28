@@ -18,9 +18,9 @@ vol = modal.Volume.from_name("vllm-jetspec-results", create_if_missing=True)
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("git", "build-essential")
+    .apt_install("git", "build-essential", "curl")
     .run_commands(
-        "echo vj2 > /tmp/bt",
+        "echo vj3 > /tmp/bt",
         "pip install -U uv",
         # torch + build deps must exist BEFORE building vllm (its setup.py imports torch;
         # uv build-isolation otherwise lacks it). Then build with --no-build-isolation.
@@ -30,8 +30,11 @@ image = (
         "uv pip install --system 'setuptools>=77,<81' wheel 'setuptools-scm>=8' ninja cmake packaging",
         "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
         # documented fork install: prebuilt vLLM wheel + fork python overlay (no CUDA rebuild)
-        "cd /root/vllm-jetspec && VLLM_USE_PRECOMPILED=1 uv pip install --system -e . "
-        "--no-build-isolation --torch-backend=auto",
+        # VLLM_DOCKER_BUILD_CONTEXT=1 makes the precompiled-wheel resolver return the
+        # curled latest upstream vllm main commit directly (the shallow clone has no git
+        # history to walk a merge-base), so it actually fetches vllm._C from wheels.vllm.ai.
+        "cd /root/vllm-jetspec && VLLM_DOCKER_BUILD_CONTEXT=1 VLLM_USE_PRECOMPILED=1 "
+        "uv pip install --system -e . --no-build-isolation --torch-backend=auto",
         "pip install datasets",
     )
 )
