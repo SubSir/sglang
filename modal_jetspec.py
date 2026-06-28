@@ -25,10 +25,12 @@ image = (
         # avoids the slow/fragile sm_100 flash-attn source build).
         "cd /root/JetSpec && pip install -e '.[bench,kernel]' --no-build-isolation || "
         "pip install -e '.[bench,kernel]'",
-        # JetSpec's deps pull a newer `kernels` than the image's huggingface_hub
-        # supports (strict-dataclass `str | None` crash). Upgrade hf_hub so its strict
-        # dataclass validator accepts union types. (This image only runs JetSpec.)
-        "pip install 'huggingface_hub>=0.34,<1.0'",
+        # The image's `kernels` 0.14 uses `str | None` in a strict dataclass that the
+        # image's huggingface_hub (0.36, <1.0 as JetSpec requires) can't validate, crashing
+        # `import transformers.models.qwen3`. `kernels` is an optional fused-kernel helper;
+        # removing it makes transformers degrade gracefully (verified: QWEN3_OK). Keep
+        # hf_hub <1.0 (JetSpec asserts it).
+        "pip install 'huggingface_hub>=0.34,<1.0' && pip uninstall -y kernels",
     )
 )
 
@@ -98,3 +100,21 @@ def pull():
         with open(f"jetspec_results/{fn}", "w") as f:
             f.write(c)
         print(f"\n===== {fn} =====\n" + "\n".join(c.splitlines()[-30:]))
+
+
+@app.function(image=image, timeout=600)
+def diag():
+    """No-GPU: find the kernels/hf_hub combo that imports qwen3 cleanly."""
+    import subprocess as sp
+    def sh(c): return sp.run(c, shell=True, capture_output=True, text=True).stdout.strip()
+    def imp():
+        r = sp.run(["python","-c","import transformers; print(transformers.__version__);"
+                    "import transformers.models.qwen3.modeling_qwen3; print('QWEN3_OK')"],
+                   capture_output=True, text=True)
+        return (r.stdout + r.stderr).splitlines()[-4:]
+    print("hf_hub:", sh("pip show huggingface_hub | grep -i version"))
+    print("kernels:", sh("pip show kernels | grep -i version"))
+    print("transformers:", sh("pip show transformers | grep -i version"))
+    print("--- import as-is ---"); print(imp())
+    sh("pip uninstall -y kernels")
+    print("--- after uninstall kernels ---"); print(imp())
