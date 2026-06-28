@@ -44,7 +44,7 @@ image = (
               volumes={"/results": vol})
 def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=16,
         target="Qwen/Qwen3-8B", draft="JetSpec/jetspec-qwen3-8b",
-        kv_layout="physical", cuda_tree_captures=0):
+        kv_layout="physical", cuda_tree_captures=0, tree_attn_kernel="triton"):
     import subprocess
     env = dict(os.environ)
     env["VLLM_USE_V1"] = "1"
@@ -55,7 +55,7 @@ def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=
         "--max-tokens", "1024", "--block-size", "16",
         "--attention-backend", "FLASH_ATTN",
         "--tree-width", str(tree_width), "--max-tree-budget", str(max_tree_budget),
-        "--tree-draft", "accum_logp", "--tree-attn-kernel", "triton",
+        "--tree-draft", "accum_logp", "--tree-attn-kernel", tree_attn_kernel,
         "--tree-kv-layout", kv_layout,
         "--num-cudagraph-tree-captures", str(cuda_tree_captures),
         "--tp-sizes", "1", "--batch-sizes", "1", "--gpu-memory-utilization", "0.85",
