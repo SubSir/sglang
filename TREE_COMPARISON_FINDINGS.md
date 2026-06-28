@@ -13,14 +13,27 @@ DDTree `liranringel/ddtree` (arXiv 2604.12989); our DFlash tree on SGLang spec-v
 
 | method | draft head | tree construction | engine / kernels |
 |---|---|---|---|
-| **DFlash chain** | z-lab DFlash-b16 (block-diffusion, 1 pass) | none (linear block) | varies |
+| **DFlash chain (JetSpec ref)** | `JetSpec/jetspec-qwen3-8b` (SAME head as JetSpec tree) | none (linear block) | JetSpec HF reference, sdpa |
+| **DFlash chain (DDTree ref / ours)** | z-lab DFlash-b16 | none (linear block) | DDTree PyTorch ref / SGLang spec-v2 |
 | **our SGLang tree** | z-lab DFlash-b16 | EAGLE top-k (fixed topk=4) | SGLang spec-v2, flashinfer/triton, cuda-graph |
 | **DDTree** | z-lab DFlash-b16 (SAME as ours) | adaptive best-first heap over draft logits (budget-bounded) | PyTorch reference, torch-sdpa, no cuda-graph |
-| **JetSpec** | **trained** causal-parallel head (`JetSpec/jetspec-qwen3-8b`) | budget over high-prob branches | optimized engine (triton paged-tree + fused gemm + cuda-graph) OR HF reference |
+| **JetSpec** | `JetSpec/jetspec-qwen3-8b` (causal-parallel) | budget over high-prob branches | optimized engine (triton paged-tree + fused gemm + cuda-graph) OR HF reference |
 
-The crucial axis: DDTree and our SGLang tree both reuse the **untrained** z-lab DFlash head and
-only change the tree shape; JetSpec uses a **purpose-trained** head. DDTree's novelty is the
-adaptive best-first tree (vs our fixed EAGLE top-k).
+**The DFlash baseline is not one thing — note WHICH head:**
+- **Task 1's "DFlash"** is JetSpec's own HF reference (`bench/reference/dflash_baseline.py`) running the
+  **`JetSpec/jetspec-qwen3-8b` head in linear-block mode** — the *same head* JetSpec's tree uses. So
+  Task 1 (DFlash 3.11×/acc6.00 vs JetSpec tree 4.69×/acc8.35) is a clean **same-head, linear-vs-tree**
+  ablation: the gain is purely the tree, not head quality.
+- **DDTree's "dflash" and our SGLang chain** use the **z-lab/Qwen3-8B-DFlash-b16** head instead.
+- The head architecture in all cases is the original DFlash design (`DFlashDraftModel`, vendored from
+  `causal_parallel_drafting/model/dflash.py`): a Qwen3 variant sharing the target's embed/lm_head,
+  conditioning on tapped target hidden states via an `fc` fusion, emitting `block_size` per-depth logits
+  in one parallel pass. Algorithm (all identical): propose linear block → verify → accept longest
+  greedy-prefix + 1 correction → crop KV → repeat (greedy/lossless).
+
+The crucial axis: DDTree and our SGLang tree both reuse the z-lab DFlash head and only change the tree
+shape; JetSpec uses its own causal-parallel head. DDTree's novelty is the adaptive best-first tree (vs
+our fixed EAGLE top-k).
 
 ---
 
