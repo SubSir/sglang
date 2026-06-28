@@ -28,7 +28,7 @@ image = (
         # JetSpec's deps pull a newer `kernels` than the image's huggingface_hub
         # supports (strict-dataclass `str | None` crash). Upgrade hf_hub so its strict
         # dataclass validator accepts union types. (This image only runs JetSpec.)
-        "pip install -U huggingface_hub",
+        "pip install 'huggingface_hub>=0.34,<1.0'",
     )
 )
 
