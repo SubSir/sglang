@@ -20,11 +20,16 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "build-essential")
     .run_commands(
-        "echo vj1 > /tmp/bt",
+        "echo vj2 > /tmp/bt",
         "pip install -U uv",
+        # torch + build deps must exist BEFORE building vllm (its setup.py imports torch;
+        # uv build-isolation otherwise lacks it). Then build with --no-build-isolation.
+        "uv pip install --system torch --torch-backend=auto",
+        "uv pip install --system setuptools wheel setuptools-scm ninja cmake packaging",
         "git clone --depth 1 https://github.com/JetSpec-project/vllm-jetspec /root/vllm-jetspec",
         # documented fork install: prebuilt vLLM wheel + fork python overlay (no CUDA rebuild)
-        "cd /root/vllm-jetspec && VLLM_USE_PRECOMPILED=1 uv pip install --system -e . --torch-backend=auto",
+        "cd /root/vllm-jetspec && VLLM_USE_PRECOMPILED=1 uv pip install --system -e . "
+        "--no-build-isolation --torch-backend=auto",
         "pip install datasets",
     )
 )
@@ -64,11 +69,10 @@ def run(mode, tree_width, max_tree_budget, tag, prompt_set="gsm8k", max_samples=
 
 @app.local_entrypoint()
 def bench(prompt_set: str = "gsm8k", max_samples: int = 16):
-    # AR baseline, vLLM-DFlash (linear, tw1), vLLM-JetSpec (tree, tw7/budget128)
-    run.spawn("ar", 1, 16, f"ar_{prompt_set}", prompt_set, max_samples)
+    # Only linear-vs-tree (no AR): vLLM-DFlash (linear, tw1) vs vLLM-JetSpec (tree, tw7/budget128)
     run.spawn("dflash", 1, 16, f"dflash_linear_{prompt_set}", prompt_set, max_samples)
     run.spawn("dflash", 7, 128, f"jetspec_tree_{prompt_set}", prompt_set, max_samples)
-    print("launched: ar + dflash(tw1) + jetspec(tw7) on", prompt_set)
+    print("launched: dflash(tw1 linear) + jetspec(tw7 tree) on", prompt_set)
 
 
 @app.function(image=image, volumes={"/results": vol})
