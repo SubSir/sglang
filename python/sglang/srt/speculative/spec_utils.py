@@ -532,12 +532,11 @@ def move_accept_tokens_to_target_kvcache(
         "spec v2 move_accept_tokens accept_index",
     )
 
-    tgt_cache_loc = torch.zeros(
-        size,
-        dtype=torch.int64,
-        device=device,
-    )
-    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    # One zeroed allocation, two views: saves a kernel launch on the post-verify
+    # critical path (move runs between verify(N) and draft(N+1), unhideable at conc=1).
+    _loc_buf = torch.zeros(2 * size, dtype=torch.int64, device=device)
+    tgt_cache_loc = _loc_buf[:size]
+    accept_out_cache_loc = _loc_buf[size:]
     assign_extend_cache_locs[(bs,)](
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
