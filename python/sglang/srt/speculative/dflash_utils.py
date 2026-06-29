@@ -1038,7 +1038,12 @@ import math
 
 # Depth bonus: a small constant added to child logprobs to bias toward deeper
 # trees (favours spine growth over wide shallow fan-out). ponytail: tunable knob.
-_DDTREE_DEPTH_BONUS: float = 0.2
+# Overridable via env for ablation (SGLANG_DDTREE_DEPTH_BONUS).
+import os as _os
+
+_DDTREE_DEPTH_BONUS: float = float(_os.environ.get("SGLANG_DDTREE_DEPTH_BONUS", "0.2"))
+# Force a fixed builder width (0 = use DDTree adaptive min(budget//L+1,2..6)).
+_DDTREE_FORCE_WIDTH: int = int(_os.environ.get("SGLANG_DDTREE_FORCE_WIDTH", "0"))
 
 
 def _build_single_ddtree(
@@ -1152,7 +1157,10 @@ def build_tree_verify_tokens_ddtree(
 
     L = num_steps
     sampled_width = topk_ids.shape[2]
-    adaptive_w = min(max(budget // max(L, 1) + 1, 2), sampled_width)
+    if _DDTREE_FORCE_WIDTH > 0:
+        adaptive_w = min(_DDTREE_FORCE_WIDTH, sampled_width)
+    else:
+        adaptive_w = min(max(budget // max(L, 1) + 1, 2), sampled_width)
 
     # log-prob domain for additive scoring (probs are post-softmax topk slices).
     log_probs = torch.log(topk_probs.clamp_min(1e-20))
