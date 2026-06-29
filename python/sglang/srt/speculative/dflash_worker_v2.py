@@ -27,6 +27,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     build_tree_verify_tokens,
+    build_tree_verify_tokens_ddtree,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -45,6 +46,7 @@ from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_loc
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
+    dflash_tree_accept_compact,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -264,6 +266,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._reuse_tree_mask_buf: Optional[torch.Tensor] = None
         self._reuse_tree_position_buf: Optional[torch.Tensor] = None
+        # Tree construction algorithm: "fused" (default, GPU topk4) or "ddtree"
+        # (CPU best-first heap, adaptive width + depth bonus). Both emit the same
+        # EAGLE (parent_list, selected_index) contract -> KV/accept/mask reused.
+        self._tree_algo: str = os.environ.get(
+            "SGLANG_DFLASH_TREE_ALGO", "fused"
+        ).lower()
         # Tree verify node budget = --speculative-num-draft-tokens (may exceed the
         # draft block_size); falls back to block_size when unset.
         self._tree_num_draft_tokens: int = int(
@@ -1714,28 +1722,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             tree_topk = int(self._tree_verify_topk)
             tree_num_draft_tokens = int(self._tree_num_draft_tokens)
             num_steps = int(draft_hidden.shape[1]) - 1
+            use_ddtree = self._tree_algo == "ddtree"
+            # DDTree picks an adaptive width up to 6; sample at least that wide so
+            # the CPU builder has the candidates it needs. The kernel `topk` then
+            # equals this sampled width (= max branching factor).
+            sample_width = max(tree_topk, 6) if use_ddtree else tree_topk
             topk_result = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(
                     -1, draft_hidden.shape[-1]
                 ),
                 lm_head=lm_head,
-                return_topk=tree_topk,
+                return_topk=sample_width,
             )
             _, draft_topk_ids, draft_topk_probs = cast(
                 Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
             )
-            draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
-            draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
+            draft_topk_ids = draft_topk_ids.view(bs, num_steps, sample_width)
+            draft_topk_probs = draft_topk_probs.view(bs, num_steps, sample_width)
 
+            builder = (
+                build_tree_verify_tokens_ddtree
+                if use_ddtree
+                else build_tree_verify_tokens
+            )
             (
                 tree_draft_tokens,
                 tree_parent_list,
                 tree_selected_index,
-            ) = build_tree_verify_tokens(
+            ) = builder(
                 verified_id=block_ids[:, 0],  # [bs]
                 topk_probs=draft_topk_probs,
                 topk_ids=draft_topk_ids,
-                topk=tree_topk,
+                topk=sample_width,
                 num_draft_tokens=tree_num_draft_tokens,
             )
             # positions=None / custom_mask=None signals prepare_for_verify to run
@@ -1749,7 +1767,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 positions=None,
                 draft_token_num=tree_num_draft_tokens,
                 custom_mask=None,
-                topk=tree_topk,
+                # Kernel parent_tb_idx math uses this topk; must equal the width
+                # used to encode parent_list/selected_index (sample_width).
+                topk=sample_width,
                 tree_parent_list=tree_parent_list,
                 tree_selected_index=tree_selected_index,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -1899,28 +1919,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict=target_predict,
                 topk=int(self._tree_verify_topk),
             )
-            # accept_index is absolute (row offset baked in); make it block-local.
-            accept_len = accept_token_num  # [bs] number of accepted drafts (excl bonus)
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            batch_offsets = (
-                torch.arange(bs, device=device, dtype=accept_index.dtype) * block_size
-            ).unsqueeze(1)
-            accept_index_local = accept_index - batch_offsets  # -1 stays out of range
-
-            # out_tokens[i, j] = predicts at the j-th accepted node (target prediction
-            # following accepted draft j). Gather predicts along accepted positions.
-            col = torch.arange(block_size, device=device)[None, :]
-            valid = col < commit_lens[:, None]
-            safe_abs = torch.where(valid, accept_index, batch_offsets)  # in-range fill
-            out_tokens = (
-                predicts[safe_abs.reshape(-1).to(torch.long)]
-                .view(bs, block_size)
-                .to(torch.int64)
+            # accept_index is absolute (row offset baked in).
+            accept_len = accept_token_num  # [bs] int32, accepted drafts (excl bonus)
+            commit_lens = accept_len + 1  # [bs] int32 (accept_token_num is int32)
+            # One fused kernel for the accept compaction (was ~14 elementwise ops =
+            # ~30 dependent launches/step on the conc=1 critical path). Produces the
+            # block-local safe indices (for the hidden gather), out_tokens, bonus,
+            # committed positions, and new_seq_lens. Mirrors the chain accept kernel.
+            (
+                accept_local_safe,
+                out_tokens,
+                bonus,
+                committed_positions,
+                new_seq_lens,
+            ) = dflash_tree_accept_compact(
+                accept_index=accept_index,
+                predicts=predicts,
+                commit_lens=commit_lens,
+                prefix_lens=prefix_lens,
             )
-            out_tokens = torch.where(valid, out_tokens, torch.zeros_like(out_tokens))
-            # bonus token = last accepted node's target prediction (per request).
-            last_col = accept_len.to(torch.int64)  # commit_lens - 1
-            bonus = out_tokens.gather(1, last_col[:, None]).squeeze(1).to(torch.int64)
+            committed_positions = committed_positions.reshape(-1)
 
             # Compact the accepted tree path to the contiguous front of each
             # per-req verify block. EAGLE v2 (_finalize_accept_tree_path) does the
@@ -1936,11 +1954,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # verify then overwrites that physical slot -> committed KV corruption.
             # Physically moving accepted KV to the front [prefix, prefix+commit)
             # (outside the next window) is what makes tree verify lossless.
-            accept_local_safe = torch.where(
-                valid,
-                accept_index_local.to(torch.long),
-                torch.zeros_like(accept_index_local, dtype=torch.long),
-            )
+            # accept_local_safe (block-local accepted idx, 0 for invalid rows) comes
+            # from the fused compaction kernel above.
             # model_worker_batch.out_cache_loc is still the full verify window here
             # (set before the verify forward); move accepted target KV to the front.
             # The move reads batch.req_to_token_pool; the rest of this branch
@@ -1964,8 +1979,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if need_mamba_verify_commit:
                 assert seq_lens_pre_verify is not None
                 # Tree: the deepest accepted node's BLOCK position (not the linear
-                # commit_lens-1) holds the correct cached recurrent state.
-                tree_last_step = accept_index_local.gather(
+                # commit_lens-1) holds the correct cached recurrent state. col=accept_len
+                # is always valid, so accept_local_safe equals the raw local index there.
+                tree_last_step = accept_local_safe.gather(
                     1, accept_len.to(torch.int64)[:, None]
                 ).squeeze(1)
                 self._update_target_mamba_state_after_verify(
@@ -1975,7 +1991,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     last_correct_step_indices=tree_last_step,
                 )
 
-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            # new_seq_lens comes from the fused compaction kernel above.
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
@@ -1995,9 +2011,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 1,
                 accept_local_safe[:, :, None].expand(-1, -1, hidden.shape[-1]),
             )  # [bs, block_size, H]; rows >= commit_lens are masked by commit_lens
-            committed_positions = (
-                prefix_lens.to(torch.int64)[:, None] + col
-            ).reshape(-1)
+            # committed_positions comes from the fused compaction kernel above.
             # Write the accepted hidden into the FRONT verify-window slots (the same
             # contiguous front slots the target KV was just moved to), so the draft KV
             # and target KV agree and both sit outside the next verify window.
