@@ -58,7 +58,8 @@ base_image = (
 def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
         num_draft_tokens, samples_base, concurrencies, backend="flashinfer",
         mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None,
-        disable_cuda_graph=False):
+        disable_cuda_graph=False, tree_algo="fused",
+        depth_bonus=None, force_width=None):
     """One server launch; bench internally sweeps all concurrencies x datasets.
     When skip_baseline is False, the bench runs the target-only baseline on the
     SAME GPU (serially) before DFLASH, yielding the speedup denominator."""
@@ -94,6 +95,12 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
 
     env = os.environ
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
+    env["SGLANG_DFLASH_TREE_ALGO"] = tree_algo  # "fused" | "ddtree"
+    # ddtree ablation knobs (default None = builder defaults)
+    if depth_bonus is not None:
+        env["SGLANG_DDTREE_DEPTH_BONUS"] = str(depth_bonus)
+    if force_width is not None:
+        env["SGLANG_DDTREE_FORCE_WIDTH"] = str(force_width)
     env["DFLASH_DRAFT_ATTN_BACKEND"] = backend  # avoid broken fa4
     # VL models (Qwen3.6-VL) need a non-cute vision-attention backend.
     if any(k in target_model.lower() for k in ("qwen3.6", "qwen3.5", "-vl")):
@@ -120,7 +127,7 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
 @app.function(gpu="B200", timeout=1200, image=base_image,
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def debug(target_model="Qwen/Qwen3-8B", draft_model="z-lab/Qwen3-8B-DFlash-b16",
-          block_size=16, num_draft_tokens=32, topk=4, tree=True):
+          block_size=16, num_draft_tokens=32, topk=4, tree=True, tree_algo="fused"):
     """Launch the DFLASH tree server directly, capture stdout+stderr, print the tail."""
     import subprocess, os, time
     cmd = [
@@ -140,6 +147,7 @@ def debug(target_model="Qwen/Qwen3-8B", draft_model="z-lab/Qwen3-8B-DFlash-b16",
     ]
     env = dict(os.environ)
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree else "0"
+    env["SGLANG_DFLASH_TREE_ALGO"] = tree_algo
     env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"
     env["CUDA_LAUNCH_BLOCKING"] = "1"  # precise CUDA error location
     print("CMD:", " ".join(cmd), "TREE=", env["SGLANG_DFLASH_TREE_VERIFY"], flush=True)
@@ -197,8 +205,476 @@ def _tables(res):
 
 
 @app.local_entrypoint()
-def dbg(tree: bool = True):
-    print(debug.remote(tree=tree))
+def dbg(tree: bool = True, tree_algo: str = "fused"):
+    print(debug.remote(tree=tree, tree_algo=tree_algo))
+
+
+@app.local_entrypoint()
+def throughput(target_model: str = "Qwen/Qwen3-8B",
+               draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+               data_names: str = "gsm8k,mt-bench",
+               block_size: int = 16, budget: int = 32, topk: int = 4,
+               concurrencies: str = "1,8,32", with_chain: bool = True,
+               backend: str = "flashinfer"):
+    """v2-port (fast upstream nightly + working tree) throughput+accept: chain vs tree,
+    cuda graph ON. topk should scale with budget (topk4 too narrow at big budget -> acc drops)."""
+    configs = [(f"tree_b{budget}_k{topk}", True, topk, budget)]
+    if with_chain:
+        configs = [("chain", False, 1, None)] + configs
+    os.makedirs("v2_tree_results", exist_ok=True)
+    for label, tv, topk, ndt in configs:
+        print(f">>> {label} conc={concurrencies} backend={backend}")
+        try:
+            res = run.remote(target_model, draft_model, data_names, tv, topk,
+                             block_size, ndt, 32, concurrencies, backend,
+                             0.85, 1, 1, True, f"tp_{label}", False)  # cuda graph ON
+            with open(f"v2_tree_results/tp_{label}_{data_names.replace(',','-')}.md", "w") as f:
+                f.write(res)
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {label}: {e}")
+
+
+@app.local_entrypoint()
+def ddtree_bench(target_model: str = "Qwen/Qwen3-8B",
+                 draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+                 data_names: str = "gsm8k",
+                 block_size: int = 16, budgets: str = "16,32,64", topk: int = 4,
+                 concurrencies: str = "1", backend: str = "triton"):
+    """Paired chain vs tree-fused vs tree-ddtree across budgets. triton verify
+    (our throughput win). Prints accept + tok/s per config."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    budget_list = [int(b) for b in str(budgets).split(",")]
+    # chain once (budget-independent); then fused+ddtree per budget.
+    configs = [("chain", False, 1, None, "fused")]
+    for b in budget_list:
+        configs.append((f"tree_fused_b{b}", True, topk, b, "fused"))
+        configs.append((f"tree_ddtree_b{b}", True, topk, b, "ddtree"))
+    for label, tv, tk, ndt, algo in configs:
+        print(f">>> {label} algo={algo} conc={concurrencies} backend={backend}")
+        try:
+            res = run.remote(target_model, draft_model, data_names, tv, tk,
+                             block_size, ndt, 32, concurrencies, backend,
+                             0.85, 1, 1, True, f"ddt_{label}", False, algo)
+            with open(f"v2_tree_results/ddt_{label}_{data_names.replace(',','-')}.md", "w") as f:
+                f.write(res)
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {label}: {e}")
+
+
+@app.local_entrypoint()
+def ddtree_ablate(target_model: str = "Qwen/Qwen3-8B",
+                  draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+                  block_size: int = 16, budget: int = 32, topk: int = 4,
+                  backend: str = "triton"):
+    """Isolate the ddtree accept gap: default vs bonus=0 vs bonus=0+width=4."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    runs = [
+        ("ablate_default", None, None),
+        ("ablate_bonus0", 0.0, None),
+        ("ablate_bonus0_w4", 0.0, topk),
+    ]
+    for label, db, fw in runs:
+        print(f">>> {label} bonus={db} width={fw}")
+        try:
+            res = run.remote(target_model, draft_model, "gsm8k", True, topk,
+                             block_size, budget, 32, "1", backend,
+                             0.85, 1, 1, True, label, False, "ddtree", db, fw)
+            with open(f"v2_tree_results/{label}_gsm8k.md", "w") as f:
+                f.write(res)
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {label}: {e}")
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def profile_decode(tree_verify: bool, topk: int, budget: int, tag: str,
+                   target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
+                   block_size: int = 16, n_prof_reqs: int = 6, disable_cuda_graph: bool = False,
+                   overlap: bool = False):
+    """Launch v2-port server (DFLASH chain or tree), drive sglang's torch profiler
+    over a few gsm8k decodes, then analyze the trace: GPU-busy vs wall (util),
+    top GPU kernels, top CPU ops. This catches launch/CPU-bound overhead that
+    cuda-event timing would mis-attribute to slow kernels."""
+    import subprocess, time, signal, json, glob, gzip, os, urllib.request
+    from collections import defaultdict
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    profdir = f"/results/prof_{tag}"
+    os.makedirs(profdir, exist_ok=True)
+    env = dict(os.environ); env["SGLANG_TORCH_PROFILER_DIR"] = profdir
+    # tree-verify is gated by env (bypasses the block_size==num_draft_tokens check)
+    env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
+    env["SGLANG_DFLASH_BLOCK_VERIFY"] = "0" if tree_verify else "1"
+    env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"
+    spec = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
+            "--speculative-dflash-block-size", str(block_size),
+            "--speculative-eagle-topk", str(topk if tree_verify else 1)]
+    if tree_verify:
+        spec += ["--speculative-num-draft-tokens", str(budget)]
+        if not overlap:
+            spec += ["--disable-overlap-schedule"]
+    server = ["python", "-m", "sglang.launch_server", "--model-path", target,
+              "--trust-remote-code", "--mem-fraction-static", "0.85",
+              "--max-running-requests", "1", "--attention-backend", "flashinfer",
+              *spec, "--port", "30000"]
+    if disable_cuda_graph:
+        server.append("--disable-cuda-graph")
+    print(">>>", " ".join(server), flush=True)
+    srv = subprocess.Popen(server, env=env)
+    ok = False
+    for _ in range(240):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:30000/health", timeout=2); ok = True; break
+        except Exception:
+            time.sleep(2)
+    if not ok:
+        srv.send_signal(signal.SIGINT); return f"{tag}: server failed to start"
+
+    tok = AutoTokenizer.from_pretrained(target)
+    ds = None
+    for _ in range(5):
+        try:
+            ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n_prof_reqs + 2)); break
+        except Exception as e:
+            print("gsm8k load retry:", e); time.sleep(10)
+    if ds is None:
+        srv.send_signal(signal.SIGINT); return f"{tag}: dataset load failed"
+    fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    def prompts(k0, k1):
+        return [tok.apply_chat_template([{"role": "user", "content": fmt.format(q=ds[i]["question"])}],
+                tokenize=False, add_generation_prompt=True, enable_thinking=False) for i in range(k0, k1)]
+    def send(p, mx=256):
+        req = urllib.request.Request("http://127.0.0.1:30000/generate",
+            data=json.dumps({"text": p, "sampling_params": {"temperature": 0.0, "max_new_tokens": mx}}).encode(),
+            headers={"Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(req, timeout=600).read())
+
+    for p in prompts(0, 2): send(p, 64)                          # warmup
+    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:30000/start_profile",
+        data=b"{}", headers={"Content-Type": "application/json"}), timeout=30)
+    accs = []
+    for p in prompts(2, 2 + n_prof_reqs):
+        r = send(p, 256); accs.append(r["meta_info"].get("spec_verify_ct"))
+    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:30000/stop_profile",
+        data=b"{}", headers={"Content-Type": "application/json"}), timeout=120)
+    time.sleep(8)
+    srv.send_signal(signal.SIGINT); time.sleep(3)
+
+    # ---- analyze the chrome trace ----
+    files = sorted(glob.glob(f"{profdir}/*.trace.json*") + glob.glob(f"{profdir}/*.json*"))
+    summary = {"tag": tag, "tree": tree_verify, "topk": topk, "budget": budget, "trace_files": files}
+    if not files:
+        summary["error"] = "no trace file";
+        json.dump(summary, open(f"/results/profsum_{tag}.json", "w"), indent=2); results_vol.commit()
+        return json.dumps(summary)
+    f = files[-1]
+    raw = gzip.open(f).read() if f.endswith(".gz") else open(f, "rb").read()
+    ev = json.loads(raw)["traceEvents"]
+    gpu_pids = set()
+    for e in ev:
+        if e.get("ph") == "M" and e.get("name") == "process_labels" and "GPU" in str(e.get("args", {}).get("labels", "")):
+            gpu_pids.add(e.get("pid"))
+    ksum = defaultdict(float); csum = defaultdict(float); gpu_busy = 0.0; cpu_busy = 0.0
+    tmin = float("inf"); tmax = 0.0
+    for e in ev:
+        if e.get("ph") != "X" or "dur" not in e: continue
+        dur = e["dur"]; cat = e.get("cat", "")
+        ts = e.get("ts", 0); tmin = min(tmin, ts); tmax = max(tmax, ts + dur)
+        if cat in ("kernel", "gpu_memcpy", "gpu_memset") or e.get("pid") in gpu_pids:
+            ksum[e["name"]] += dur; gpu_busy += dur
+        elif cat in ("cpu_op", "user_annotation", "cuda_runtime", "python_function"):
+            csum[e["name"]] += dur
+            if cat == "cpu_op": cpu_busy += dur
+    wall = (tmax - tmin) if tmax > tmin else 1.0
+    summary["wall_us"] = round(wall, 1)
+    summary["gpu_busy_us"] = round(gpu_busy, 1)
+    summary["gpu_util_pct"] = round(100 * gpu_busy / wall, 1)
+    summary["accept_verify_ct"] = accs
+    summary["top_gpu_kernels"] = sorted(({"name": k[:70], "us": round(v, 1)} for k, v in ksum.items()),
+                                        key=lambda x: -x["us"])[:18]
+    summary["top_cpu_ops"] = sorted(({"name": k[:70], "us": round(v, 1)} for k, v in csum.items()),
+                                    key=lambda x: -x["us"])[:18]
+    json.dump(summary, open(f"/results/profsum_{tag}.json", "w"), indent=2); results_vol.commit()
+    print(json.dumps({k: summary[k] for k in ("tag", "wall_us", "gpu_busy_us", "gpu_util_pct")}), flush=True)
+    return json.dumps(summary)[:2500]
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def quickbench(tree_verify: bool, topk: int, budget: int, tag: str, overlap: bool = False,
+               target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
+               block_size: int = 16, n: int = 24):
+    """Lean conc=1 gsm8k throughput+accept for the v2-port tree, with an OVERLAP toggle
+    (test if tree can run with overlap scheduling on = hide exposed CPU)."""
+    import subprocess, time, signal, json, urllib.request
+    env = dict(os.environ)
+    env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
+    env["SGLANG_DFLASH_BLOCK_VERIFY"] = "0" if tree_verify else "1"
+    env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"
+    spec = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
+            "--speculative-dflash-block-size", str(block_size),
+            "--speculative-eagle-topk", str(topk if tree_verify else 1)]
+    if tree_verify:
+        spec += ["--speculative-num-draft-tokens", str(budget)]
+        if not overlap:
+            spec += ["--disable-overlap-schedule"]
+    server = ["python", "-m", "sglang.launch_server", "--model-path", target, "--trust-remote-code",
+              "--mem-fraction-static", "0.85", "--max-running-requests", "1",
+              "--attention-backend", "flashinfer", *spec, "--port", "30000"]
+    print(">>>", " ".join(server), flush=True)
+    srv = subprocess.Popen(server, env=env)
+    ok = False
+    for _ in range(240):
+        try: urllib.request.urlopen("http://127.0.0.1:30000/health", timeout=2); ok = True; break
+        except Exception: time.sleep(2)
+    out = {"tag": tag, "ready": ok, "overlap": overlap}
+    if ok:
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(target)
+        ds = None
+        for _ in range(5):
+            try: ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n)); break
+            except Exception: time.sleep(10)
+        fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        ps = [tok.apply_chat_template([{"role": "user", "content": fmt.format(q=ds[i]["question"])}],
+              tokenize=False, add_generation_prompt=True, enable_thinking=False) for i in range(n)]
+        def send(p):
+            req = urllib.request.Request("http://127.0.0.1:30000/generate",
+                data=json.dumps({"text": p, "sampling_params": {"temperature": 0.0, "max_new_tokens": 512}}).encode(),
+                headers={"Content-Type": "application/json"})
+            return json.loads(urllib.request.urlopen(req, timeout=600).read())
+        send(ps[0]); send(ps[1])  # warmup
+        t0 = time.perf_counter(); toks = 0; accs = []
+        for p in ps:
+            r = send(p); m = r["meta_info"]
+            toks += m["completion_tokens"]
+            if m.get("spec_verify_ct"): accs.append(m["completion_tokens"] / m["spec_verify_ct"])
+        dt = time.perf_counter() - t0
+        out["tok_s"] = round(toks / dt, 1); out["accept_len"] = round(sum(accs)/len(accs), 2) if accs else None
+        out["tokens"] = toks; out["secs"] = round(dt, 2)
+    srv.send_signal(signal.SIGINT); time.sleep(2)
+    json.dump(out, open(f"/results/qb_{tag}.json", "w")); results_vol.commit()
+    print(json.dumps(out), flush=True)
+    return json.dumps(out)
+
+
+@app.local_entrypoint()
+def qb():
+    """Test: chain, tree(overlap off, current), tree(overlap ON, experiment)."""
+    hs = [
+        ("chain", quickbench.spawn(False, 1, 16, "chain", False)),
+        ("tree_b32_noov", quickbench.spawn(True, 4, 32, "tree_b32_noov", False)),
+        ("tree_b32_overlap", quickbench.spawn(True, 4, 32, "tree_b32_overlap", True)),
+    ]
+    for name, h in hs:
+        try: print(name, "->", h.get())
+        except Exception as e: print(name, "FAILED", e)
+
+
+@app.local_entrypoint()
+def qbfull(n: int = 48):
+    """Robust conc=1 single-request throughput: chain (overlap on) vs tree (overlap on)
+    at budgets 16/32/64. Establishes tree > chain+10%."""
+    hs = [("chain", quickbench.spawn(False, 1, 16, "qbf_chain", True, n=n))]
+    for b in (16, 32, 64):
+        hs.append((f"tree_b{b}", quickbench.spawn(True, 4, b, f"qbf_tree_b{b}", True, n=n)))
+    rows = {}
+    for name, h in hs:
+        try:
+            r = h.get(); rows[name] = r; print(name, "->", r)
+        except Exception as e:
+            print(name, "FAILED", e)
+    import json
+    ch = json.loads(rows.get("chain", "{}")).get("tok_s")
+    if ch:
+        for name, r in rows.items():
+            d = json.loads(r)
+            if d.get("tok_s"): print(f"{name}: {d['tok_s']} tok/s (acc {d.get('accept_len')})  vs chain = {100*(d['tok_s']/ch-1):+.1f}%")
+
+
+@app.local_entrypoint()
+def prof(budget: int = 32, topk: int = 4):
+    """Profile chain vs tree to localize the per-forward overhead (sglang torch profiler)."""
+    h_chain = profile_decode.spawn(False, 1, 16, "chain")
+    h_tree = profile_decode.spawn(True, topk, budget, f"tree_b{budget}_k{topk}")
+    for h in (h_chain, h_tree):
+        print(h.get()[:1500])
+
+
+@app.local_entrypoint()
+def profov(budget: int = 32, topk: int = 4):
+    """Profile chain vs tree with OVERLAP ON (matches the real bench config)."""
+    h_chain = profile_decode.spawn(False, 1, 16, "chain_ov", overlap=True)
+    h_tree = profile_decode.spawn(True, topk, budget, f"tree_ov_b{budget}_k{topk}", overlap=True)
+    for h in (h_chain, h_tree):
+        print(h.get()[:1500])
+
+
+@app.function(image=base_image, volumes={"/results": results_vol})
+def reanalyze(tags: list):
+    """Proper per-step trace analysis (reuses saved traces, no GPU). For each tag:
+    GPU busy (merged intervals per stream), wall, #steps (run_batch annotations),
+    per-step GPU-busy vs per-step wall (gap = launch/CPU-bound), phase annotations."""
+    import glob, gzip, json
+    from collections import defaultdict
+    res = {}
+    for tag in tags:
+        files = sorted(set(glob.glob(f"/results/prof_{tag}/*.trace.json*")))
+        if not files: res[tag] = {"error": "no trace"}; continue
+        raw = gzip.open(files[-1]).read() if files[-1].endswith(".gz") else open(files[-1], "rb").read()
+        ev = json.loads(raw)["traceEvents"]
+        streams = defaultdict(list); ann = defaultdict(lambda: [0.0, 0]); kname = defaultdict(float)
+        for e in ev:
+            if e.get("ph") != "X" or "dur" not in e: continue
+            cat = e.get("cat", "")
+            if cat == "kernel":
+                streams[(e.get("pid"), e.get("tid"))].append((e["ts"], e["ts"] + e["dur"]))
+                kname[e["name"][:55]] += e["dur"]
+            elif cat in ("user_annotation", "cpu_op"):
+                ann[e["name"][:45]][0] += e["dur"]; ann[e["name"][:45]][1] += 1
+        # merge intervals on the busiest stream
+        def merged(iv):
+            iv = sorted(iv); tot = 0.0; cs = ce = None
+            for s, e2 in iv:
+                if cs is None: cs, ce = s, e2
+                elif s <= ce: ce = max(ce, e2)
+                else: tot += ce - cs; cs, ce = s, e2
+            if cs is not None: tot += ce - cs
+            return tot, (iv[0][0] if iv else 0), (max(e2 for _, e2 in iv) if iv else 0)
+        best = max(streams.values(), key=lambda iv: sum(b - a for a, b in iv)) if streams else []
+        gpu_busy, t0, t1 = merged(best)
+        wall = t1 - t0 if t1 > t0 else 1.0
+        steps = ann.get("scheduler.run_batch", [0, 0])[1] or ann.get("TARGET_VERIFY", [0, 1])[1] or 1
+        res[tag] = {
+            "wall_ms": round(wall / 1e3, 1), "gpu_busy_ms": round(gpu_busy / 1e3, 1),
+            "gpu_util_pct": round(100 * gpu_busy / wall, 1), "steps": steps,
+            "per_step_wall_us": round(wall / steps, 1), "per_step_gpu_us": round(gpu_busy / steps, 1),
+            "per_step_idle_us": round((wall - gpu_busy) / steps, 1),
+            "top_kernels": sorted(({"k": k, "ms": round(v / 1e3, 1), "us_per_step": round(v / steps, 1)}
+                                   for k, v in kname.items()), key=lambda x: -x["ms"])[:14],
+            "top_annotations": sorted(({"a": k, "ms": round(v[0] / 1e3, 1), "n": v[1],
+                                        "us_per_step": round(v[0] / steps, 1)} for k, v in ann.items()),
+                                      key=lambda x: -x["ms"])[:14],
+        }
+    return res
+
+
+@app.function(image=base_image, volumes={"/results": results_vol})
+def launchcount(tags: list):
+    """Count GPU kernel launches per decode step (tree vs chain), plus the
+    longest dependent launch chain inside one TARGET_VERIFY window. This is the
+    real conc=1 lever: # of serial launches, not individual kernel durations."""
+    import glob, gzip, json
+    from collections import defaultdict
+    res = {}
+    for tag in tags:
+        files = sorted(set(glob.glob(f"/results/prof_{tag}/*.trace.json*")))
+        if not files: res[tag] = {"error": "no trace"}; continue
+        raw = gzip.open(files[-1]).read() if files[-1].endswith(".gz") else open(files[-1], "rb").read()
+        ev = json.loads(raw)["traceEvents"]
+        n_kernels = 0; n_runtime = 0; steps = 0
+        kcount = defaultdict(int)
+        for e in ev:
+            if e.get("ph") != "X": continue
+            cat = e.get("cat", "")
+            if cat == "kernel":
+                n_kernels += 1; kcount[e["name"][:55]] += 1
+            elif cat == "cuda_runtime":
+                # launch-issuing runtime calls (cudaLaunchKernel etc.)
+                if "Launch" in e.get("name", "") or "launch" in e.get("name", ""):
+                    n_runtime += 1
+            elif cat == "user_annotation" and e.get("name") == "scheduler.run_batch":
+                steps += 1
+        steps = steps or 1
+        res[tag] = {
+            "steps": steps,
+            "kernels_per_step": round(n_kernels / steps, 1),
+            "launches_per_step": round(n_runtime / steps, 1),
+            "top_kernel_counts": sorted(({"k": k, "n_per_step": round(v / steps, 1)}
+                                         for k, v in kcount.items()),
+                                        key=lambda x: -x["n_per_step"])[:25],
+        }
+    return res
+
+
+@app.local_entrypoint()
+def lc(tags: str = "chain,tree_b32_k4"):
+    import json
+    r = launchcount.remote(tags.split(","))
+    for tag, d in r.items():
+        if "error" in d: print(f"\n##### {tag}: {d['error']}"); continue
+        print(f"\n##### {tag}: steps={d['steps']} kernels/step={d['kernels_per_step']} "
+              f"launches/step={d['launches_per_step']}")
+        for k in d["top_kernel_counts"]: print(f"    {k['n_per_step']:>6.1f}/step  {k['k']}")
+
+
+@app.local_entrypoint()
+def reana(tags: str = "chain,tree_b32_k4"):
+    import json
+    r = reanalyze.remote(tags.split(","))
+    for tag, d in r.items():
+        if "error" in d: print(f"\n##### {tag}: {d['error']}"); continue
+        print(f"\n##### {tag}: util={d['gpu_util_pct']}% steps={d['steps']} "
+              f"per-step wall={d['per_step_wall_us']}us gpu={d['per_step_gpu_us']}us idle={d['per_step_idle_us']}us")
+        print("  -- top GPU kernels (us/step) --")
+        for k in d["top_kernels"][:10]: print(f"    {k['us_per_step']:>8.1f}us/step  {k['k']}")
+        print("  -- top annotations (us/step) --")
+        for a in d["top_annotations"][:8]: print(f"    {a['us_per_step']:>8.1f}us/step (n={a['n']})  {a['a']}")
+
+
+@app.function(image=base_image, volumes={"/results": results_vol})
+def _list_profsum():
+    import os, json
+    out = {}
+    for fn in sorted(os.listdir("/results")):
+        if fn.startswith("profsum_") and fn.endswith(".json"):
+            out[fn] = open(f"/results/{fn}").read()
+    return out
+
+
+@app.local_entrypoint()
+def profpull():
+    import os, json
+    os.makedirs("v2_prof", exist_ok=True)
+    for fn, c in _list_profsum.remote().items():
+        open(f"v2_prof/{fn}", "w").write(c)
+        d = json.loads(c)
+        print(f"\n===== {fn}: util={d.get('gpu_util_pct')}% wall={d.get('wall_us')}us gpu_busy={d.get('gpu_busy_us')}us =====")
+        for k in d.get("top_gpu_kernels", [])[:8]: print(f"  GPU {k['us']:>9.1f}us  {k['name']}")
+        for k in d.get("top_cpu_ops", [])[:8]: print(f"  CPU {k['us']:>9.1f}us  {k['name']}")
+
+
+@app.local_entrypoint()
+def grid(target_model: str = "Qwen/Qwen3-8B",
+         draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+         data_names: str = "gsm8k,mt-bench", concurrencies: str = "1"):
+    """Sweep (budget x topk) at conc=1 to find best tree config + show topk-scaling.
+    Each config = its own GPU container (parallel via spawn)."""
+    GRID = [(16, 4), (32, 4), (32, 8), (64, 4), (64, 8),
+            (128, 4), (128, 8), (128, 16), (256, 8), (256, 16)]
+    handles = [("chain", run.spawn(target_model, draft_model, data_names, False, 1, 16,
+                                   None, 32, concurrencies, "flashinfer", 0.85, 1, 1, True,
+                                   "grid_chain", False))]
+    for b, k in GRID:
+        handles.append((f"b{b}_k{k}", run.spawn(
+            target_model, draft_model, data_names, True, k, 16, b, 32, concurrencies,
+            "flashinfer", 0.85, 1, 1, True, f"grid_b{b}_k{k}", False)))
+    os.makedirs("v2_tree_results", exist_ok=True)
+    for name, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/grid_{name}.md", "w") as f:
+                f.write(res)
+            print(f"\n>>> {name}\n{_tables(res)}")
+        except Exception as e:
+            print(f">>> FAILED {name}: {e}")
 
 
 @app.local_entrypoint()
