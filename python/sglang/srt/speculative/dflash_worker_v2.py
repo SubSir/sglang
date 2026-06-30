@@ -1868,23 +1868,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         hidden_flat = hidden.view(-1, hidden.shape[-1])
 
         if tight:
-            # Rebuild a [bs, max_vbs] rectangular view of the committed-eligible
-            # tokens so the existing prefix-valid writer (cache_loc_2d + commit_lens)
-            # works; commit_lens <= per_req_vbs <= max_vbs, so padding cols are unused.
-            used_m = used_mask[:, :max_vbs]
-            h = hidden.shape[-1]
-            cl2d = torch.zeros(bs, max_vbs, dtype=v_cache_loc.dtype, device=device)
-            cl2d[used_m] = v_cache_loc[:total_real]
-            pos2d = torch.zeros(bs, max_vbs, dtype=v_positions.dtype, device=device)
-            pos2d[used_m] = v_positions[:total_real]
-            h2d = torch.zeros(bs, max_vbs, h, dtype=hidden.dtype, device=device)
-            h2d[used_m] = hidden_flat[:total_real]
+            # Gather only the committed packed tokens and write them flat (projects
+            # just those; avoids rebuilding a [bs, max_vbs, hidden] tensor each step).
+            # committed_2d[b, c] = c < commit_lens[b]; indexed by used_mask it lands
+            # in packed order. commit_lens <= per_req_vbs so it's a subset of used.
+            committed_2d = self._block_pos_offsets.unsqueeze(0) < commit_lens.unsqueeze(
+                1
+            ).to(self._block_pos_offsets.dtype)
+            committed = committed_2d[used_mask]  # [total_real] bool, packed order
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=h2d.reshape(-1, h),
-                cache_loc=cl2d.reshape(-1),
-                cache_loc_2d=cl2d,
-                positions=pos2d.reshape(-1),
-                commit_lens=commit_lens,
+                target_hidden=hidden_flat[:total_real][committed],
+                cache_loc=v_cache_loc[:total_real][committed],
+                positions=v_positions[:total_real][committed],
+                cache_loc_2d=None,
+                commit_lens=None,
             )
         else:
             self._append_target_hidden_to_draft_kv_by_loc(
