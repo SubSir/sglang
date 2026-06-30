@@ -120,6 +120,26 @@ AND not is_draft_worker (target only). Buckets = {4,6,8,12,block_size}.
   fits. Backend stores/looks up by ShapeKey variant -> already supported.
 Risk: keep non-dflash + draft-worker paths byte-identical (buckets=[num_tokens_per_bs]).
 
+## *** FINAL RESULT (same-card serial, 1024 samples, margin=1, min_bs=48) ***
+conc 1:   484.7 -> 484.9  ratio 1.000  acc 4.033->4.033   (parity)
+conc 32:  6739  -> 6760   ratio 1.003  acc 4.153->4.135   (parity, gated)
+conc 64:  7927  -> 8918   ratio 1.125  acc 4.125->4.067   (WIN +12.5%)
+conc 128: 8960  -> 10523  ratio 1.174  acc 4.105->4.006   (WIN +17.4%)
+=> GOAL MET: high conc >=10% faster (12.5%/17.4%), low/mid conc not slower (parity),
+   accept length preserved (-1..-2.4% vs rectangular's -12%). Lossless (chain verify).
+
+## *** FINAL DESIGN (per-request tight-pack, sync-free, gated) ***
+Defaults: margin=1, stat=mean, min_bs=48 (env SGLANG_DFLASH_VBS_MARGIN/STAT/MIN_BS).
+- Per-request: each req keeps its own per_req_vbs=ceil(est_accept+margin); tight-packed
+  into bs*effective_tpbs (effective_tpbs=bucket(mean)). Accept preserved.
+- Sync-free: permutation-scatter pack + gather unpack + searchsorted/nonzero committed
+  gather (2 host syncs/step vs ~6 with boolean indexing).
+- Gated: truncate only at bs>=min_bs (small batch is overhead-bound; truncation can't
+  beat the per-step overhead there) -> low/mid conc = exact parity (not slower).
+Same-card cross-card tune (sync-free): conc128 m1=1.196x acc4.05 / m0=1.253x acc3.94;
+conc32 m1=0.90x (=> gated off). Final same-card serial 1024-sample sweep: see results.
+Deliverable: `modal run modal_vbs_v2.py::final --concurrencies 1,32,64,128`.
+
 ## *** PER-REQUEST tight-pack (the design the user wants) ***
 Each request keeps its own per_req_vbs (est+margin); tight-packed into bs*effective_tpbs
 (effective_tpbs=bucket(mean)). Ragged qo/kv_indptr in generate_attn_arg_prefill (causal
