@@ -429,9 +429,134 @@ def _summarize_trace(path: str):
 
 
 @app.local_entrypoint()
-def prof(dynamic_mode: str = "off", concurrency: int = 32):
+def prof(dynamic_mode: str = "off", concurrency: int = 32, vbs_margin: float = 0.0,
+         vbs_stat: str = "mean", vbs_min_bs: int = 2):
     import json as _json
-    print(_json.dumps(profile.remote(_mode(dynamic_mode), concurrency), indent=2))
+    print(_json.dumps(profile.remote(_mode(dynamic_mode), concurrency, 4.0, 0.75,
+                                     vbs_margin, vbs_stat, vbs_min_bs), indent=2))
+
+
+_trace_vol = modal.Volume.from_name("dflash-traces", create_if_missing=True)
+
+
+@app.function(gpu="B200", cloud="aws", timeout=3600, image=image,
+              volumes={"/traces": _trace_vol},
+              secrets=[modal.Secret.from_name("huggingface-secret")])
+def trace(concurrency: int = 32, num_steps: int = 40, vbs_margin: float = 0.0,
+          vbs_min_bs: int = 1, mem_fraction: float = 0.75):
+    """Capture sglang torch-profiler traces for no-dyn AND dyn on the SAME card
+    (serial), at `concurrency`. Saves chrome traces to the dflash-traces volume.
+    Download: modal volume get dflash-traces /<dir> ./"""
+    import subprocess, signal, time, glob, os as _os, threading
+    from concurrent.futures import ThreadPoolExecutor
+    from transformers import AutoTokenizer
+    import requests
+
+    _write_mt_bench_jsonl("/root/mt-bench.jsonl")
+    with open("/root/mt-bench.jsonl") as f:
+        dataset = [json.loads(l) for l in f]
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    prompts = [tok.apply_chat_template(
+        [{"role": "user", "content": dataset[i % len(dataset)]["turns"][0]}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        for i in range(concurrency * 4)]
+
+    out = {}
+    for dynamic in (False, True):
+        tag = "dyn" if dynamic else "nodyn"
+        prof_dir = f"/traces/qwen3-8b_conc{concurrency}_{tag}"
+        _os.makedirs(prof_dir, exist_ok=True)
+        for _f in glob.glob(prof_dir + "/*"):  # clear stale (possibly-corrupt) traces
+            try: _os.remove(_f)
+            except Exception: pass
+        cmd = [
+            "python", "-m", "sglang.launch_server", "--model-path", MODEL,
+            "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", DRAFT,
+            "--speculative-num-draft-tokens", str(NUM_DRAFT_TOKENS),
+            "--tp-size", "1", "--attention-backend", "flashinfer", "--page-size", "1",
+            "--mem-fraction-static", str(mem_fraction),
+            "--max-running-requests", str(max(concurrency, 1)),
+            "--port", "30000", "--trust-remote-code",
+            ("--speculative-dflash-dynamic-vbs" if dynamic
+             else "--no-speculative-dflash-dynamic-vbs"),
+        ]
+        env = dict(os.environ)
+        env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+        env["SGLANG_TORCH_PROFILER_DIR"] = prof_dir
+        env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
+        env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
+        print(f">>> [{tag}]", " ".join(cmd), flush=True)
+        srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
+        base = "http://127.0.0.1:30000"; ready = False
+        for _ in range(300):
+            if srv.poll() is not None: break
+            try:
+                if requests.get(base + "/health", timeout=5).status_code == 200:
+                    ready = True; break
+            except Exception: pass
+            time.sleep(3)
+        if not ready:
+            srv.send_signal(signal.SIGINT); out[tag] = "server not ready"; continue
+
+        def send(p):
+            try:
+                requests.post(base + "/generate", json={"text": p, "sampling_params":
+                    {"temperature": 0.0, "max_new_tokens": 512}}, timeout=600)
+            except Exception: pass
+        stop = threading.Event()
+        def load():
+            with ThreadPoolExecutor(max_workers=concurrency * 2) as pool:
+                i = 0
+                while not stop.is_set():
+                    if pool._work_queue.qsize() < concurrency:
+                        pool.submit(send, prompts[i % len(prompts)]); i += 1
+                    else:
+                        time.sleep(0.001)
+        th = threading.Thread(target=load, daemon=True); th.start()
+        time.sleep(8)  # steady state
+        before = set(glob.glob(prof_dir + "/*"))
+        requests.post(base + "/start_profile",
+                      json={"num_steps": num_steps, "activities": ["CPU", "GPU"]}, timeout=60)
+        # wait for a NEW trace file, then wait until its size is STABLE (the .gz dump
+        # is written incrementally; grabbing it mid-write yields a truncated/corrupt gz).
+        path = None
+        for _ in range(120):
+            time.sleep(2)
+            cand = [f for f in set(glob.glob(prof_dir + "/*.json*")) - before
+                    if _os.path.getsize(f) > 0]
+            if cand:
+                path = sorted(cand, key=_os.path.getmtime)[-1]; break
+        if path is None:
+            try: requests.post(base + "/stop_profile", timeout=60)
+            except Exception: pass
+            for _ in range(30):
+                time.sleep(2)
+                cand = sorted(glob.glob(prof_dir + "/*.json*"), key=_os.path.getmtime)
+                if cand: path = cand[-1]; break
+        if path is not None:
+            last = -1
+            for _ in range(60):  # wait for size to stop growing
+                sz = _os.path.getsize(path)
+                if sz == last and sz > 0:
+                    break
+                last = sz; time.sleep(1)
+            time.sleep(2)
+        stop.set(); srv.send_signal(signal.SIGINT); time.sleep(5)
+        sz = _os.path.getsize(path) / 1e6 if path and _os.path.exists(path) else 0
+        out[tag] = {"dir": prof_dir, "file": path, "size_mb": round(sz, 1),
+                    "all": [_os.path.basename(x) for x in glob.glob(prof_dir + "/*")]}
+        print(f">>> [{tag}] trace: {out[tag]}", flush=True)
+
+    _trace_vol.commit()
+    print(">>> DOWNLOAD with: modal volume get dflash-traces / ./traces", flush=True)
+    print(">>> TRACE RESULT:", json.dumps(out, indent=2), flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def trace_main(concurrency: int = 32, num_steps: int = 40, vbs_margin: float = 0.0,
+               vbs_min_bs: int = 1):
+    print(json.dumps(trace.remote(concurrency, num_steps, vbs_margin, vbs_min_bs), indent=2))
 
 
 def _mode(s):
