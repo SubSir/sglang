@@ -1521,6 +1521,17 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_dynamic_vbs: A[
+        bool,
+        Arg(
+            help="DFLASH only. Enable dynamic verify block size: truncate each "
+            "step's verify block to an estimated accept length (from draft "
+            "confidence) so the target wastes less compute on tokens that would "
+            "be rejected. Use --no-speculative-dflash-dynamic-vbs to force a "
+            "fixed verify block.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

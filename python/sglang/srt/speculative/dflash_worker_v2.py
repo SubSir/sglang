@@ -207,6 +207,35 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
+
+        # --- Dynamic verify block size (VBS) -------------------------------
+        # Drafting always produces the full block_size; dynamic-VBS truncates
+        # only the *verify* forward to an estimated accept length (from draft
+        # confidence) so the target wastes less compute on soon-to-be-rejected
+        # tokens. effective_tpbs is rounded up to a fixed bucket so a single
+        # batch-wide verify length is used (rectangular; no per-request packing).
+        self.use_dynamic_verify = bool(
+            getattr(server_args, "speculative_dflash_dynamic_vbs", False)
+        )
+        self.dynamic_verify_margin = 2
+        self.dynamic_verify_confidence_scale = 0.5  # sqrt: <1 tempers cumprod decay
+        # Below this batch size, verify is memory-bound: truncating saves ~no GPU
+        # time and the eager (non-graph) verify would regress. Keep the full block
+        # (and its captured graph) there. ponytail: bs gate, raise/lower per profile.
+        self.dynamic_verify_min_bs = 2
+        self.dynamic_verify_buckets = sorted(
+            {b for b in (4, 6, 8, 12, self.block_size) if 1 <= b <= self.block_size}
+        )
+        # tokens_per_bs -> smallest bucket >= it (round up).
+        self._dynamic_verify_bucket_lookup = [self.block_size] * (self.block_size + 1)
+        _bi = 0
+        for _t in range(self.block_size + 1):
+            while (
+                _bi + 1 < len(self.dynamic_verify_buckets)
+                and _t > self.dynamic_verify_buckets[_bi]
+            ):
+                _bi += 1
+            self._dynamic_verify_bucket_lookup[_t] = self.dynamic_verify_buckets[_bi]
         self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
@@ -606,22 +635,51 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return int(resolved_id)
 
+    def _dynamic_verify_len(self, draft_conf: torch.Tensor) -> int:
+        """Estimate a single batch-wide verify length from draft confidence.
+
+        draft_conf: [bs, block_size-1] per-draft-token top-1 confidence proxy.
+        Expected accepted run length est_accept[b] = sum_t prod_{<=t} conf^scale.
+        Truncate the whole batch to ceil(mean(est_accept)+margin) rounded up to a
+        bucket (rectangular; one verify length for the batch). Costs one small host
+        sync to pick the shape — inherent to choosing a dynamic verify size.
+        """
+        if self.dynamic_verify_confidence_scale == 0.5:
+            scaled = torch.sqrt(draft_conf)
+        else:
+            scaled = draft_conf ** self.dynamic_verify_confidence_scale
+        est_accept = torch.cumprod(scaled, dim=1).sum(dim=1)  # [bs]
+        raw_vbs = torch.ceil(est_accept + self.dynamic_verify_margin)
+        batch_vbs = int(raw_vbs.mean().clamp_(1, self.block_size).item())
+        return self._dynamic_verify_bucket_lookup[batch_vbs]
+
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_confidence: bool = False,
+    ):
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+
+        When ``return_confidence`` is set, also returns a per-token top-1 confidence
+        proxy ``sigmoid(top1_logit - top2_logit)`` in [0, 1] used by dynamic-VBS to
+        estimate accept length. Only the cheap single-rank paths fill a real value;
+        other paths return 1.0 (i.e. "fully confident" -> no truncation).
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            empty = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            if return_confidence:
+                return empty, torch.empty(
+                    (0,), dtype=torch.float32, device=hidden_states.device
+                )
+            return empty
 
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
@@ -629,17 +687,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
+        out_confidence = (
+            torch.ones((num_tokens,), dtype=torch.float32, device=hidden_states.device)
+            if return_confidence
+            else None
+        )
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        def _ret():
+            return (out_tokens, out_confidence) if return_confidence else out_tokens
 
         if not hasattr(lm_head, "shard_indices"):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
                 logits = torch.matmul(hs, weight.T)
-                out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
-            return out_tokens
+                if return_confidence:
+                    top2v, top2i = torch.topk(logits, 2, dim=-1)
+                    out_tokens[start:end] = top2i[:, 0].to(torch.long)
+                    out_confidence[start:end] = torch.sigmoid(
+                        (top2v[:, 0] - top2v[:, 1]).float()
+                    )
+                else:
+                    out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+            return _ret()
 
         shard = lm_head.shard_indices
         tp_group = get_tp_group()
@@ -693,15 +766,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    local_max, local_arg = _ensure_local_reduce_buffers(
-                        end - start, base_logits.dtype, hs.device
-                    )
-                    torch.max(base_logits, dim=-1, out=(local_max, local_arg))
-                    out_tokens[start:end].copy_(local_arg)
-                    out_tokens[start:end].add_(org_vocab_start)
+                    if return_confidence:
+                        top2v, top2i = torch.topk(base_logits, 2, dim=-1)
+                        out_tokens[start:end].copy_(top2i[:, 0])
+                        out_tokens[start:end].add_(org_vocab_start)
+                        out_confidence[start:end] = torch.sigmoid(
+                            (top2v[:, 0] - top2v[:, 1]).float()
+                        )
+                    else:
+                        local_max, local_arg = _ensure_local_reduce_buffers(
+                            end - start, base_logits.dtype, hs.device
+                        )
+                        torch.max(base_logits, dim=-1, out=(local_max, local_arg))
+                        out_tokens[start:end].copy_(local_arg)
+                        out_tokens[start:end].add_(org_vocab_start)
                 else:
                     out_tokens[start:end] = 0
-            return out_tokens
+            return _ret()
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -816,7 +897,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_tokens[start:end].copy_(selected_ids.view(-1))
 
-        return out_tokens
+        # TP path leaves out_confidence at 1.0 (no truncation) — dynamic-VBS is
+        # only wired for the single-rank fast path that the tp=1 target uses.
+        return _ret()
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
@@ -1488,10 +1571,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, int(self.block_size) - 1)
+        block_size = int(self.block_size)
+        # Dynamic-VBS truncates the verify forward to `verify_len` (<= block_size).
+        # Drafting still produces the full block; only the (greedy) verify path may
+        # shrink. Skipped at small bs (no compute-bound win, eager would regress) and
+        # for non-greedy sampling (handled by the fixed-block sampling-verify kernel).
+        _sampling_info = model_worker_batch.sampling_info
+        do_dynamic = (
+            self.use_dynamic_verify
+            and bs >= self.dynamic_verify_min_bs
+            and (_sampling_info is None or _sampling_info.is_all_greedy)
+        )
+        if do_dynamic:
+            draft_next, draft_conf = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+                return_confidence=True,
+            )
+            draft_next = draft_next.view(bs, block_size - 1)
+            draft_conf = draft_conf.view(bs, block_size - 1)
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, block_size - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -1501,16 +1604,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_input_ids = draft_tokens.reshape(-1)
+        verify_len = block_size
+        v_positions = positions
+        v_cache_loc = verify_out_cache_loc
+        v_cache_loc_2d = verify_out_cache_loc_2d
+        if do_dynamic:
+            verify_len = self._dynamic_verify_len(draft_conf)
+            if verify_len < block_size:
+                v_positions = positions_2d[:, :verify_len].reshape(-1)
+                v_cache_loc_2d = verify_out_cache_loc_2d[:, :verify_len]
+                v_cache_loc = v_cache_loc_2d.reshape(-1)
+
+        verify_input_ids = (
+            draft_tokens.reshape(-1)
+            if verify_len == block_size
+            else draft_tokens[:, :verify_len].reshape(-1)
+        )
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
+            positions=v_positions,
+            draft_token_num=int(verify_len),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
-        model_worker_batch.out_cache_loc = verify_out_cache_loc
+        model_worker_batch.out_cache_loc = v_cache_loc
         sampling_info = model_worker_batch.sampling_info
 
         need_mamba_verify_commit = hasattr(
@@ -1548,11 +1666,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                draft_token_num=int(verify_len),
             )
 
-        candidates = draft_tokens
+        vlen = int(verify_len)
+        candidates = draft_tokens if vlen == block_size else draft_tokens[:, :vlen]
         new_seq_lens = None
+
+        def _mk_out_tokens(accept_len_t, bonus_t):
+            # Keep block_size width so downstream stride (speculative_num_draft_tokens)
+            # is unchanged; only the first commit_len entries per row are consumed.
+            ot = torch.empty((bs, block_size), dtype=torch.int64, device=device)
+            if vlen > 1:
+                ot[:, : vlen - 1].copy_(candidates[:, 1:vlen])
+            ot[:, vlen - 1 :].fill_(0)
+            ot.scatter_(1, accept_len_t.to(torch.int64)[:, None], bonus_t[:, None])
+            return ot
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1566,18 +1695,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
-            )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            out_tokens = _mk_out_tokens(accept_len, bonus)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
+                bs, vlen
             )
-            if self._use_triton_accept_bonus:
+            # The Triton accept/bonus kernel assumes the full block_size layout
+            # (and block-wide buffers); use it only when not truncating.
+            if self._use_triton_accept_bonus and vlen == block_size:
                 try:
                     (
                         accept_len,
@@ -1607,34 +1732,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                         target_predict=target_predict,
                     )
                     commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
-                    )
+                    out_tokens = _mk_out_tokens(accept_len, bonus)
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
                 commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                out_tokens = torch.empty(
-                    (bs, int(self.block_size)), dtype=torch.int64, device=device
-                )
-                if int(self.block_size) > 1:
-                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-                out_tokens[:, int(self.block_size) - 1].fill_(0)
-                out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
-                )
+                out_tokens = _mk_out_tokens(accept_len, bonus)
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -1655,13 +1760,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
+        hidden = hidden.view(bs, vlen, -1)
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
+            cache_loc=v_cache_loc,
+            cache_loc_2d=v_cache_loc_2d,
+            positions=v_positions,
             commit_lens=commit_lens,
         )
 

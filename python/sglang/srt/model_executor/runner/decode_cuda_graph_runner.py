@@ -449,12 +449,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        is_ngram_supported = (
+        # NGRAM and DFLASH may submit fewer tokens than the captured
+        # num_tokens_per_bs (DFLASH dynamic-VBS truncates the verify block). The
+        # graph buffers are sized for the full block, so a short batch must fall
+        # back to eager instead of matching the same-bs graph. Non-truncated
+        # batches satisfy this equality, so behavior is unchanged for them.
+        is_token_count_supported = (
             (
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
-            if self.model_runner.spec_algorithm.is_ngram()
+            if (
+                self.model_runner.spec_algorithm.is_ngram()
+                or self.model_runner.spec_algorithm.is_dflash()
+            )
             else True
         )
 
@@ -463,7 +471,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
-            and is_ngram_supported
+            and is_token_count_supported
         )
 
     def _init_profile_context_and_memory_record(self):
