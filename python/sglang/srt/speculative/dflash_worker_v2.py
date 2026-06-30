@@ -237,8 +237,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.dynamic_verify_stat = os.environ.get("SGLANG_DFLASH_VBS_STAT", "mean")
         # Verify-token accounting (host-side ints only -> no extra device sync):
         # actual = sum(bs*verify_len), full = sum(bs*block_size) (what no-dynamic runs).
-        self._vbs_tok_actual = 0
-        self._vbs_tok_full = 0
+        self._vbs_tok_actual = 0  # padded (GEMM) verify tokens = sum(bs*effective_tpbs)
+        self._vbs_tok_real = 0  # real draft tokens chosen to verify = sum(per_req_vbs)
+        self._vbs_tok_full = 0  # what no-dynamic runs = sum(bs*block_size)
         self._vbs_tok_bs_sum = 0
         self._vbs_tok_steps = 0
         self.dynamic_verify_buckets = sorted(
@@ -1724,18 +1725,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         else:
             verify_input_ids = draft_tokens.reshape(-1)
 
-        # Verify-token accounting: host ints (bs, verify_len) -> no device sync.
+        # Verify-token accounting: host ints (bs, verify_len, total_real) -> no sync.
         self._vbs_tok_actual += bs * int(verify_len)
+        self._vbs_tok_real += int(total_real) if tight else bs * int(verify_len)
         self._vbs_tok_full += bs * block_size
         self._vbs_tok_bs_sum += bs
         self._vbs_tok_steps += 1
         if self._vbs_tok_steps % 256 == 0 and self.tp_rank == 0:
-            a, f = self._vbs_tok_actual, self._vbs_tok_full
+            a, r, f = self._vbs_tok_actual, self._vbs_tok_real, self._vbs_tok_full
             logger.info(
-                "DFLASH verify-tokens cumulative: actual=%d full=%d saved=%.1f%% "
-                "(avg verify_len=%.2f vs block_size=%d)",
-                a, f, 100.0 * (1.0 - a / max(f, 1)),
-                a / max(self._vbs_tok_bs_sum, 1), block_size,
+                "DFLASH verify-tokens: padded=%d (saved %.1f%%) real=%d (saved %.1f%%) "
+                "full=%d | avg padded_len=%.2f real_len=%.2f vs block=%d",
+                a, 100.0 * (1.0 - a / max(f, 1)),
+                r, 100.0 * (1.0 - r / max(f, 1)), f,
+                a / max(self._vbs_tok_bs_sum, 1),
+                r / max(self._vbs_tok_bs_sum, 1), block_size,
             )
 
         verify_input = DFlashVerifyInput(

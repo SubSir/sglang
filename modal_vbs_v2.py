@@ -431,8 +431,10 @@ def _mode(s):
 
 
 @app.local_entrypoint()
-def one(dynamic_mode: str = "none", concurrency: int = 1, num_prompts: int = 512):
-    print(bench.remote(_mode(dynamic_mode), concurrency, num_prompts))
+def one(dynamic_mode: str = "none", concurrency: int = 1, num_prompts: int = 512,
+        vbs_margin: float = 1.0, vbs_stat: str = "mean"):
+    print(bench.remote(_mode(dynamic_mode), concurrency, num_prompts, 1024, 0.75,
+                       vbs_margin, vbs_stat))
 
 
 @app.local_entrypoint()
