@@ -30,9 +30,12 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    is_dflash_domino_projector,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.domino_helper import DFlashDominoHelper
+from sglang.srt.speculative.domino_rollout import DFlashDominoRollout
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
@@ -203,6 +206,35 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+
+        # Optional Domino GRU autoregressive rollout. When the draft checkpoint's
+        # projector_type is domino/causal_v5, the draft block is produced by a
+        # sequential GRU rollout instead of the block-parallel argmax sample.
+        # The global-argmax callbacks are only used on the TP>1 rollout path;
+        # this conc=1/TP=1 chain port leaves them unset.
+        self.domino_helper: Optional[DFlashDominoHelper] = (
+            DFlashDominoHelper(self.draft_model)
+            if is_dflash_domino_projector(
+                getattr(self.draft_model, "projector_type", None)
+            )
+            else None
+        )
+        self.domino_rollout: Optional[DFlashDominoRollout] = None
+        if self.domino_helper is not None:
+            self.domino_rollout = DFlashDominoRollout(
+                domino_helper=self.domino_helper,
+                block_size=self.block_size,
+                target_vocab_size=int(
+                    getattr(
+                        self.target_worker.model_runner.model_config,
+                        "vocab_size",
+                        0,
+                    )
+                    or 0
+                ),
+                global_argmax_from_local_logits=None,
+                global_argmax_from_local_max=None,
+            )
         # Number of tokens the TARGET verifies per request. Chain == block_size;
         # tree == the (possibly larger) verify node budget (--speculative-num-draft-tokens).
         # The verify cache buffers, allocation, and accept logic are sized by this,
@@ -1669,12 +1701,50 @@ class DFlashWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
         else:
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
+            # SGLANG_DOMINO_TIME_DRAFT=1: CUDA-event time JUST the draft-step
+            # (GRU rollout vs block-parallel sample) to isolate the rollout
+            # overhead. Adds a per-step sync, so run it in a SEPARATE timing run,
+            # not the throughput run. ponytail: gated; throughput run untouched.
+            _time_draft = bool(int(os.environ.get("SGLANG_DOMINO_TIME_DRAFT", "0")))
+            _t0 = _t1 = None
+            if _time_draft and is_cuda():
+                _t0 = torch.cuda.Event(enable_timing=True)
+                _t1 = torch.cuda.Event(enable_timing=True)
+                _t0.record()
+
+            if self.domino_rollout is not None:
+                # Domino: sequential GRU autoregressive rollout of the draft block,
+                # producing block_size-1 tokens conditioned on the previous token.
+                draft_next = self.domino_rollout.rollout_draft_block(
+                    draft_hidden=draft_hidden,
+                    verified_id=block_ids[:, 0],
+                    target_model=target_model,
+                    lm_head=lm_head,
+                )
+            else:
+                # z-lab DFlash: single block-parallel argmax over the draft block.
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                ).view(bs, int(self.block_size) - 1)
+
+            if _t0 is not None:
+                _t1.record()
+                torch.cuda.synchronize()
+                dt_us = _t0.elapsed_time(_t1) * 1000.0
+                self._domino_time_n = getattr(self, "_domino_time_n", 0) + 1
+                self._domino_time_us = getattr(self, "_domino_time_us", 0.0) + dt_us
+                if self._domino_time_n % 200 == 0:
+                    which = "domino-rollout" if self.domino_rollout is not None else "dflash-sample"
+                    logger.warning(
+                        "[DRAFT-TIME] %s: mean=%.1f us/step over %d steps (bs=%d)",
+                        which,
+                        self._domino_time_us / self._domino_time_n,
+                        self._domino_time_n,
+                        bs,
+                    )
 
             draft_tokens = self._draft_block_tokens_buf[:bs]
             draft_tokens[:, 0].copy_(block_ids[:, 0])
