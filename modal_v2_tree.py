@@ -27,7 +27,7 @@ base_image = (
     modal.Image.from_registry(
         "lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96"
     )
-    .run_commands("echo v2tree3 > /tmp/build_time")
+    .run_commands("echo v2tree4-domino > /tmp/build_time")
     # Overlay the tree-verify port (the speculative dir from the worktree).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
@@ -39,6 +39,12 @@ base_image = (
         remote_path="/tmp/port_arg_groups",
         copy=True,
     )
+    # Domino port edits models/dflash.py (GRU projector) -> overlay it too.
+    .add_local_file(
+        f"{WT}/python/sglang/srt/models/dflash.py",
+        remote_path="/tmp/port_models_dflash.py",
+        copy=True,
+    )
     .add_local_dir("./benchmark", remote_path="/root/benchmark", copy=True)
     .add_local_file("./patch_cudagraph.py", remote_path="/tmp/patch_cudagraph.py", copy=True)
     .run_commands(
@@ -46,23 +52,87 @@ base_image = (
         "echo \"sglang at $SGLANG_DIR\" && "
         "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
         "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && "
-        "echo overlaid tree-verify port",
+        "cp -f /tmp/port_models_dflash.py \"$SGLANG_DIR/srt/models/dflash.py\" && "
+        "echo overlaid tree-verify + domino port",
         "python3 /tmp/patch_cudagraph.py",
     )
 )
 
 
-@app.function(gpu="B200", timeout=10800, image=base_image,
-              secrets=[modal.Secret.from_name("huggingface-secret")],
-              volumes={"/results": results_vol})
-def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
-        num_draft_tokens, samples_base, concurrencies, backend="flashinfer",
-        mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None,
-        disable_cuda_graph=False, tree_algo="fused",
-        depth_bonus=None, force_width=None):
-    """One server launch; bench internally sweeps all concurrencies x datasets.
-    When skip_baseline is False, the bench runs the target-only baseline on the
-    SAME GPU (serially) before DFLASH, yielding the speedup denominator."""
+# --- fa4 experiment image: cu13 (native cuda-13 for fa4's cutlass DSL) -----------
+# Isolated from base_image (cu12) so the running comparison is undisturbed.
+#  - libnuma-dev: sgl_kernel's compiled `common_ops` links libnuma; the cu13 image
+#    omits the runtime lib -> dlopen fails -> "No module named 'common_ops'".
+#  - cutlass payload via --no-deps so numpy/cuda-python aren't upgraded (those
+#    upgrades also break sgl_kernel's common_ops).
+fa4_image = (
+    modal.Image.from_registry(
+        "lmsysorg/sglang:nightly-dev-cu13-20260627-13b5bd96"
+    )
+    .apt_install("git", "wget", "libnuma-dev")
+    .run_commands("echo fa4img1 > /tmp/build_time")
+    .run_commands(
+        "pip install --force-reinstall --no-cache-dir --no-deps "
+        "nvidia-cutlass-dsl==4.5.2 nvidia-cutlass-dsl-libs-base==4.5.2"
+    )
+    .add_local_dir(f"{WT}/python/sglang/srt/speculative",
+                   remote_path="/tmp/port_speculative", copy=True)
+    .add_local_dir(f"{WT}/python/sglang/srt/arg_groups",
+                   remote_path="/tmp/port_arg_groups", copy=True)
+    .add_local_dir("./benchmark", remote_path="/root/benchmark", copy=True)
+    .add_local_file("./patch_cudagraph.py", remote_path="/tmp/patch_cudagraph.py", copy=True)
+    .run_commands(
+        "SGLANG_DIR=$(python3 -c 'import sglang,os;print(os.path.dirname(sglang.__file__))') && "
+        "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
+        "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && echo overlaid",
+        "python3 /tmp/patch_cudagraph.py",
+    )
+)
+
+
+@app.function(image=fa4_image, gpu="B200", cloud="aws", timeout=600)
+def fa4check():
+    """GPU check (needs libcuda.so.1): cutlass + sgl_kernel + sglang import on fa4_image."""
+    import subprocess
+    checks = [
+        ("import cutlass", "import cutlass; print(cutlass.__file__)"),
+        ("import cutlass.cute", "import cutlass.cute as cute; print('cute ok')"),
+        ("import sglang", "import sglang; print('sglang', sglang.__version__)"),
+        ("import sgl_kernel", "import sgl_kernel; print('sgl_kernel ok')"),
+        ("dlopen common_ops (real error)",
+         "import ctypes; ctypes.CDLL('/usr/local/lib/python3.12/dist-packages/sgl_kernel/sm100/common_ops.abi3.so'); print('dlopen ok')"),
+        ("import flashinfer", "import flashinfer; print('flashinfer ok')"),
+    ]
+    for label, code in checks:
+        r = subprocess.run(["python3", "-c", code], capture_output=True, text=True)
+        print(f"### {label}\nrc={r.returncode}\nout={r.stdout}\nerr={r.stderr[-1500:]}")
+    # what top-level modules does the DSL package actually install?
+    r = subprocess.run(["bash", "-c",
+        "python3 -c \"import importlib.metadata as m; "
+        "print([f for f in m.files('nvidia-cutlass-dsl') if str(f).count('/')<=1][:40])\"; "
+        "echo '--- libs-base ---'; "
+        "python3 -c \"import importlib.metadata as m; "
+        "print([f for f in m.files('nvidia-cutlass-dsl-libs-base') if str(f).count('/')<=1][:40])\"; "
+        "echo '--- how sglang fa4 imports cutlass ---'; "
+        "grep -rnE 'import cutlass|from cutlass' /usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/ 2>/dev/null | head; "
+        "echo '--- how flash_attn_4 / flashinfer import it (the working consumers) ---'; "
+        "python3 -c \"import flash_attn_interface\" 2>&1 | tail -2; "
+        "grep -rlE 'import cutlass' /usr/local/lib/python3.12/dist-packages/flashinfer/ 2>/dev/null | head -3"],
+        capture_output=True, text=True)
+    print(f"### module files + import sites\n{r.stdout}\nERR:{r.stderr[-800:]}")
+    return "done"
+
+
+@app.local_entrypoint()
+def fa4dbg():
+    fa4check.remote()
+
+
+def _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_size,
+                num_draft_tokens, samples_base, concurrencies, backend,
+                mem_fraction, tp, gpu_count, skip_baseline, result_tag,
+                disable_cuda_graph, tree_algo, depth_bonus, force_width):
+    """Shared bench body (image-agnostic) used by run() [cu12] and fa4_run() [cu13]."""
     import sys, importlib.util
 
     args = [
@@ -122,6 +192,60 @@ def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
             f.write(res)
         results_vol.commit()
     return res
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
+        num_draft_tokens, samples_base, concurrencies, backend="flashinfer",
+        mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None,
+        disable_cuda_graph=False, tree_algo="fused", depth_bonus=None, force_width=None):
+    """cu12 (validated triton) bench entrypoint. One server launch; sweeps datasets."""
+    return _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_size,
+                       num_draft_tokens, samples_base, concurrencies, backend,
+                       mem_fraction, tp, gpu_count, skip_baseline, result_tag,
+                       disable_cuda_graph, tree_algo, depth_bonus, force_width)
+
+
+@app.function(gpu="B200", cloud="aws", timeout=10800, image=fa4_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def fa4_run(target_model, draft_model, data_names, tree_verify, topk, block_size,
+            num_draft_tokens, samples_base, concurrencies, backend="fa4",
+            mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None,
+            disable_cuda_graph=False, tree_algo="fused", depth_bonus=None, force_width=None):
+    """cu13 + cutlass image: same bench, for testing the fa4 attention backend."""
+    return _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_size,
+                       num_draft_tokens, samples_base, concurrencies, backend,
+                       mem_fraction, tp, gpu_count, skip_baseline, result_tag,
+                       disable_cuda_graph, tree_algo, depth_bonus, force_width)
+
+
+@app.local_entrypoint()
+def fa4bench(datasets: str = "gsm8k", budget: int = 32, n: int = 80, topk: int = 4,
+             block_size: int = 16):
+    """Test the fa4 attention backend on the tree verify (cu13 image). Runs chain +
+    ours-fused at budget on fa4, conc=1. Compare to the triton/flashinfer numbers."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    configs = [("chain", False, 1, None), ("ours_fused", True, topk, budget)]
+    handles = []
+    for ds in [d.strip() for d in datasets.split(",")]:
+        for label, tv, tk, ndt in configs:
+            tag = f"fa4_{label}_{ds}"
+            print(f">>> spawn {tag} (backend=fa4)")
+            h = fa4_run.spawn("Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", ds, tv, tk,
+                              block_size, ndt, n, "1", "fa4", 0.85, 1, 1, True, tag, False, "fused")
+            handles.append((tag, h))
+    for tag, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/{tag}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE {tag}")
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
 
 
 @app.function(gpu="B200", timeout=1200, image=base_image,
@@ -187,6 +311,259 @@ def debug(target_model="Qwen/Qwen3-8B", draft_model="z-lab/Qwen3-8B-DFlash-b16",
     return ">>> debug done (see container logs above)"
 
 
+@app.local_entrypoint()
+def domino(datasets: str = "gsm8k,math500", n: int = 80, block_size: int = 16,
+           backend: str = "triton"):
+    """Domino GRU-rollout chain vs z-lab DFlash block-parallel chain, OUR v2 engine.
+
+    conc=1, CHAIN verify. Reports accept_len + tok/s for both drafts on each
+    dataset. gsm8k accept is CONTAMINATED for Domino (training overlap) -> read
+    math500 for the fair ~0.2 acc signal. Net tok/s captures GRU rollout overhead.
+    """
+    os.makedirs("v2_tree_results", exist_ok=True)
+    # (label, draft_model). Both chain (tree_verify=False, topk=1, ndt=None).
+    drafts = [
+        ("zlab_dflash", "z-lab/Qwen3-8B-DFlash-b16"),
+        ("domino", "Huang2020/Qwen3-8B-Domino-b16"),
+    ]
+    handles = []
+    for ds in [d.strip() for d in datasets.split(",")]:
+        for label, draft in drafts:
+            tag = f"domino_{label}_{ds}"
+            print(f">>> spawn {tag} (draft={draft}, backend={backend}, chain)")
+            h = run.spawn("Qwen/Qwen3-8B", draft, ds, False, 1, block_size,
+                          None, n, "1", backend, 0.8, 1, 1, True, tag, False, "fused")
+            handles.append((tag, h))
+    for tag, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/{tag}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE {tag}")
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
+
+
+@app.local_entrypoint()
+def domino_time(dataset: str = "gsm8k", n: int = 40, block_size: int = 16,
+                backend: str = "triton"):
+    """Isolate the draft-step cost: CUDA-event us/step for GRU rollout vs DFlash
+    sample (SGLANG_DOMINO_TIME_DRAFT=1). Look for [DRAFT-TIME] lines in logs."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    drafts = [
+        ("zlab_dflash", "z-lab/Qwen3-8B-DFlash-b16"),
+        ("domino", "Huang2020/Qwen3-8B-Domino-b16"),
+    ]
+    handles = []
+    for label, draft in drafts:
+        tag = f"dtime_{label}_{dataset}"
+        print(f">>> spawn {tag} (time-draft, draft={draft})")
+        h = time_run.spawn("Qwen/Qwen3-8B", draft, dataset, block_size, n, backend, tag)
+        handles.append((tag, h))
+    for tag, h in handles:
+        try:
+            print(f">>> DONE {tag}\n{h.get()}")
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
+
+
+@app.function(gpu="B200", timeout=3600, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def time_run(target_model, draft_model, data_name, block_size, n, backend, result_tag):
+    """Run the chain bench with SGLANG_DOMINO_TIME_DRAFT=1 so the worker logs
+    mean us/step for the draft generation. Returns the captured [DRAFT-TIME] lines."""
+    import sys, importlib.util, io, contextlib
+    os.environ["SGLANG_DFLASH_TREE_VERIFY"] = "0"
+    os.environ["SGLANG_DFLASH_TREE_ALGO"] = "fused"
+    os.environ["DFLASH_DRAFT_ATTN_BACKEND"] = backend
+    os.environ["SGLANG_DOMINO_TIME_DRAFT"] = "1"
+    args = [
+        "bench_dflash_sweep.py", "--data-names", data_name,
+        "--target-model", target_model, "--draft-model", draft_model,
+        "--tp-sizes", "1", "--concurrencies", "1",
+        "--samples-per-concurrency-base", str(n),
+        "--max-samples-per-config", str(n * 4), "--max-new-tokens", "512",
+        "--attention-backends", backend, "--mem-fraction-static", "0.8",
+        "--speculative-eagle-topk", "1", "--speculative-dflash-block-size", str(block_size),
+        "--max-running-requests", "1", "--skip-baseline",
+        "--output-md", "/root/out_time.md",
+    ]
+    os.chdir("/root")
+    sys.argv = args
+    spec = importlib.util.spec_from_file_location(
+        "bench", "/root/benchmark/dflash/bench_dflash_sweep.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["bench"] = mod
+    spec.loader.exec_module(mod)
+    mod.main()
+    with open("/root/out_time.md") as f:
+        table = _tables(f.read())
+    return f"(see [DRAFT-TIME] lines in container logs)\n{table}"
+
+
+@app.local_entrypoint()
+def domino_opt(datasets: str = "math500", n: int = 80, backend: str = "triton"):
+    """Optimization sweep: Domino chain with candidate_pool in {2048(default),0(full-vocab
+    fused, skips per-step eager topk)}. Lossless check = accept_len must match. Reports
+    tok/s + accept for each pool on each dataset, vs the z-lab DFlash baseline."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    DOM = "Huang2020/Qwen3-8B-Domino-b16"
+    handles = []
+    for ds in [d.strip() for d in datasets.split(",")]:
+        for pool in ("2048", "0"):
+            tag = f"dopt_pool{pool}_{ds}"
+            print(f">>> spawn {tag} (cand_pool={pool})")
+            h = run_env.spawn("Qwen/Qwen3-8B", DOM, ds, n, backend, tag,
+                              {"DFLASH_DOMINO_CANDIDATE_POOL": pool})
+            handles.append((tag, h))
+    for tag, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/{tag}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE {tag}")
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def ab_samecard(datasets: str = "math500,mbpp", n: int = 128, backend: str = "triton",
+                concs: str = "1"):
+    """SAME-CARD A/B across CONCURRENCY: one container, sequential server launches —
+    z-lab DFlash chain then optimized Domino chain (cand_pool=0). For each (dataset,
+    conc) reports tok/s, accept, per-FORWARD ms. Same B200. concs = "1,8,32"."""
+    import subprocess, time, signal, json, urllib.request, os as _os
+    from concurrent.futures import ThreadPoolExecutor
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    target = "Qwen/Qwen3-8B"
+    DOM = "Huang2020/Qwen3-8B-Domino-b16"; ZLAB = "z-lab/Qwen3-8B-DFlash-b16"
+    conc_list = [int(c) for c in str(concs).split(",")]
+    max_conc = max(conc_list)
+    print("GPU:", subprocess.run(["nvidia-smi","--query-gpu=name,uuid","--format=csv,noheader"],
+          capture_output=True, text=True).stdout.strip(), flush=True)
+    tok = AutoTokenizer.from_pretrained(target)
+    fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    def load(ds_name, k):
+        if ds_name == "math500":
+            d = load_dataset("HuggingFaceH4/MATH-500", split="test").select(range(k))
+            return [x["problem"] for x in d]
+        if ds_name == "mbpp":
+            d = load_dataset("google-research-datasets/mbpp", "sanitized", split="test").select(range(k))
+            return [x["prompt"] for x in d]
+        d = load_dataset("openai/gsm8k","main",split="test").select(range(k))
+        return [x["question"] for x in d]
+
+    def launch(draft, pool):
+        env = dict(_os.environ)
+        env["SGLANG_DFLASH_TREE_VERIFY"] = "0"; env["SGLANG_DFLASH_BLOCK_VERIFY"] = "1"
+        env["DFLASH_DRAFT_ATTN_BACKEND"] = backend
+        if pool is not None: env["DFLASH_DOMINO_CANDIDATE_POOL"] = str(pool)
+        server = ["python","-m","sglang.launch_server","--model-path",target,"--trust-remote-code",
+                  "--mem-fraction-static","0.85","--max-running-requests",str(max_conc),
+                  "--cuda-graph-max-bs",str(max_conc),
+                  "--attention-backend",backend,"--speculative-algorithm","DFLASH",
+                  "--speculative-draft-model-path",draft,"--speculative-dflash-block-size","16",
+                  "--speculative-eagle-topk","1","--port","30000"]
+        srv = subprocess.Popen(server, env=env)
+        for _ in range(300):
+            try: urllib.request.urlopen("http://127.0.0.1:30000/health",timeout=2); return srv
+            except Exception: time.sleep(2)
+        srv.send_signal(signal.SIGINT); return None
+
+    def send(p):
+        req=urllib.request.Request("http://127.0.0.1:30000/generate",
+            data=json.dumps({"text":p,"sampling_params":{"temperature":0.0,"max_new_tokens":512}}).encode(),
+            headers={"Content-Type":"application/json"})
+        return json.loads(urllib.request.urlopen(req,timeout=900).read())
+
+    def bench(prompts, conc):
+        # warmup 2 serial
+        send(prompts[0]); send(prompts[1])
+        t0=time.perf_counter(); toks=0; fwd=0; accs=[]
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            for r in ex.map(send, prompts):
+                m=r["meta_info"]; toks+=m["completion_tokens"]; vc=m.get("spec_verify_ct")
+                if vc: fwd+=vc; accs.append(m["completion_tokens"]/vc)
+        dt=time.perf_counter()-t0
+        return {"tok_s":round(toks/dt,1),"accept":round(sum(accs)/len(accs),3) if accs else None,
+                "per_forward_ms":round(dt/fwd*1000,3) if fwd else None,"forward_ct":fwd,"secs":round(dt,1)}
+
+    out={}
+    for ds_name in [d.strip() for d in datasets.split(",")]:
+        prompts=[tok.apply_chat_template([{"role":"user","content":fmt.format(q=q)}],
+                 tokenize=False,add_generation_prompt=True,enable_thinking=False) for q in load(ds_name,n)]
+        out[ds_name]={}
+        for label, draft, pool in (("dflash",ZLAB,None),("domino_opt",DOM,0)):
+            srv = launch(draft, pool)
+            if srv is None:
+                for c in conc_list: out[ds_name].setdefault(str(c),{})[label]={"error":"server down"}
+                continue
+            for c in conc_list:
+                res = bench(prompts, c)
+                out[ds_name].setdefault(str(c),{})[label]=res
+                print(f"  [{ds_name} conc={c}] {label}: {res}", flush=True)
+            srv.send_signal(signal.SIGINT); time.sleep(4)
+            try: srv.wait(timeout=10)
+            except Exception: srv.kill()
+            time.sleep(3)
+        print(f"\n### {ds_name} SAME-CARD conc sweep", flush=True)
+        for c in conc_list:
+            df=out[ds_name][str(c)].get("dflash",{}); do=out[ds_name][str(c)].get("domino_opt",{})
+            if df.get("tok_s") and do.get("tok_s"):
+                ratio=do["tok_s"]/df["tok_s"]
+                print(f"  conc={c:3d}: DFlash {df['tok_s']:8.1f} (acc {df['accept']}) | "
+                      f"Domino {do['tok_s']:8.1f} (acc {do['accept']}) | ratio {ratio:.3f} ({(ratio-1)*100:+.1f}%)", flush=True)
+    json.dump(out, open("/results/ab_concsweep.json","w"), indent=2); results_vol.commit()
+    return json.dumps(out, indent=2)
+
+
+@app.local_entrypoint()
+def absame(datasets: str = "math500,mbpp", n: int = 128, concs: str = "1,8,32"):
+    print(ab_samecard.remote(datasets, n, "triton", concs))
+
+
+@app.local_entrypoint()
+def domino_final(datasets: str = "math500,mt-bench,mbpp", n: int = 80, backend: str = "triton"):
+    """FINAL: optimized Domino chain (cand_pool=0 + out= graph-buffer writes) vs z-lab
+    DFlash chain, conc=1, n>=80, per clean dataset. Reports tok/s + accept for both."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    DOM = "Huang2020/Qwen3-8B-Domino-b16"; ZLAB = "z-lab/Qwen3-8B-DFlash-b16"
+    handles = []
+    for ds in [d.strip() for d in datasets.split(",")]:
+        h_df = run.spawn("Qwen/Qwen3-8B", ZLAB, ds, False, 1, 16, None, n, "1",
+                         backend, 0.8, 1, 1, True, f"fin_dflash_{ds}", False, "fused")
+        h_do = run_env.spawn("Qwen/Qwen3-8B", DOM, ds, n, backend, f"fin_domino_{ds}",
+                             {"DFLASH_DOMINO_CANDIDATE_POOL": "0"})
+        handles += [(f"fin_dflash_{ds}", h_df), (f"fin_domino_{ds}", h_do)]
+    for tag, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/{tag}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE {tag}")
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def run_env(target_model, draft_model, data_names, n, backend, result_tag, extra_env):
+    """Chain bench (conc=1) with extra env vars applied (for opt sweeps)."""
+    for k, v in (extra_env or {}).items():
+        os.environ[k] = str(v)
+    return _bench_impl(target_model, draft_model, data_names, False, 1, 16,
+                       None, n, "1", backend, 0.8, 1, 1, True, result_tag,
+                       False, "fused", None, None)
+
+
 def _tables(res):
     """Pull the per-conc accept-length and tok/s table rows (tp=1) for a quick echo."""
     out = []
@@ -236,6 +613,118 @@ def throughput(target_model: str = "Qwen/Qwen3-8B",
 
 
 @app.local_entrypoint()
+def compare(datasets: str = "gsm8k,math500,mt-bench", budget: int = 32, n: int = 128,
+            backend: str = "triton", topk: int = 4, block_size: int = 16,
+            target_model: str = "Qwen/Qwen3-8B",
+            draft_model: str = "z-lab/Qwen3-8B-DFlash-b16"):
+    """Four-way comparison (sglang side: chain / ours-fused / ddtree) at conc=1,
+    best budget, triton verify, across datasets. n samples per dataset (mt-bench
+    caps at its 80). Throughput + accept. Detach-friendly: spawns all 3 in parallel.
+    JetSpec side runs separately via modal_vllm_jetspec.py::compare."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    configs = [
+        ("chain",      False, 1,    None,   "fused"),
+        ("ours_fused", True,  topk, budget, "fused"),
+        ("ddtree",     True,  topk, budget, "ddtree"),
+    ]
+    # Spawn EVERY (method x dataset) as its own AWS B200 container -> max parallelism.
+    # Same GPU model + same cloud (aws) controls hardware; conc=1 greedy is deterministic.
+    handles = []
+    for ds in [d.strip() for d in datasets.split(",")]:
+        for label, tv, tk, ndt, algo in configs:
+            tag = f"cmp_{label}_{ds}"
+            print(f">>> spawn {tag} budget={budget} n={n} backend={backend}")
+            h = run.spawn(target_model, draft_model, ds, tv, tk, block_size,
+                          ndt, n, "1", backend, 0.85, 1, 1, True,
+                          tag, False, algo)
+            handles.append((tag, h))
+    for tag, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/{tag}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE {tag}")
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
+
+
+@app.local_entrypoint()
+def kbench(dataset: str = "gsm8k", n: int = 80, topk: int = 4, block_size: int = 16):
+    """Verify-kernel x budget: does fa4 handle the big (b128) tree better than triton/
+    flashinfer? If a kernel keeps b128 fast, b128's higher acc -> higher throughput
+    (jetspec-style). ours-fused, conc=1. fa4 runs on cu13 fa4_image; others on cu12."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    combos = [  # (backend, budget, fn)
+        ("triton", 32, run), ("triton", 128, run),
+        ("flashinfer", 128, run),
+        ("fa4", 32, fa4_run), ("fa4", 128, fa4_run),
+    ]
+    handles = []
+    for bk, bud, fn in combos:
+        tag = f"kb_{dataset}_{bk}_b{bud}"
+        h = fn.spawn("Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", dataset, True, topk,
+                     block_size, bud, n, "1", bk, 0.85, 1, 1, True, tag, False, "fused")
+        handles.append((tag, h))
+    for tag, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/{tag}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE {tag}"); print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED {tag}: {e}")
+
+
+@app.local_entrypoint()
+def bsweep(dataset: str = "gsm8k", budgets: str = "32,48,64", n: int = 128,
+           topk: int = 4, block_size: int = 16):
+    """ours-fused budget sweep at conc=1 (triton). Tests whether a bigger verify tree
+    raises acc ~for free (memory-bound 8B verify) -> higher throughput. Each its own
+    B200 (unpinned). budget = num_draft_tokens."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    handles = []
+    for b in [int(x) for x in budgets.split(",")]:
+        tag = f"bsw_{dataset}_b{b}"
+        h = run.spawn("Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", dataset, True, topk,
+                      block_size, b, n, "1", "triton", 0.85, 1, 1, True, tag, False, "fused")
+        handles.append((b, h))
+    for b, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/bsw_{dataset}_b{b}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE b{b}"); print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED b{b}: {e}")
+
+
+@app.local_entrypoint()
+def ddtree_width(dataset: str = "gsm8k", budget: int = 32, n: int = 80,
+                 widths: str = "6,16,32", topk: int = 4, block_size: int = 16):
+    """Sweep ddtree's build/sample width (force_width). Official DDTree uses
+    topk=min(budget,V) i.e. width≈budget; our default caps at ~3-6. Tests whether a
+    faithful wide DDTree heap gets higher accept than ours-fused. triton verify, conc=1."""
+    os.makedirs("v2_tree_results", exist_ok=True)
+    handles = []
+    for w in [x.strip() for x in widths.split(",")]:
+        tag = f"ddw_{dataset}_fw{w}"
+        print(f">>> spawn {tag} (ddtree force_width={w})")
+        h = run.spawn("Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", dataset, True, topk,
+                      block_size, budget, n, "1", "triton", 0.85, 1, 1, True, tag, False,
+                      "ddtree", None, int(w))
+        handles.append((w, h))
+    for w, h in handles:
+        try:
+            res = h.get()
+            with open(f"v2_tree_results/ddw_{dataset}_fw{w}.md", "w") as f:
+                f.write(res)
+            print(f">>> DONE fw{w}")
+            print(_tables(res))
+        except Exception as e:
+            print(f">>> FAILED fw{w}: {e}")
+
+
+@app.local_entrypoint()
 def ddtree_bench(target_model: str = "Qwen/Qwen3-8B",
                  draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
                  data_names: str = "gsm8k",
@@ -250,14 +739,21 @@ def ddtree_bench(target_model: str = "Qwen/Qwen3-8B",
     for b in budget_list:
         configs.append((f"tree_fused_b{b}", True, topk, b, "fused"))
         configs.append((f"tree_ddtree_b{b}", True, topk, b, "ddtree"))
+    # Spawn all configs concurrently (each its own GPU container) instead of serial
+    # .remote() — wall-clock ~= one config's boot+run, not the sum of all seven.
+    handles = []
     for label, tv, tk, ndt, algo in configs:
-        print(f">>> {label} algo={algo} conc={concurrencies} backend={backend}")
+        print(f">>> spawn {label} algo={algo} conc={concurrencies} backend={backend}")
+        h = run.spawn(target_model, draft_model, data_names, tv, tk,
+                      block_size, ndt, 32, concurrencies, backend,
+                      0.85, 1, 1, True, f"ddt_{label}", False, algo)
+        handles.append((label, h))
+    for label, h in handles:
         try:
-            res = run.remote(target_model, draft_model, data_names, tv, tk,
-                             block_size, ndt, 32, concurrencies, backend,
-                             0.85, 1, 1, True, f"ddt_{label}", False, algo)
+            res = h.get()
             with open(f"v2_tree_results/ddt_{label}_{data_names.replace(',','-')}.md", "w") as f:
                 f.write(res)
+            print(f">>> DONE {label}")
             print(_tables(res))
         except Exception as e:
             print(f">>> FAILED {label}: {e}")
@@ -294,7 +790,7 @@ def ddtree_ablate(target_model: str = "Qwen/Qwen3-8B",
 def profile_decode(tree_verify: bool, topk: int, budget: int, tag: str,
                    target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
                    block_size: int = 16, n_prof_reqs: int = 6, disable_cuda_graph: bool = False,
-                   overlap: bool = False):
+                   overlap: bool = False, backend: str = "flashinfer"):
     """Launch v2-port server (DFLASH chain or tree), drive sglang's torch profiler
     over a few gsm8k decodes, then analyze the trace: GPU-busy vs wall (util),
     top GPU kernels, top CPU ops. This catches launch/CPU-bound overhead that
@@ -310,7 +806,7 @@ def profile_decode(tree_verify: bool, topk: int, budget: int, tag: str,
     # tree-verify is gated by env (bypasses the block_size==num_draft_tokens check)
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "0" if tree_verify else "1"
-    env["DFLASH_DRAFT_ATTN_BACKEND"] = "flashinfer"
+    env["DFLASH_DRAFT_ATTN_BACKEND"] = backend
     spec = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
             "--speculative-dflash-block-size", str(block_size),
             "--speculative-eagle-topk", str(topk if tree_verify else 1)]
@@ -320,7 +816,7 @@ def profile_decode(tree_verify: bool, topk: int, budget: int, tag: str,
             spec += ["--disable-overlap-schedule"]
     server = ["python", "-m", "sglang.launch_server", "--model-path", target,
               "--trust-remote-code", "--mem-fraction-static", "0.85",
-              "--max-running-requests", "1", "--attention-backend", "flashinfer",
+              "--max-running-requests", "1", "--attention-backend", backend,
               *spec, "--port", "30000"]
     if disable_cuda_graph:
         server.append("--disable-cuda-graph")
@@ -497,6 +993,31 @@ def qbfull(n: int = 48):
         for name, r in rows.items():
             d = json.loads(r)
             if d.get("tok_s"): print(f"{name}: {d['tok_s']} tok/s (acc {d.get('accept_len')})  vs chain = {100*(d['tok_s']/ch-1):+.1f}%")
+
+
+@app.local_entrypoint()
+def profdomino():
+    """Profile Domino chain vs z-lab DFlash chain (both triton, conc=1) to break the
+    per-step into backbone / lm_head / GRU-rollout. Look at top_gpu_kernels +
+    top_cpu_ops (domino_* record_function spans) in the printed/persisted summary."""
+    DOM = "Huang2020/Qwen3-8B-Domino-b16"
+    ZLAB = "z-lab/Qwen3-8B-DFlash-b16"
+    h_dflash = profile_decode.spawn(False, 1, 16, "pd_dflash_chain", draft=ZLAB, backend="triton")
+    h_domino = profile_decode.spawn(False, 1, 16, "pd_domino_chain", draft=DOM, backend="triton")
+    for name, h in (("dflash", h_dflash), ("domino", h_domino)):
+        try:
+            import json
+            s = json.loads(h.get())
+            print(f"\n===== {name} chain (triton) =====")
+            print(f"wall_us={s.get('wall_us')} gpu_busy_us={s.get('gpu_busy_us')} util={s.get('gpu_util_pct')}%")
+            print("-- top_gpu_kernels --")
+            for k in s.get("top_gpu_kernels", [])[:12]:
+                print(f"   {k['us']:>9.1f}us  {k['name']}")
+            print("-- top_cpu_ops (incl domino_* spans) --")
+            for k in s.get("top_cpu_ops", [])[:14]:
+                print(f"   {k['us']:>9.1f}us  {k['name']}")
+        except Exception as e:
+            print(f"{name} FAILED: {e}")
 
 
 @app.local_entrypoint()
