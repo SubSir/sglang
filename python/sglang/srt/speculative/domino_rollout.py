@@ -686,8 +686,13 @@ class DFlashDominoRollout:
         local_gru_input_table: Optional[torch.Tensor] = None,
         org_vocab_start: int = 0,
         num_org: int = 0,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Initialize the Domino prefix GRU state from [verified, first draft]."""
+        """Initialize the Domino prefix GRU state from [verified, first draft].
+
+        When ``out`` is given the final hidden state is written into it in place
+        (lets the caller hand the graph's static gru_h buffer directly).
+        """
 
         if full_gru_input_table is None and local_gru_input_table is None:
             if embed_module is None:
@@ -695,7 +700,11 @@ class DFlashDominoRollout:
                     "DFLASH Domino prefix init requires embeddings or a GRU input table."
                 )
             prefix_embeds = embed_module(prefix_ids).to(z_dtype)
-            return self.domino_helper.init_gru_hidden(prefix_embeds)
+            gru_h = self.domino_helper.init_gru_hidden(prefix_embeds)
+            if out is not None:
+                out.copy_(gru_h)
+                return out
+            return gru_h
 
         if full_gru_input_table is not None:
             prefix_gi = self._domino_lookup_gru_input_proj_full(
@@ -723,6 +732,9 @@ class DFlashDominoRollout:
                 gru_h=gru_h,
                 state=state,
             )
+        if out is not None:
+            out.copy_(gru_h)
+            return out
         return gru_h
 
     def _domino_manual_gru_step_from_input_proj(
@@ -1056,12 +1068,35 @@ class DFlashDominoRollout:
             embed_module.weight
         )
 
-        # Original eager-prologue path.
+        # Fetch the graph entry FIRST so the eager prologue can compute its outputs
+        # straight into the graph's static input buffers (no post-hoc .copy_).
+        logits_dtype = z_for_dtype.dtype if z_for_dtype.dtype == weight.dtype else z.dtype
+        graph_entry = self._get_or_capture_domino_loop_graph(
+            bs=bs,
+            num_draft=num_draft,
+            emb_dim=emb_dim,
+            gru_hidden=G,
+            num_org=num_org,
+            org_vocab_start=org_vocab_start,
+            z_dtype=z.dtype,
+            logits_dtype=weight.dtype,
+            device=device,
+            state=state,
+            gru_input_table=gru_input_table,
+            candidate_pool_size=candidate_pool_size,
+        )
+        base_logits_buf = graph_entry["base_logits_buf"]
+        z_proj_buf = graph_entry["z_proj_buf"]
+        gru_h_buf = graph_entry["gru_h_buf"]
+        out_buf = graph_entry["out_buf"]
+
+        # Opt: write base_logits + z_proj directly into the graph buffers via out=,
+        # removing the two largest post-hoc copies (base_logits is [bs,15,vocab]).
         with torch.profiler.record_function("domino_prologue_base_logits"):
             z_flat = z_for_dtype.reshape(bs * num_draft, hidden_size)
-            base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
-                bs, num_draft, num_org
-            )
+            base_logits = base_logits_buf.view(bs * num_draft, num_org)
+            torch.matmul(z_flat, weight[:num_org].T, out=base_logits)
+            base_logits = base_logits_buf  # [bs, num_draft, num_org]
 
         with torch.profiler.record_function("domino_prologue_candidate_topk"):
             candidate_ids = None
@@ -1074,42 +1109,34 @@ class DFlashDominoRollout:
                 candidate_ids = torch.topk(
                     pool_logits, k=candidate_pool_size, dim=-1
                 ).indices.contiguous()
+                graph_entry["candidate_ids_buf"].copy_(candidate_ids)
 
             slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
             slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
 
         with torch.profiler.record_function("domino_prologue_gru_init"):
-            gru_h = self._init_domino_prefix_gru_hidden(
+            self._init_domino_prefix_gru_hidden(
                 prefix_ids=torch.stack([verified_id.to(torch.long), slot_1], dim=1),
                 z_dtype=z.dtype,
                 device=device,
                 state=state,
                 embed_module=embed_module,
+                out=gru_h_buf,
             )
+            # z @ w_z (+b1) straight into the graph buffer.
+            z_proj_flat = z_proj_buf.view(bs * num_draft, emb_dim)
+            if state["b1"] is not None:
+                torch.addmm(
+                    state["b1"], z.reshape(bs * num_draft, hidden_size),
+                    state["w_z"].T, out=z_proj_flat,
+                )
+            else:
+                torch.matmul(
+                    z.reshape(bs * num_draft, hidden_size), state["w_z"].T,
+                    out=z_proj_flat,
+                )
 
-            z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
-
-        graph_entry = self._get_or_capture_domino_loop_graph(
-            bs=bs,
-            num_draft=num_draft,
-            emb_dim=emb_dim,
-            gru_hidden=G,
-            num_org=num_org,
-            org_vocab_start=org_vocab_start,
-            z_dtype=z.dtype,
-            logits_dtype=base_logits.dtype,
-            device=device,
-            state=state,
-            gru_input_table=gru_input_table,
-            candidate_pool_size=candidate_pool_size,
-        )
         with torch.profiler.record_function("domino_graph_copy_and_replay"):
-            graph_entry["z_proj_buf"].copy_(z_proj_all)
-            graph_entry["base_logits_buf"].copy_(base_logits)
-            if candidate_ids is not None:
-                graph_entry["candidate_ids_buf"].copy_(candidate_ids)
-            graph_entry["gru_h_buf"].copy_(gru_h)
-            graph_entry["out_buf"][:, 0].copy_(slot_1)
+            out_buf[:, 0].copy_(slot_1)
             graph_entry["graph"].replay()
-        out = graph_entry["out_buf"]
-        return out
+        return out_buf
