@@ -63,7 +63,8 @@ def _write_mt_bench_jsonl(path: str) -> int:
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def bench(dynamic, concurrency: int, num_prompts: int = 512,
           max_new_tokens: int = 1024, mem_fraction: float = 0.75,
-          vbs_margin: float = 2.0, vbs_stat: str = "mean"):
+          vbs_margin: float = 2.0, vbs_stat: str = "mean",
+          vbs_min_bs: int = 48, vbs_probe: int = 0):
     """dynamic: None|True|False -> see module docstring."""
     import subprocess, signal, time, statistics
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -96,7 +97,10 @@ def bench(dynamic, concurrency: int, num_prompts: int = 512,
     env = dict(os.environ); env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
     env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
     env["SGLANG_DFLASH_VBS_STAT"] = str(vbs_stat)
-    print(">>> SERVER:", " ".join(cmd), f"(margin={vbs_margin} stat={vbs_stat})", flush=True)
+    env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
+    env["SGLANG_DFLASH_VBS_PROBE"] = str(vbs_probe)
+    print(">>> SERVER:", " ".join(cmd),
+          f"(margin={vbs_margin} stat={vbs_stat} min_bs={vbs_min_bs} probe={vbs_probe})", flush=True)
     srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
 
     base = "http://127.0.0.1:30000"
@@ -270,7 +274,8 @@ def final(concurrencies: str = "1,32,64,128", num_prompts: int = 1024,
 @app.function(gpu="B200", cloud="aws", timeout=3600, image=image,
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def profile(dynamic, concurrency: int = 32, capture_secs: float = 4.0,
-            mem_fraction: float = 0.75):
+            mem_fraction: float = 0.75, vbs_margin: float = 0.0,
+            vbs_stat: str = "mean", vbs_min_bs: int = 2):
     """Torch-profiler (NOT cuda-event) trace of steady-state decode at `concurrency`.
     Returns GPU-busy vs wall (idle% = CPU-bound bubbles) + top GPU kernels, so we can
     see what fraction is the target verify and whether the dynamic path stalls the GPU.
@@ -302,6 +307,9 @@ def profile(dynamic, concurrency: int = 32, capture_secs: float = 4.0,
     env = dict(os.environ)
     env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
     env["SGLANG_TORCH_PROFILER_DIR"] = prof_dir
+    env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
+    env["SGLANG_DFLASH_VBS_STAT"] = str(vbs_stat)
+    env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
     print(">>> SERVER:", " ".join(cmd), flush=True)
     srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
     base = "http://127.0.0.1:30000"
@@ -432,9 +440,10 @@ def _mode(s):
 
 @app.local_entrypoint()
 def one(dynamic_mode: str = "none", concurrency: int = 1, num_prompts: int = 512,
-        vbs_margin: float = 1.0, vbs_stat: str = "mean"):
+        vbs_margin: float = 1.0, vbs_stat: str = "mean", vbs_min_bs: int = 48,
+        vbs_probe: int = 0):
     print(bench.remote(_mode(dynamic_mode), concurrency, num_prompts, 1024, 0.75,
-                       vbs_margin, vbs_stat))
+                       vbs_margin, vbs_stat, vbs_min_bs, vbs_probe))
 
 
 @app.local_entrypoint()

@@ -235,6 +235,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Batch statistic over per-request raw VBS: "mean" (more truncation, more
         # throughput) or a percentile in [0,1] like "0.75"/"0.9" (less accept drop).
         self.dynamic_verify_stat = os.environ.get("SGLANG_DFLASH_VBS_STAT", "mean")
+        # Diagnostic: run the FULL dynamic path (confidence, packing, gather) but
+        # remove the per-step GPU->CPU syncs and DON'T truncate (full block). Isolates
+        # the host-sync cost from the rest of the dynamic compute.
+        self._vbs_probe = os.environ.get("SGLANG_DFLASH_VBS_PROBE", "0") == "1"
         # Verify-token accounting (host-side ints only -> no extra device sync):
         # actual = sum(bs*verify_len), full = sum(bs*block_size) (what no-dynamic runs).
         self._vbs_tok_actual = 0  # padded (GEMM) verify tokens = sum(bs*effective_tpbs)
@@ -675,6 +679,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             .clamp_(self.dynamic_verify_buckets[0], block)
             .to(torch.int32)
         )
+        if self._vbs_probe:
+            # Keep all the GPU compute above, but skip the host sync and use a fixed
+            # full-block shape (no truncation). per_req_vbs forced to block so the
+            # packing is a consistent identity; total_real/effective_tpbs are host
+            # constants -> no GPU->CPU sync.
+            per_req_vbs = torch.full((bs,), block, dtype=torch.int32, device=device)
+            cumsum = torch.arange(
+                0, (bs + 1) * block, block, dtype=torch.int32, device=device
+            )
+            return per_req_vbs, cumsum, block, bs * block, block
         cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
         # One host sync for all three scalars.
@@ -1682,7 +1696,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 total_real,
                 max_vbs,
             ) = self._compute_per_request_vbs(draft_conf, bs)
-            if effective_tpbs < block_size:
+            if effective_tpbs < block_size or self._vbs_probe:
                 tight = True
                 total_padded = bs * effective_tpbs
                 verify_len = effective_tpbs
@@ -1908,7 +1922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden_flat = hidden.view(-1, hidden.shape[-1])
 
-        if tight:
+        if tight and not self._vbs_probe:
             # Gather only the committed packed tokens (write flat -> projects just
             # those). Committed mask over packed [0:total_real] built sync-free:
             # packed slot p -> request b (searchsorted) -> committed if its within-
