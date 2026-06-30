@@ -246,6 +246,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        # --- DFLASH dynamic-VBS verify buckets -------------------------
+        # The target verify forward may run a shorter block than num_tokens_per_bs
+        # (dynamic-VBS truncation). Capture a graph per tokens-per-bs bucket so the
+        # truncated verify replays on a graph instead of falling back to eager.
+        # Only the target worker truncates; everything else keeps a single bucket so
+        # behavior is byte-identical for non-dflash / draft-worker / non-dynamic.
+        self.dflash_vbs_tpbs_buckets = [self.num_tokens_per_bs]
+        if (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and getattr(
+                model_runner.server_args, "speculative_dflash_dynamic_vbs", False
+            )
+        ):
+            _blk = self.num_tokens_per_bs
+            self.dflash_vbs_tpbs_buckets = sorted(
+                {b for b in (4, 6, 8, 12, _blk) if 1 <= b <= _blk}
+            )
+
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
@@ -386,6 +405,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=variant_label,
         )
 
+    def _replay_tpbs(self, forward_batch: ForwardBatch) -> int:
+        """tokens-per-bs of this forward. With DFLASH dynamic-VBS the verify block
+        may be a smaller captured bucket; otherwise it's the fixed num_tokens_per_bs.
+        """
+        if len(self.dflash_vbs_tpbs_buckets) <= 1:
+            return self.num_tokens_per_bs
+        bs = forward_batch.batch_size
+        numel = int(forward_batch.input_ids.numel())
+        if bs > 0 and numel % bs == 0:
+            tpbs = numel // bs
+            if tpbs in self.dflash_vbs_tpbs_buckets:
+                return tpbs
+        return self.num_tokens_per_bs
+
+    def _vbs_variant(self, tpbs: int, base_variant: Optional[str] = None):
+        """Graph variant label for a tpbs bucket (None when single-bucket so
+        non-dflash paths keep their existing lora/None variant labels)."""
+        if len(self.dflash_vbs_tpbs_buckets) <= 1:
+            return base_variant
+        return f"tpbs{tpbs}"
+
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
             return None
@@ -449,22 +489,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        # NGRAM and DFLASH may submit fewer tokens than the captured
-        # num_tokens_per_bs (DFLASH dynamic-VBS truncates the verify block). The
-        # graph buffers are sized for the full block, so a short batch must fall
-        # back to eager instead of matching the same-bs graph. Non-truncated
-        # batches satisfy this equality, so behavior is unchanged for them.
-        is_token_count_supported = (
-            (
+        # NGRAM submits fewer tokens than num_tokens_per_bs and has no per-bucket
+        # graphs -> require the full token count. DFLASH dynamic-VBS truncates the
+        # verify block but captures a graph per bucket, so accept any batch whose
+        # tokens-per-bs is a captured bucket (the variant is selected in load_batch);
+        # other token counts fall back to eager.
+        if self.model_runner.spec_algorithm.is_dflash():
+            bs_ = forward_batch.batch_size
+            numel_ = forward_batch.input_ids.numel()
+            is_token_count_supported = (
+                bs_ > 0
+                and numel_ % bs_ == 0
+                and (numel_ // bs_) in self.dflash_vbs_tpbs_buckets
+            )
+        elif self.model_runner.spec_algorithm.is_ngram():
+            is_token_count_supported = (
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
-            if (
-                self.model_runner.spec_algorithm.is_ngram()
-                or self.model_runner.spec_algorithm.is_dflash()
-            )
-            else True
-        )
+        else:
+            is_token_count_supported = True
 
         return (
             is_bs_supported
@@ -512,6 +556,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         size: int,
         stream_idx: Optional[int] = None,
+        tokens_per_bs: Optional[int] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -522,7 +567,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         bs = size
         buffers: DecodeInputBuffers = self.buffers
-        num_tokens = bs * self.num_tokens_per_bs
+        tpbs = tokens_per_bs if tokens_per_bs is not None else self.num_tokens_per_bs
+        num_tokens = bs * tpbs
 
         # Registry-owned FB-shared slots come through the registry (which
         # shares physical storage with self.buffers via source=...); the rest
@@ -588,7 +634,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = self.get_spec_info(num_tokens, tokens_per_bs=tpbs)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -738,15 +784,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+            # Largest bucket first so smaller graphs reuse its memory pool.
+            for tpbs in sorted(self.dflash_vbs_tpbs_buckets, reverse=True):
+                for variant_label, _variant_has_lora in lora_variants:
+                    _set_capture_lora_variant(variant_label)
+                    label = self._vbs_variant(tpbs, variant_label)
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * tpbs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs, forward, stream_idx, label, tokens_per_bs=tpbs
+                        )
 
     def capture_one_shape(
         self,
@@ -754,9 +805,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        tokens_per_bs: Optional[int] = None,
     ):
         bs = size
-        num_tokens = bs * self.num_tokens_per_bs
+        tpbs = tokens_per_bs if tokens_per_bs is not None else self.num_tokens_per_bs
+        num_tokens = bs * tpbs
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if self.model_runner.server_args.debug_cuda_graph:
@@ -765,7 +818,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            size, stream_idx=stream_idx
+            size, stream_idx=stream_idx, tokens_per_bs=tpbs
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -879,17 +932,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            n_tok = self.raw_num_token
+            self.buffers.input_ids[:n_tok].copy_(forward_batch.input_ids)
+            self.buffers.positions[:n_tok].copy_(forward_batch.positions)
             if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
-                )
-            variant_label = self._resolve_lora_variant(forward_batch)
+                self.buffers.input_embeds[:n_tok].copy_(forward_batch.input_embeds)
+            variant_label = self._vbs_variant(
+                self._replay_tpbs(forward_batch),
+                self._resolve_lora_variant(forward_batch),
+            )
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 self.bs, stream_idx, variant_label
@@ -900,12 +955,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        # DFLASH dynamic-VBS: this verify's tokens-per-bs may be a smaller captured
+        # bucket; everything below sizes tokens by it (== num_tokens_per_bs otherwise).
+        replay_tpbs = self._replay_tpbs(forward_batch)
+        raw_num_token = raw_bs * replay_tpbs
 
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
+                max_num_tokens / replay_tpbs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
@@ -920,7 +978,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raw_bs=raw_bs,
             padded_bs=bs,
             raw_num_tokens=raw_num_token,
-            padded_num_tokens=bs * self.num_tokens_per_bs,
+            padded_num_tokens=bs * replay_tpbs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -950,7 +1008,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             buffers=buffers,
             bs=bs,
             raw_bs=raw_bs,
-            num_tokens=bs * self.num_tokens_per_bs,
+            num_tokens=bs * replay_tpbs,
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
@@ -965,7 +1023,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._vbs_variant(
+            replay_tpbs, self._resolve_lora_variant(forward_batch)
+        )
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             self.bs, stream_idx, variant_label
@@ -1028,8 +1088,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, tokens_per_bs: Optional[int] = None):
         spec_info = None
+        _tpbs = tokens_per_bs if tokens_per_bs is not None else self.num_tokens_per_bs
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
@@ -1080,7 +1141,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=_tpbs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

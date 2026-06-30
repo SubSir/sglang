@@ -645,8 +645,15 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        # DFLASH dynamic-VBS captures several verify token-counts per bs, so the
+        # verify (prefill) wrapper metadata is keyed by (bs, num_tokens), not bs:
+        # each token-count gets its own wrapper sized for its qo rows. For decode /
+        # dllm / non-dynamic this is one entry per bs (num_tokens constant), so
+        # behavior is unchanged. Use input_ids (present on both the real
+        # ForwardBatch at capture and the SimpleNamespace fb_view at replay, which
+        # has no `positions`).
+        num_tokens = forward_batch.input_ids.numel()
         if in_capture:
-            num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
         if forward_mode.is_decode_or_idle():
@@ -668,7 +675,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[(bs, num_tokens)],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -680,7 +687,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[(bs, num_tokens)],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
@@ -933,7 +940,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[(bs, num_tokens)] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )

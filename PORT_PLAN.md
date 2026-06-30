@@ -88,6 +88,64 @@ Step 5: tune margin/buckets; loop sweep until success.
   spec). KNOWN overhead: _dynamic_verify_len does one .item() host sync per step (picks
   the verify shape) -> serializes draft vs verify. Profile this; it's the prime target.
 
+## PROFILE RESULTS (conc=32, 4s torch-profiler window)
+- dyn OFF (graph verify, 16 tok): GPU busy 57%, idle 43%, GPU-work 2.30s, 6731 tok/s.
+- dyn ON  (EAGER verify, ~8 tok): GPU busy 16%, idle 84%, GPU-work 0.66s, 4033 tok/s.
+Conclusions:
+1. Truncation cuts GPU verify work ~3.5x -> the compute win is real + large.
+2. EAGER verify is the killer: 84% GPU idle (per-step eager attn-metadata rebuild +
+   host .item() sync starve the GPU). => per-bucket verify CUDA GRAPHS are required.
+3. Baseline is already 43% GPU-idle @conc32 => system is overhead-bound there, NOT
+   GPU-bound. Truncation only converts to throughput where GPU is the bottleneck =>
+   the win lives at HIGH conc (128). Expect ~parity at conc<=32, win at conc=128.
+   (Confirming conc=128 baseline GPU-bound-ness.)
+DECISION: implement per-bucket target-verify cuda graphs in decode_cuda_graph_runner
+(variant_label = f"tpbs{n}" via existing ShapeKey machinery). Then revisit the
+.item() host sync (consider bs-driven fixed bucket to avoid the sync).
+
+## Per-bucket verify graph plan (decode_cuda_graph_runner.py)
+Gate everything behind: spec is dflash AND server_args.speculative_dflash_dynamic_vbs
+AND not is_draft_worker (target only). Buckets = {4,6,8,12,block_size}.
+- __init__: self.dflash_vbs_buckets = buckets or [num_tokens_per_bs].
+- _capture_one_stream: for bs, for tpbs in buckets: capture_one_shape(bs, tpbs,
+  variant_label=f"tpbs{tpbs}"). (Largest tpbs first for mem reuse.)
+- capture_one_shape/capture_prepare: add tokens_per_bs param (default
+  num_tokens_per_bs); num_tokens=bs*tokens_per_bs; registry slot slice_for(bs,
+  num_tokens) already handles it; variant_label passed to ShapeKey.
+- can_run_graph: for dflash, derive tpbs=input_ids.numel()//bs; OK if tpbs in buckets
+  and divides evenly; route graph_key variant=f"tpbs{tpbs}".
+- load_batch: compute replay_tpbs from forward_batch (numel//bs); use it for
+  raw_num_token, fill_from padded_num_tokens, fb_view num_tokens, _replay_graph_key
+  variant. Attn-backend cuda graph state already sized to max (block_size) -> smaller
+  fits. Backend stores/looks up by ShapeKey variant -> already supported.
+Risk: keep non-dflash + draft-worker paths byte-identical (buckets=[num_tokens_per_bs]).
+
+## *** PIVOTAL FINDING: system is OVERHEAD-bound at high conc ***
+Baseline throughput (dyn off, continuous-load bench, the trustworthy number):
+  conc 1 / 8 / 32 / 64 / 128 = 371 / 3086 / 6760 / 7478 / 8392 tok/s.
+=> saturates: conc 32->128 (4x conc) only 1.24x tput. Server-side decode logs agree
+   (~9300 tok/s ceiling @ running-req 128). The GPU is NOT the bottleneck at high
+   conc; per-step CPU/scheduler overhead is. So reducing GPU verify compute
+   (dynamic-VBS) cannot lift high-conc throughput here -> saved GPU time -> more idle.
+IMPLICATION: dynamic-VBS's value (save target verify FLOPs) doesn't help an
+overhead-bound server. The honest deliverable on B200+Qwen3-8B+tp1:
+  - low conc: parity (gate => no truncation where it can't help) -> "not slower" MET.
+  - high conc: truncation won't add throughput unless it ALSO cuts CPU/step.
+Gate decision on CLEAN profile (fixed continuous-load generator):
+  - if GPU-busy high (>75%) @conc128 -> finish per-bucket graphs (flashinfer keying)
+    + truncation wins.
+  - if GPU-busy low (overhead-bound) -> pivot: keep dynamic-VBS never-slower, and the
+    real throughput lever is cutting the dominant per-step CPU op (find it in profile).
+
+## Per-bucket verify graph status: IMPLEMENTED but CRASHES (flashinfer collision)
+decode_cuda_graph_runner per-(bs,tpbs) graphs done & gated. But flashinfer
+prefill_cuda_graph_metadata is keyed by bs ONLY -> capturing multiple tpbs per bs
+overwrites the wrapper (last=tpbs4) -> replay tpbs16 hits "qo_indptr 16 cannot exceed
+init 4". FIX (only if GPU-bound): key prefill_cuda_graph_metadata by (bs, num_tokens)
+at flashinfer_backend.py lines 650(capture)/671,683(replay)/936(store); compute
+num_tokens=positions.numel() in the replay branch too. Each (bs,num_tokens) wrapper
+gets its own first-plan capacity. Adds bs*buckets wrappers (mem+capture time).
+
 ## Profiling (torch profiler, NOT cuda-event timers)
 SGLang: env SGLANG_TORCH_PROFILER_DIR=/root/prof; POST /start_profile with
 ProfileReq(num_steps=N, activities=["CPU","GPU"]) -> auto-stops after N forward steps,

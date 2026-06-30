@@ -222,13 +222,25 @@ def profile(dynamic, concurrency: int = 32, capture_secs: float = 4.0,
         except Exception:
             pass
 
+    # Maintain a constant `concurrency` in-flight (replenish on completion) so the
+    # GPU stays saturated — a batch-and-wait loop sags between batches and inflates
+    # measured GPU-idle. Use many workers + a semaphore to cap concurrency.
     stop = threading.Event()
+    sem = threading.Semaphore(concurrency)
+    def one(i):
+        sem.acquire()
+        try:
+            send(prompts[i % len(prompts)])
+        finally:
+            sem.release()
     def load_loop():
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        with ThreadPoolExecutor(max_workers=concurrency * 2) as pool:
+            i = 0
             while not stop.is_set():
-                list(pool.map(send, prompts[:concurrency]))
+                sem.acquire(); sem.release()  # throttle submission to inflight cap
+                pool.submit(one, i); i += 1
     th = threading.Thread(target=load_loop, daemon=True); th.start()
-    time.sleep(6)  # reach steady-state decode at full concurrency
+    time.sleep(8)  # reach steady-state decode at full concurrency
 
     requests.post(base + "/start_profile",
                   json={"activities": ["CPU", "GPU"]}, timeout=60)
@@ -259,16 +271,26 @@ def _summarize_trace(path: str):
         # fall back: cat may be "Kernel" or use pid/tid lanes; treat cuda category
         kernels = [e for e in evs if e.get("ph") == "X" and "kernel" in str(e.get("cat", "")).lower()]
     cpu_ops = [e for e in evs if e.get("ph") == "X" and e.get("cat") == "cpu_op"]
+    runtime = [e for e in evs if e.get("ph") == "X"
+               and str(e.get("cat", "")).lower() in ("cuda_runtime", "runtime")]
     if not kernels:
         return {"error": "no GPU kernels in trace", "n_events": len(evs)}
     gpu_busy = sum(e.get("dur", 0) for e in kernels)
     t0 = min(e["ts"] for e in kernels)
     t1 = max(e["ts"] + e.get("dur", 0) for e in kernels)
     wall = max(t1 - t0, 1)
-    by = {}
-    for e in kernels:
-        by[e["name"]] = by.get(e["name"], 0) + e.get("dur", 0)
-    top = sorted(by.items(), key=lambda kv: -kv[1])[:18]
+
+    def _topn(events, n=16):
+        by = {}
+        for e in events:
+            by[e["name"]] = by.get(e["name"], 0) + e.get("dur", 0)
+        return [[round(v, 1), k[:74]] for k, v in
+                sorted(by.items(), key=lambda kv: -kv[1])[:n]]
+
+    # CPU self-time per op-name: subtract immediate GPU-launch children isn't tractable
+    # from chrome json cheaply, so report total dur (inclusive) per name + launch count.
+    launch = [e for e in runtime if "launch" in e["name"].lower()
+              or "Launch" in e["name"]]
     return {
         "wall_us": round(wall, 1),
         "gpu_busy_us": round(gpu_busy, 1),
@@ -276,7 +298,13 @@ def _summarize_trace(path: str):
         "gpu_idle_frac": round(1 - gpu_busy / wall, 4),
         "n_kernels": len(kernels),
         "n_cpu_ops": len(cpu_ops),
-        "top_kernels_us": [[round(v, 1), n[:70]] for n, v in top],
+        "n_runtime": len(runtime),
+        "n_launch": len(launch),
+        "launch_us_total": round(sum(e.get("dur", 0) for e in launch), 1),
+        "cpu_op_us_total": round(sum(e.get("dur", 0) for e in cpu_ops), 1),
+        "top_kernels_us": _topn(kernels),
+        "top_cpu_ops_us": _topn(cpu_ops),
+        "top_runtime_us": _topn(runtime, 10),
     }
 
 
