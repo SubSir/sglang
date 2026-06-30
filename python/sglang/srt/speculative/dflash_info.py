@@ -41,10 +41,22 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
+    # --- Per-request dynamic-VBS (tight packing) ---
+    # When set, the verify block is tight-packed: request b contributes
+    # per_request_vbs[b] query tokens (instead of a uniform draft_token_num), so
+    # high-confidence requests keep their full length (accept preserved). The graph
+    # still runs draft_token_num tokens/bs; only the first total_real_tokens are real.
+    per_request_vbs: Optional[torch.Tensor] = None  # [bs] int32
+    per_request_vbs_cumsum: Optional[torch.Tensor] = None  # [bs+1] int32, starts at 0
+    total_real_tokens: int = -1
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+
+    def _is_tight_packed(self) -> bool:
+        return self.per_request_vbs is not None
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -99,20 +111,41 @@ class DFlashVerifyInput(SpecInput):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
 
-        qo_indptr = torch.arange(
-            0,
-            (bs + 1) * self.draft_token_num,
-            step=self.draft_token_num,
-            dtype=torch.int32,
-            device=device,
-        )
+        if self._is_tight_packed():
+            # Ragged per-request query lengths. Pad per_vbs to bs (cuda graph may pad
+            # bs beyond the real batch). Causal attention over (qo segment, kv segment)
+            # reproduces the chain-verify mask, so no custom mask is needed.
+            raw_vbs = self.per_request_vbs
+            if raw_vbs.shape[0] < bs:
+                per_vbs = torch.zeros(bs, dtype=torch.int32, device=device)
+                per_vbs[: raw_vbs.shape[0]] = raw_vbs.to(torch.int32)
+            else:
+                per_vbs = raw_vbs[:bs].to(torch.int32)
+            qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            qo_indptr[1:] = torch.cumsum(per_vbs, dim=0)
+            per_q = per_vbs
+        else:
+            qo_indptr = torch.arange(
+                0,
+                (bs + 1) * self.draft_token_num,
+                step=self.draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            per_q = self.draft_token_num
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+        paged_kernel_lens = paged_kernel_lens + per_q
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Total kv = prefix sum + total query tokens (no host sync).
+        added_q = (
+            int(self.total_real_tokens)
+            if self._is_tight_packed()
+            else self.draft_token_num * bs
+        )
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
+            paged_kernel_lens_sum + added_q,
             dtype=torch.int32,
             device=device,
         )

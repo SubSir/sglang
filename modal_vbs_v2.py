@@ -158,6 +158,107 @@ def bench(dynamic, concurrency: int, num_prompts: int = 512,
     return res
 
 
+@app.function(gpu="B200", cloud="aws", timeout=7200, image=image,
+              secrets=[modal.Secret.from_name("huggingface-secret")])
+def final_bench(concurrency: int, num_prompts: int = 1024,
+                max_new_tokens: int = 1024, mem_fraction: float = 0.75,
+                vbs_margin: float = 2.0, vbs_stat: str = "mean"):
+    """Final fair comparison: run no-dynamic then dynamic SERIALLY on the SAME card,
+    each over `num_prompts` samples (dataset looped). Returns both + ratio."""
+    import subprocess, signal, time, statistics
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from transformers import AutoTokenizer
+    import requests
+
+    _write_mt_bench_jsonl("/root/mt-bench.jsonl")
+    with open("/root/mt-bench.jsonl") as f:
+        dataset = [json.loads(l) for l in f]
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    prompts = []
+    for i in range(num_prompts + concurrency):
+        item = dataset[i % len(dataset)]
+        prompts.append(tok.apply_chat_template(
+            [{"role": "user", "content": item["turns"][0]}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=False))
+
+    def run(dynamic):
+        cmd = [
+            "python", "-m", "sglang.launch_server", "--model-path", MODEL,
+            "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", DRAFT,
+            "--speculative-num-draft-tokens", str(NUM_DRAFT_TOKENS),
+            "--tp-size", "1", "--attention-backend", "flashinfer", "--page-size", "1",
+            "--mem-fraction-static", str(mem_fraction),
+            "--max-running-requests", str(max(concurrency, 1)),
+            "--port", "30000", "--trust-remote-code",
+        ]
+        cmd.append("--speculative-dflash-dynamic-vbs" if dynamic
+                   else "--no-speculative-dflash-dynamic-vbs")
+        env = dict(os.environ); env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+        env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
+        env["SGLANG_DFLASH_VBS_STAT"] = str(vbs_stat)
+        srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
+        base = "http://127.0.0.1:30000"; ready = False
+        for _ in range(300):
+            if srv.poll() is not None: break
+            try:
+                if requests.get(base + "/health", timeout=5).status_code == 200:
+                    ready = True; break
+            except Exception: pass
+            time.sleep(3)
+        if not ready:
+            srv.send_signal(signal.SIGINT); return {"error": "server not ready"}
+
+        def send(p):
+            r = requests.post(base + "/generate", json={"text": p, "sampling_params":
+                {"temperature": 0.0, "top_p": 1.0, "max_new_tokens": max_new_tokens}}, timeout=3600)
+            r.raise_for_status(); o = r.json(); return o if isinstance(o, dict) else o[0]
+        try: requests.get(base + "/flush_cache", timeout=60)
+        except Exception: pass
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(send, prompts[:concurrency]))
+        t0 = time.perf_counter(); total = 0; accs = []
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futs = [pool.submit(send, p) for p in prompts[concurrency:]]
+            for fut in as_completed(futs):
+                m = (fut.result().get("meta_info") or {})
+                total += int(m.get("completion_tokens", 0))
+                if "spec_accept_length" in m:
+                    try: accs.append(float(m["spec_accept_length"]))
+                    except Exception: pass
+        dt = time.perf_counter() - t0
+        srv.send_signal(signal.SIGINT); time.sleep(8)
+        return {"tok_s": round(total / max(dt, 1e-6), 2),
+                "accept_len": round(statistics.mean(accs), 3) if accs else None,
+                "secs": round(dt, 1)}
+
+    off = run(False)
+    on = run(True)
+    ratio = (on["tok_s"] / off["tok_s"]) if (off.get("tok_s") and on.get("tok_s")) else None
+    res = {"concurrency": concurrency, "num_prompts": num_prompts, "off": off, "on": on,
+           "ratio": round(ratio, 4) if ratio else None}
+    print(f"\n>>> FINAL conc={concurrency} n={num_prompts}: "
+          f"no-dyn={off.get('tok_s')} (acc {off.get('accept_len')}) | "
+          f"dyn={on.get('tok_s')} (acc {on.get('accept_len')}) | ratio={res['ratio']}", flush=True)
+    return res
+
+
+@app.local_entrypoint()
+def final(highconc: int = 128, lowconc: int = 1, num_prompts: int = 1024,
+          low_prompts: int = 256, vbs_margin: float = 2.0, vbs_stat: str = "mean"):
+    """Same-card serial no-dyn vs dyn at high + low concurrency (the deliverable)."""
+    hi = final_bench.spawn(highconc, num_prompts, 1024, 0.75, vbs_margin, vbs_stat)
+    lo = final_bench.spawn(lowconc, low_prompts, 1024, 0.75, vbs_margin, vbs_stat)
+    print("\n==== DFlash dynamic-VBS FINAL (same card, serial) ====")
+    for tag, h in (("HIGH", hi), ("LOW", lo)):
+        try:
+            r = h.get()
+            print(f"{tag} conc={r['concurrency']} n={r['num_prompts']}: "
+                  f"no-dyn={r['off'].get('tok_s')} acc={r['off'].get('accept_len')} | "
+                  f"dyn={r['on'].get('tok_s')} acc={r['on'].get('accept_len')} | ratio={r['ratio']}")
+        except Exception as e:
+            print(f"{tag}: ERROR {e}")
+
+
 @app.function(gpu="B200", cloud="aws", timeout=3600, image=image,
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def profile(dynamic, concurrency: int = 32, capture_secs: float = 4.0,

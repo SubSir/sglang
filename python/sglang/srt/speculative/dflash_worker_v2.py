@@ -645,6 +645,43 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return int(resolved_id)
 
+    def _compute_per_request_vbs(self, draft_conf: torch.Tensor, bs: int):
+        """Per-request verify lengths for tight-packed dynamic-VBS.
+
+        draft_conf: [bs, block_size-1]. Returns (per_req_vbs[bs] int32, cumsum[bs+1]
+        int32, effective_tpbs:int graph bucket, total_real:int, max_vbs:int). Each
+        request keeps its OWN length (est_accept+margin), so high-confidence requests
+        aren't truncated (accept preserved). The graph runs bs*effective_tpbs tokens
+        where effective_tpbs=bucket(mean(per_req_vbs)) >= mean, so total_real<=padded.
+        """
+        device = draft_conf.device
+        block = int(self.block_size)
+        if self.dynamic_verify_confidence_scale == 0.5:
+            scaled = torch.sqrt(draft_conf)
+        else:
+            scaled = draft_conf ** self.dynamic_verify_confidence_scale
+        est_accept = torch.cumprod(scaled, dim=1).sum(dim=1)  # [bs]
+        per_req_vbs = (
+            torch.ceil(est_accept + self.dynamic_verify_margin)
+            .clamp_(self.dynamic_verify_buckets[0], block)
+            .to(torch.int32)
+        )
+        cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
+        # One host sync for all three scalars.
+        stats = torch.stack(
+            [
+                per_req_vbs.sum(),
+                per_req_vbs.float().mean().ceil().to(torch.int32),
+                per_req_vbs.max(),
+            ]
+        ).cpu()
+        total_real = int(stats[0])
+        mean_vbs = int(stats[1])
+        max_vbs = int(stats[2])
+        effective_tpbs = self._dynamic_verify_bucket_lookup[max(1, min(mean_vbs, block))]
+        return per_req_vbs, cumsum, effective_tpbs, total_real, max_vbs
+
     def _dynamic_verify_len(self, draft_conf: torch.Tensor) -> int:
         """Estimate a single batch-wide verify length from draft confidence.
 
@@ -1617,31 +1654,67 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 1:].copy_(draft_next)
 
         # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
-        custom_mask = None
-
-        verify_len = block_size
+        # Per-request tight-packed dynamic-VBS: each request contributes its own
+        # per_req_vbs query tokens (long requests keep their length -> accept
+        # preserved). The verify graph runs bs*effective_tpbs tokens; ragged
+        # qo/kv_indptr (built in generate_attn_arg_prefill) + causal == chain mask.
+        verify_len = block_size  # graph shape (draft_token_num)
         v_positions = positions
         v_cache_loc = verify_out_cache_loc
-        v_cache_loc_2d = verify_out_cache_loc_2d
+        tight = False
+        per_req_vbs = vbs_cumsum = used_mask = None
+        total_real = -1
+        max_vbs = block_size
         if do_dynamic:
-            verify_len = self._dynamic_verify_len(draft_conf)
-            if verify_len < block_size:
-                v_positions = positions_2d[:, :verify_len].reshape(-1)
-                v_cache_loc_2d = verify_out_cache_loc_2d[:, :verify_len]
-                v_cache_loc = v_cache_loc_2d.reshape(-1)
+            (
+                per_req_vbs,
+                vbs_cumsum,
+                effective_tpbs,
+                total_real,
+                max_vbs,
+            ) = self._compute_per_request_vbs(draft_conf, bs)
+            if effective_tpbs < block_size:
+                tight = True
+                total_padded = bs * effective_tpbs
+                verify_len = effective_tpbs
+                # used[b, c] = c < per_req_vbs[b]; boolean indexing is row-major,
+                # which is exactly the per-request-contiguous packed order.
+                used_mask = self._block_pos_offsets.unsqueeze(0) < per_req_vbs.unsqueeze(
+                    1
+                ).to(self._block_pos_offsets.dtype)
+                packed_tokens = torch.zeros(
+                    total_padded, dtype=draft_tokens.dtype, device=device
+                )
+                packed_pos = torch.zeros(
+                    total_padded, dtype=positions_2d.dtype, device=device
+                )
+                packed_loc = torch.empty(
+                    total_padded, dtype=verify_out_cache_loc_2d.dtype, device=device
+                )
+                packed_tokens[:total_real] = draft_tokens[used_mask]
+                packed_pos[:total_real] = positions_2d[used_mask]
+                packed_loc[:total_real] = verify_out_cache_loc_2d[used_mask]
+                # Padding tokens reuse allocated-but-unused slots (never read; the
+                # over-allocation reclaims them next step).
+                pad_loc = verify_out_cache_loc_2d[~used_mask]
+                packed_loc[total_real:] = pad_loc[: total_padded - total_real]
+                v_positions = packed_pos
+                v_cache_loc = packed_loc
+                verify_input_ids = packed_tokens
+            else:
+                verify_input_ids = draft_tokens.reshape(-1)
+        else:
+            verify_input_ids = draft_tokens.reshape(-1)
 
-        verify_input_ids = (
-            draft_tokens.reshape(-1)
-            if verify_len == block_size
-            else draft_tokens[:, :verify_len].reshape(-1)
-        )
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=v_positions,
             draft_token_num=int(verify_len),
-            custom_mask=custom_mask,
+            custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            per_request_vbs=(per_req_vbs if tight else None),
+            per_request_vbs_cumsum=(vbs_cumsum if tight else None),
+            total_real_tokens=(total_real if tight else -1),
         )
 
         model_worker_batch.out_cache_loc = v_cache_loc
@@ -1678,33 +1751,51 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        if sampling_info is not None:
+        if sampling_info is not None and not tight:
+            # The adjustment assumes a uniform [bs, draft_token_num] layout; the
+            # tight-packed verify is greedy-only (gated), where this is a no-op.
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(verify_len),
             )
 
-        vlen = int(verify_len)
-        candidates = draft_tokens if vlen == block_size else draft_tokens[:, :vlen]
         new_seq_lens = None
 
         def _mk_out_tokens(accept_len_t, bonus_t):
-            # Keep block_size width so downstream stride (speculative_num_draft_tokens)
-            # is unchanged; only the first commit_len entries per row are consumed.
+            # block_size width; only first commit_len entries per row are consumed.
             ot = torch.empty((bs, block_size), dtype=torch.int64, device=device)
-            if vlen > 1:
-                ot[:, : vlen - 1].copy_(candidates[:, 1:vlen])
-            ot[:, vlen - 1 :].fill_(0)
+            ot[:, : block_size - 1].copy_(draft_tokens[:, 1:])
+            ot[:, block_size - 1].fill_(0)
             ot.scatter_(1, accept_len_t.to(torch.int64)[:, None], bonus_t[:, None])
             return ot
-        if (
+
+        if tight:
+            # Unpack packed target predictions to [bs, block_size] via used_mask, then
+            # standard chain accept clamped to each request's per_req_vbs.
+            packed_predict = torch.argmax(
+                logits_output.next_token_logits[:total_real], dim=-1
+            )
+            target_predict = torch.zeros(
+                bs, block_size, dtype=torch.int64, device=device
+            )
+            target_predict[used_mask] = packed_predict
+            accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                candidates=draft_tokens, target_predict=target_predict
+            )
+            accept_len = torch.minimum(
+                accept_len, (per_req_vbs - 1).to(accept_len.dtype)
+            )
+            bonus = target_predict[torch.arange(bs, device=device), accept_len]
+            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens = _mk_out_tokens(accept_len, bonus)
+        elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
+                candidates=draft_tokens,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
@@ -1714,11 +1805,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens = _mk_out_tokens(accept_len, bonus)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, vlen
+                bs, block_size
             )
-            # The Triton accept/bonus kernel assumes the full block_size layout
-            # (and block-wide buffers); use it only when not truncating.
-            if self._use_triton_accept_bonus and vlen == block_size:
+            if self._use_triton_accept_bonus:
                 try:
                     (
                         accept_len,
@@ -1728,7 +1817,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         new_seq_lens,
                     ) = self._next_accept_bonus_buffers(bs)
                     _compute_dflash_accept_bonus_triton_unchecked(
-                        candidates=candidates,
+                        candidates=draft_tokens,
                         target_top1=target_predict,
                         accept_lens_out=accept_len,
                         commit_lens_out=commit_lens,
@@ -1744,14 +1833,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                         e,
                     )
                     accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                        candidates=candidates,
+                        candidates=draft_tokens,
                         target_predict=target_predict,
                     )
                     commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                     out_tokens = _mk_out_tokens(accept_len, bonus)
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                    candidates=candidates,
+                    candidates=draft_tokens,
                     target_predict=target_predict,
                 )
                 commit_lens = accept_len.to(torch.int32) + 1  # [bs]
@@ -1776,15 +1865,35 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, vlen, -1)
+        hidden_flat = hidden.view(-1, hidden.shape[-1])
 
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=v_cache_loc,
-            cache_loc_2d=v_cache_loc_2d,
-            positions=v_positions,
-            commit_lens=commit_lens,
-        )
+        if tight:
+            # Rebuild a [bs, max_vbs] rectangular view of the committed-eligible
+            # tokens so the existing prefix-valid writer (cache_loc_2d + commit_lens)
+            # works; commit_lens <= per_req_vbs <= max_vbs, so padding cols are unused.
+            used_m = used_mask[:, :max_vbs]
+            h = hidden.shape[-1]
+            cl2d = torch.zeros(bs, max_vbs, dtype=v_cache_loc.dtype, device=device)
+            cl2d[used_m] = v_cache_loc[:total_real]
+            pos2d = torch.zeros(bs, max_vbs, dtype=v_positions.dtype, device=device)
+            pos2d[used_m] = v_positions[:total_real]
+            h2d = torch.zeros(bs, max_vbs, h, dtype=hidden.dtype, device=device)
+            h2d[used_m] = hidden_flat[:total_real]
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=h2d.reshape(-1, h),
+                cache_loc=cl2d.reshape(-1),
+                cache_loc_2d=cl2d,
+                positions=pos2d.reshape(-1),
+                commit_lens=commit_lens,
+            )
+        else:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden_flat,
+                cache_loc=verify_out_cache_loc,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
