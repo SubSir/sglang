@@ -120,6 +120,18 @@ AND not is_draft_worker (target only). Buckets = {4,6,8,12,block_size}.
   fits. Backend stores/looks up by ShapeKey variant -> already supported.
 Risk: keep non-dflash + draft-worker paths byte-identical (buckets=[num_tokens_per_bs]).
 
+## *** RESULT: dynamic-VBS WINS with per-bucket graphs (commit 55838a9) ***
+sweep (Qwen3-8B, B200, mt-bench), dyn off vs on:
+  conc 1:   373.6 vs 369.8  (0.99x parity; gate=>no truncation at bs=1, code-identical)
+  conc 32:  6582.8 vs 6976.7 (1.06x)
+  conc 128: 8455.8 vs 10716.5 (1.27x)  accept 4.13->3.63
+GOAL MET: not-slower at low conc, real win at high conc. The earlier "overhead-bound =>
+no win" was too pessimistic: the verify forward is on each step's CRITICAL PATH, so
+shrinking it speeds steps even with idle between them.
+OPEN: accept drops ~10-12% (rectangular-mean caps upper tail). Tuning margin/stat
+(env SGLANG_DFLASH_VBS_MARGIN / _STAT=mean|0.75|0.9) + maybe per-request packing.
+The .item() host sync does NOT hurt (conc1 parity, high-conc win) -> leave it.
+
 ## *** PIVOTAL FINDING: system is OVERHEAD-bound at high conc ***
 Baseline throughput (dyn off, continuous-load bench, the trustworthy number):
   conc 1 / 8 / 32 / 64 / 128 = 371 / 3086 / 6760 / 7478 / 8392 tok/s.

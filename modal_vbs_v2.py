@@ -62,7 +62,8 @@ def _write_mt_bench_jsonl(path: str) -> int:
 @app.function(gpu="B200", cloud="aws", timeout=3600, image=image,
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def bench(dynamic, concurrency: int, num_prompts: int = 512,
-          max_new_tokens: int = 1024, mem_fraction: float = 0.75):
+          max_new_tokens: int = 1024, mem_fraction: float = 0.75,
+          vbs_margin: float = 2.0, vbs_stat: str = "mean"):
     """dynamic: None|True|False -> see module docstring."""
     import subprocess, signal, time, statistics
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -93,7 +94,9 @@ def bench(dynamic, concurrency: int, num_prompts: int = 512,
     elif dynamic is False:
         cmd.append("--no-speculative-dflash-dynamic-vbs")
     env = dict(os.environ); env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
-    print(">>> SERVER:", " ".join(cmd), flush=True)
+    env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
+    env["SGLANG_DFLASH_VBS_STAT"] = str(vbs_stat)
+    print(">>> SERVER:", " ".join(cmd), f"(margin={vbs_margin} stat={vbs_stat})", flush=True)
     srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
 
     base = "http://127.0.0.1:30000"
@@ -321,6 +324,27 @@ def _mode(s):
 @app.local_entrypoint()
 def one(dynamic_mode: str = "none", concurrency: int = 1, num_prompts: int = 512):
     print(bench.remote(_mode(dynamic_mode), concurrency, num_prompts))
+
+
+@app.local_entrypoint()
+def tune(concurrency: int = 128, num_prompts: int = 512,
+         configs: str = "off|2|mean,on|1|mean,on|2|mean,on|3|mean,on|2|0.75,on|2|0.9"):
+    """Sweep (dynamic, margin, stat) at one concurrency to find the best throughput/
+    accept tradeoff. configs: comma-list of 'mode|margin|stat'."""
+    specs = []
+    for c in configs.split(","):
+        mode, margin, stat = c.split("|")
+        specs.append((_mode(mode), float(margin), stat))
+    handles = [((m, mg, st), bench.spawn(m, concurrency, num_prompts, 1024, 0.75, mg, st))
+               for (m, mg, st) in specs]
+    print(f"\n==== DFlash VBS tune @conc={concurrency} ====")
+    print(f"{'mode':>5} {'margin':>6} {'stat':>6} | {'tok/s':>9} {'accept':>7}")
+    for (m, mg, st), h in handles:
+        try:
+            r = h.get()
+            print(f"{str(m):>5} {mg:>6} {st:>6} | {str(r.get('tok_s')):>9} {str(r.get('accept_len')):>7}")
+        except Exception as e:
+            print(f"{str(m):>5} {mg:>6} {st:>6} | ERROR {str(e)[:50]}")
 
 
 @app.local_entrypoint()

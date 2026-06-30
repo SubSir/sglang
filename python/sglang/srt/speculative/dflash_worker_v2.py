@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import List, Optional
 
@@ -217,12 +218,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.use_dynamic_verify = bool(
             getattr(server_args, "speculative_dflash_dynamic_vbs", False)
         )
-        self.dynamic_verify_margin = 2
-        self.dynamic_verify_confidence_scale = 0.5  # sqrt: <1 tempers cumprod decay
+        # Tunables (env-overridable so margin/gate can be swept without a rebuild).
+        self.dynamic_verify_margin = float(
+            os.environ.get("SGLANG_DFLASH_VBS_MARGIN", "2")
+        )
+        self.dynamic_verify_confidence_scale = float(
+            os.environ.get("SGLANG_DFLASH_VBS_SCALE", "0.5")
+        )  # sqrt: <1 tempers cumprod decay
         # Below this batch size, verify is memory-bound: truncating saves ~no GPU
-        # time and the eager (non-graph) verify would regress. Keep the full block
-        # (and its captured graph) there. ponytail: bs gate, raise/lower per profile.
-        self.dynamic_verify_min_bs = 2
+        # time. Keep the full block (and its captured graph) there.
+        self.dynamic_verify_min_bs = int(
+            os.environ.get("SGLANG_DFLASH_VBS_MIN_BS", "2")
+        )
+        # Batch statistic over per-request raw VBS: "mean" (more truncation, more
+        # throughput) or a percentile in [0,1] like "0.75"/"0.9" (less accept drop).
+        self.dynamic_verify_stat = os.environ.get("SGLANG_DFLASH_VBS_STAT", "mean")
         self.dynamic_verify_buckets = sorted(
             {b for b in (4, 6, 8, 12, self.block_size) if 1 <= b <= self.block_size}
         )
@@ -650,7 +660,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             scaled = draft_conf ** self.dynamic_verify_confidence_scale
         est_accept = torch.cumprod(scaled, dim=1).sum(dim=1)  # [bs]
         raw_vbs = torch.ceil(est_accept + self.dynamic_verify_margin)
-        batch_vbs = int(raw_vbs.mean().clamp_(1, self.block_size).item())
+        if self.dynamic_verify_stat == "mean":
+            stat = raw_vbs.mean()
+        else:
+            # percentile in [0,1]: higher -> covers more requests -> less accept drop
+            q = max(0.0, min(1.0, float(self.dynamic_verify_stat)))
+            stat = torch.quantile(raw_vbs.float(), q)
+        batch_vbs = int(stat.clamp_(1, self.block_size).item())
         return self._dynamic_verify_bucket_lookup[batch_vbs]
 
     def _greedy_sample_from_vocab_parallel_head(
