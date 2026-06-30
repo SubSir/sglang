@@ -220,15 +220,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Tunables (env-overridable so margin/gate can be swept without a rebuild).
         self.dynamic_verify_margin = float(
-            os.environ.get("SGLANG_DFLASH_VBS_MARGIN", "2")
+            os.environ.get("SGLANG_DFLASH_VBS_MARGIN", "1")
         )
         self.dynamic_verify_confidence_scale = float(
             os.environ.get("SGLANG_DFLASH_VBS_SCALE", "0.5")
         )  # sqrt: <1 tempers cumprod decay
-        # Below this batch size, verify is memory-bound: truncating saves ~no GPU
-        # time. Keep the full block (and its captured graph) there.
+        # Truncation only pays off once the verify is compute-bound enough that the
+        # saved GEMM beats the per-step packing overhead -- i.e. at large batch. Below
+        # this batch size keep the full block (parity with no-dynamic). Tuned on
+        # Qwen3-8B/B200 where the win crosses ~conc 48-64.
         self.dynamic_verify_min_bs = int(
-            os.environ.get("SGLANG_DFLASH_VBS_MIN_BS", "2")
+            os.environ.get("SGLANG_DFLASH_VBS_MIN_BS", "48")
         )
         # Batch statistic over per-request raw VBS: "mean" (more truncation, more
         # throughput) or a percentile in [0,1] like "0.75"/"0.9" (less accept drop).

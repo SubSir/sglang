@@ -162,7 +162,7 @@ def bench(dynamic, concurrency: int, num_prompts: int = 512,
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def final_bench(concurrency: int, num_prompts: int = 1024,
                 max_new_tokens: int = 1024, mem_fraction: float = 0.75,
-                vbs_margin: float = 2.0, vbs_stat: str = "mean"):
+                vbs_margin: float = 1.0, vbs_stat: str = "mean", vbs_min_bs: int = 48):
     """Final fair comparison: run no-dynamic then dynamic SERIALLY on the SAME card,
     each over `num_prompts` samples (dataset looped). Returns both + ratio."""
     import subprocess, signal, time, statistics
@@ -196,6 +196,7 @@ def final_bench(concurrency: int, num_prompts: int = 1024,
         env = dict(os.environ); env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
         env["SGLANG_DFLASH_VBS_STAT"] = str(vbs_stat)
+        env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
         srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
         base = "http://127.0.0.1:30000"; ready = False
         for _ in range(300):
@@ -243,20 +244,27 @@ def final_bench(concurrency: int, num_prompts: int = 1024,
 
 
 @app.local_entrypoint()
-def final(highconc: int = 128, lowconc: int = 1, num_prompts: int = 1024,
-          low_prompts: int = 256, vbs_margin: float = 2.0, vbs_stat: str = "mean"):
-    """Same-card serial no-dyn vs dyn at high + low concurrency (the deliverable)."""
-    hi = final_bench.spawn(highconc, num_prompts, 1024, 0.75, vbs_margin, vbs_stat)
-    lo = final_bench.spawn(lowconc, low_prompts, 1024, 0.75, vbs_margin, vbs_stat)
-    print("\n==== DFlash dynamic-VBS FINAL (same card, serial) ====")
-    for tag, h in (("HIGH", hi), ("LOW", lo)):
+def final(concurrencies: str = "1,32,64,128", num_prompts: int = 1024,
+          low_prompts: int = 256, vbs_margin: float = 1.0, vbs_stat: str = "mean",
+          vbs_min_bs: int = 48):
+    """Same-card serial no-dyn vs dyn across concurrencies (the deliverable). Low conc
+    uses fewer prompts (slow, ~sequential); high conc uses the full num_prompts."""
+    concs = [int(c) for c in concurrencies.split(",")]
+    handles = []
+    for c in concs:
+        n = num_prompts if c >= 32 else low_prompts
+        handles.append((c, final_bench.spawn(c, n, 1024, 0.75, vbs_margin, vbs_stat, vbs_min_bs)))
+    print(f"\n==== DFlash dynamic-VBS FINAL (same card, serial; margin={vbs_margin} "
+          f"stat={vbs_stat} min_bs={vbs_min_bs}) ====")
+    print(f"{'conc':>6} {'n':>6} | {'no-dyn':>9} {'acc':>6} | {'dyn':>9} {'acc':>6} | ratio")
+    for c, h in handles:
         try:
             r = h.get()
-            print(f"{tag} conc={r['concurrency']} n={r['num_prompts']}: "
-                  f"no-dyn={r['off'].get('tok_s')} acc={r['off'].get('accept_len')} | "
-                  f"dyn={r['on'].get('tok_s')} acc={r['on'].get('accept_len')} | ratio={r['ratio']}")
+            print(f"{c:>6} {r['num_prompts']:>6} | {str(r['off'].get('tok_s')):>9} "
+                  f"{str(r['off'].get('accept_len')):>6} | {str(r['on'].get('tok_s')):>9} "
+                  f"{str(r['on'].get('accept_len')):>6} | {r['ratio']}")
         except Exception as e:
-            print(f"{tag}: ERROR {e}")
+            print(f"{c:>6}: ERROR {e}")
 
 
 @app.function(gpu="B200", cloud="aws", timeout=3600, image=image,
