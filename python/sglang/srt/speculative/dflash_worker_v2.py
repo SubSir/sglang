@@ -235,6 +235,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Batch statistic over per-request raw VBS: "mean" (more truncation, more
         # throughput) or a percentile in [0,1] like "0.75"/"0.9" (less accept drop).
         self.dynamic_verify_stat = os.environ.get("SGLANG_DFLASH_VBS_STAT", "mean")
+        # Verify-token accounting (host-side ints only -> no extra device sync):
+        # actual = sum(bs*verify_len), full = sum(bs*block_size) (what no-dynamic runs).
+        self._vbs_tok_actual = 0
+        self._vbs_tok_full = 0
+        self._vbs_tok_bs_sum = 0
+        self._vbs_tok_steps = 0
         self.dynamic_verify_buckets = sorted(
             {b for b in (4, 6, 8, 12, self.block_size) if 1 <= b <= self.block_size}
         )
@@ -1717,6 +1723,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_input_ids = draft_tokens.reshape(-1)
         else:
             verify_input_ids = draft_tokens.reshape(-1)
+
+        # Verify-token accounting: host ints (bs, verify_len) -> no device sync.
+        self._vbs_tok_actual += bs * int(verify_len)
+        self._vbs_tok_full += bs * block_size
+        self._vbs_tok_bs_sum += bs
+        self._vbs_tok_steps += 1
+        if self._vbs_tok_steps % 256 == 0 and self.tp_rank == 0:
+            a, f = self._vbs_tok_actual, self._vbs_tok_full
+            logger.info(
+                "DFLASH verify-tokens cumulative: actual=%d full=%d saved=%.1f%% "
+                "(avg verify_len=%.2f vs block_size=%d)",
+                a, f, 100.0 * (1.0 - a / max(f, 1)),
+                a / max(self._vbs_tok_bs_sum, 1), block_size,
+            )
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
