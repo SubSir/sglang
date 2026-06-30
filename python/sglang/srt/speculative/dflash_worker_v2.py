@@ -225,13 +225,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.dynamic_verify_confidence_scale = float(
             os.environ.get("SGLANG_DFLASH_VBS_SCALE", "0.5")
         )  # sqrt: <1 tempers cumprod decay
-        # Truncation only pays off once the verify is compute-bound enough that the
-        # saved GEMM beats the per-step packing overhead -- i.e. at large batch. Below
-        # this batch size keep the full block (parity with no-dynamic). Tuned on
-        # Qwen3-8B/B200 where the win crosses ~conc 48-64.
-        self.dynamic_verify_min_bs = int(
-            os.environ.get("SGLANG_DFLASH_VBS_MIN_BS", "48")
-        )
         # Batch statistic over per-request raw VBS: "mean" (more truncation, more
         # throughput) or a percentile in [0,1] like "0.75"/"0.9" (less accept drop).
         self.dynamic_verify_stat = os.environ.get("SGLANG_DFLASH_VBS_STAT", "mean")
@@ -1653,10 +1646,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # shrink. Skipped at small bs (no compute-bound win, eager would regress) and
         # for non-greedy sampling (handled by the fixed-block sampling-verify kernel).
         _sampling_info = model_worker_batch.sampling_info
-        do_dynamic = (
-            self.use_dynamic_verify
-            and bs >= self.dynamic_verify_min_bs
-            and (_sampling_info is None or _sampling_info.is_all_greedy)
+        do_dynamic = self.use_dynamic_verify and (
+            _sampling_info is None or _sampling_info.is_all_greedy
         )
         if do_dynamic:
             draft_next, draft_conf = self._greedy_sample_from_vocab_parallel_head(
