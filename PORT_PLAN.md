@@ -120,6 +120,18 @@ AND not is_draft_worker (target only). Buckets = {4,6,8,12,block_size}.
   fits. Backend stores/looks up by ShapeKey variant -> already supported.
 Risk: keep non-dflash + draft-worker paths byte-identical (buckets=[num_tokens_per_bs]).
 
+## *** PER-REQUEST tight-pack (the design the user wants) ***
+Each request keeps its own per_req_vbs (est+margin); tight-packed into bs*effective_tpbs
+(effective_tpbs=bucket(mean)). Ragged qo/kv_indptr in generate_attn_arg_prefill (causal
+== chain mask, no custom mask); reuses (bs,effective_tpbs) graph via DFLASH_VERIFY hook.
+Accept PRESERVED. Margin tune @conc128 (cross-card tune; same-card final pending):
+  off m2: 8542 acc4.13 | on m0: 10037 1.175x acc3.94 | on m1: 9818 1.149x acc4.05 |
+  on m2: 9444 1.105x acc4.07.  => margin=1 best balance (1.15x, acc nearly baseline).
+Tight-pack @conc32 was 0.84x (overhead > savings at small batch) -- may gate via
+SGLANG_DFLASH_VBS_MIN_BS so truncation only activates where it wins (crossover ~conc64;
+checking). Low conc (conc1) parity (gated, no truncation). knobs: SGLANG_DFLASH_VBS_
+MARGIN/STAT/MIN_BS. Final deliverable: modal final (same-card serial 1024 samples).
+
 ## *** RESULT: dynamic-VBS WINS with per-bucket graphs (commit 55838a9) ***
 sweep (Qwen3-8B, B200, mt-bench), dyn off vs on:
   conc 1:   373.6 vs 369.8  (0.99x parity; gate=>no truncation at bs=1, code-identical)

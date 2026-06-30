@@ -1677,30 +1677,40 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tight = True
                 total_padded = bs * effective_tpbs
                 verify_len = effective_tpbs
-                # used[b, c] = c < per_req_vbs[b]; boolean indexing is row-major,
-                # which is exactly the per-request-contiguous packed order.
-                used_mask = self._block_pos_offsets.unsqueeze(0) < per_req_vbs.unsqueeze(
-                    1
-                ).to(self._block_pos_offsets.dtype)
-                packed_tokens = torch.zeros(
-                    total_padded, dtype=draft_tokens.dtype, device=device
+                # Sync-free packing: build a permutation `dest` mapping every (b,c) to
+                # a packed slot -- real tokens (c < per_req_vbs[b]) -> [0:total_real]
+                # (contiguous per request), unused -> [total_real:bs*block_size]. A
+                # plain scatter then packs with NO data-dependent host sync (boolean
+                # indexing `x[mask]` would sync once per call). Padding slots get the
+                # allocated-but-unused cache locs (valid, never read).
+                col = self._block_pos_offsets  # [block_size] int64
+                per64 = per_req_vbs.to(torch.int64)
+                valid = col.unsqueeze(0) < per64.unsqueeze(1)  # [bs, block_size]
+                valid_dest = vbs_cumsum[:bs].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
+                unused_per_req = block_size - per64  # [bs]
+                unused_cum = torch.zeros(bs, dtype=torch.int64, device=device)
+                if bs > 1:
+                    unused_cum[1:] = torch.cumsum(unused_per_req, dim=0)[:-1]
+                unused_dest = (
+                    total_real
+                    + unused_cum.unsqueeze(1)
+                    + (col.unsqueeze(0) - per64.unsqueeze(1))
                 )
-                packed_pos = torch.zeros(
-                    total_padded, dtype=positions_2d.dtype, device=device
-                )
-                packed_loc = torch.empty(
-                    total_padded, dtype=verify_out_cache_loc_2d.dtype, device=device
-                )
-                packed_tokens[:total_real] = draft_tokens[used_mask]
-                packed_pos[:total_real] = positions_2d[used_mask]
-                packed_loc[:total_real] = verify_out_cache_loc_2d[used_mask]
-                # Padding tokens reuse allocated-but-unused slots (never read; the
-                # over-allocation reclaims them next step).
-                pad_loc = verify_out_cache_loc_2d[~used_mask]
-                packed_loc[total_real:] = pad_loc[: total_padded - total_real]
-                v_positions = packed_pos
-                v_cache_loc = packed_loc
-                verify_input_ids = packed_tokens
+                dest_flat = torch.where(valid, valid_dest, unused_dest).reshape(-1)
+
+                def _pack(src2d):
+                    out = torch.empty(
+                        bs * block_size, dtype=src2d.dtype, device=device
+                    )
+                    out.scatter_(0, dest_flat, src2d.reshape(-1))
+                    return out[:total_padded]
+
+                # Keep for sync-free accept unpack (gather): valid mask + valid_dest.
+                used_mask = valid
+                self._tp_valid_dest = valid_dest  # [bs, block_size]
+                verify_input_ids = _pack(draft_tokens)
+                v_positions = _pack(positions_2d)
+                v_cache_loc = _pack(verify_out_cache_loc_2d)
             else:
                 verify_input_ids = draft_tokens.reshape(-1)
         else:
@@ -1771,15 +1781,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             return ot
 
         if tight:
-            # Unpack packed target predictions to [bs, block_size] via used_mask, then
-            # standard chain accept clamped to each request's per_req_vbs.
+            # Sync-free unpack of packed predictions to [bs, block_size] by gather:
+            # target_predict[b,c] = packed_predict[valid_dest[b,c]] if valid else 0.
             packed_predict = torch.argmax(
                 logits_output.next_token_logits[:total_real], dim=-1
             )
-            target_predict = torch.zeros(
-                bs, block_size, dtype=torch.int64, device=device
+            predict_ext = torch.cat(
+                [packed_predict, packed_predict.new_zeros(1)]
+            )  # index total_real -> 0 for padding
+            src_idx = torch.where(
+                used_mask,
+                self._tp_valid_dest,
+                torch.full_like(self._tp_valid_dest, total_real),
             )
-            target_predict[used_mask] = packed_predict
+            target_predict = predict_ext[src_idx.reshape(-1)].view(bs, block_size)
             accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                 candidates=draft_tokens, target_predict=target_predict
             )
@@ -1868,18 +1883,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         hidden_flat = hidden.view(-1, hidden.shape[-1])
 
         if tight:
-            # Gather only the committed packed tokens and write them flat (projects
-            # just those; avoids rebuilding a [bs, max_vbs, hidden] tensor each step).
-            # committed_2d[b, c] = c < commit_lens[b]; indexed by used_mask it lands
-            # in packed order. commit_lens <= per_req_vbs so it's a subset of used.
-            committed_2d = self._block_pos_offsets.unsqueeze(0) < commit_lens.unsqueeze(
-                1
-            ).to(self._block_pos_offsets.dtype)
-            committed = committed_2d[used_mask]  # [total_real] bool, packed order
+            # Gather only the committed packed tokens (write flat -> projects just
+            # those). Committed mask over packed [0:total_real] built sync-free:
+            # packed slot p -> request b (searchsorted) -> committed if its within-
+            # request offset < commit_lens[b]. One sync (nonzero) then index_select.
+            p = torch.arange(total_real, device=device)
+            b_of = torch.searchsorted(
+                vbs_cumsum[1 : bs + 1].contiguous(), p, right=True
+            )
+            c_of = p - vbs_cumsum[:bs][b_of]
+            committed = c_of < commit_lens[b_of]
+            idx = torch.nonzero(committed, as_tuple=True)[0]  # one host sync
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=hidden_flat[:total_real][committed],
-                cache_loc=v_cache_loc[:total_real][committed],
-                positions=v_positions[:total_real][committed],
+                target_hidden=hidden_flat[:total_real].index_select(0, idx),
+                cache_loc=v_cache_loc[:total_real].index_select(0, idx),
+                positions=v_positions[:total_real].index_select(0, idx),
                 cache_loc_2d=None,
                 commit_lens=None,
             )
