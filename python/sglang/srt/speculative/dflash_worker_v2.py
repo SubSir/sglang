@@ -21,6 +21,8 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.mem_cache.triton_ops.dflash_pack import pack_verify_inputs
+from sglang.srt.mem_cache.triton_ops.dflash_vbs import compute_per_req_vbs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -278,6 +280,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+        # Fused per-request VBS estimate (one kernel vs the sqrt/cumprod/sum/ceil chain).
+        self._use_fused_vbs = is_cuda() or is_hip()
+        # Fused tight-packing (one kernel vs dest-arith + 3 scatters).
+        self._use_fused_pack = is_cuda() or is_hip()
 
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
@@ -655,16 +661,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         device = draft_conf.device
         block = int(self.block_size)
-        if self.dynamic_verify_confidence_scale == 0.5:
-            scaled = torch.sqrt(draft_conf)
-        else:
-            scaled = draft_conf ** self.dynamic_verify_confidence_scale
-        est_accept = torch.cumprod(scaled, dim=1).sum(dim=1)  # [bs]
-        per_req_vbs = (
-            torch.ceil(est_accept + self.dynamic_verify_margin)
-            .clamp_(self.dynamic_verify_buckets[0], block)
-            .to(torch.int32)
-        )
+        lo = self.dynamic_verify_buckets[0]
+        per_req_vbs = None
+        if (
+            self._use_fused_vbs
+            and self.dynamic_verify_confidence_scale == 0.5
+            and draft_conf.shape[1] > 0
+        ):
+            # One kernel for sqrt->cumprod->sum->ceil->clamp (vs ~6 queued before sync).
+            try:
+                per_req_vbs = compute_per_req_vbs(
+                    draft_conf, self.dynamic_verify_margin, lo, block
+                )
+            except Exception as e:
+                logger.warning("DFLASH fused vbs failed; falling back to torch: %s", e)
+                self._use_fused_vbs = False
+        if per_req_vbs is None:
+            if self.dynamic_verify_confidence_scale == 0.5:
+                scaled = torch.sqrt(draft_conf)
+            else:
+                scaled = draft_conf ** self.dynamic_verify_confidence_scale
+            est_accept = torch.cumprod(scaled, dim=1).sum(dim=1)  # [bs]
+            per_req_vbs = (
+                torch.ceil(est_accept + self.dynamic_verify_margin)
+                .clamp_(lo, block)
+                .to(torch.int32)
+            )
         cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
         # total_real = cumsum[-1] is the ONLY value that needs a host round-trip.
@@ -1655,32 +1677,45 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # tokens (c < per_req_vbs[b]) -> [0:total_real] (contiguous per request),
                 # unused -> the tail. No data-dependent host sync (boolean indexing would
                 # sync). valid_dest + used_mask are kept for the sync-free accept unpack.
+                # valid_dest + used_mask are needed later for the sync-free accept unpack.
                 col = self._block_pos_offsets  # [block_size] int64
                 per64 = per_req_vbs.to(torch.int64)
                 used_mask = col.unsqueeze(0) < per64.unsqueeze(1)  # [bs, block_size]
                 self._tp_valid_dest = (
                     vbs_cumsum[:bs].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
                 )
-                unused_cum = torch.zeros(bs, dtype=torch.int64, device=device)
-                if bs > 1:
-                    unused_cum[1:] = torch.cumsum(block_size - per64, dim=0)[:-1]
-                unused_dest = (
-                    total_real
-                    + unused_cum.unsqueeze(1)
-                    + (col.unsqueeze(0) - per64.unsqueeze(1))
-                )
-                dest_flat = torch.where(
-                    used_mask, self._tp_valid_dest, unused_dest
-                ).reshape(-1)
+                if self._use_fused_pack:
+                    try:
+                        verify_input_ids, v_positions, v_cache_loc = pack_verify_inputs(
+                            per_req_vbs, vbs_cumsum, draft_tokens, positions_2d,
+                            verify_out_cache_loc_2d, total_real, total_padded,
+                        )
+                    except Exception as e:
+                        logger.warning("DFLASH fused pack failed; falling back to torch: %s", e)
+                        self._use_fused_pack = False
+                if not self._use_fused_pack:
+                    unused_cum = torch.zeros(bs, dtype=torch.int64, device=device)
+                    if bs > 1:
+                        unused_cum[1:] = torch.cumsum(block_size - per64, dim=0)[:-1]
+                    unused_dest = (
+                        total_real
+                        + unused_cum.unsqueeze(1)
+                        + (col.unsqueeze(0) - per64.unsqueeze(1))
+                    )
+                    dest_flat = torch.where(
+                        used_mask, self._tp_valid_dest, unused_dest
+                    ).reshape(-1)
 
-                def _pack(src2d):
-                    out = torch.empty(bs * block_size, dtype=src2d.dtype, device=device)
-                    out.scatter_(0, dest_flat, src2d.reshape(-1))
-                    return out[:total_padded]
+                    def _pack(src2d):
+                        out = torch.empty(
+                            bs * block_size, dtype=src2d.dtype, device=device
+                        )
+                        out.scatter_(0, dest_flat, src2d.reshape(-1))
+                        return out[:total_padded]
 
-                verify_input_ids = _pack(draft_tokens)
-                v_positions = _pack(positions_2d)
-                v_cache_loc = _pack(verify_out_cache_loc_2d)
+                    verify_input_ids = _pack(draft_tokens)
+                    v_positions = _pack(positions_2d)
+                    v_cache_loc = _pack(verify_out_cache_loc_2d)
             else:
                 verify_input_ids = draft_tokens.reshape(-1)
         else:

@@ -47,6 +47,18 @@ image = (
 )
 
 
+@app.function(gpu="B200", cloud="aws", timeout=600, image=image)
+def _vbscheck():
+    from sglang.srt.mem_cache.triton_ops import dflash_vbs
+    dflash_vbs._demo()
+    return "ok"
+
+
+@app.local_entrypoint()
+def vbscheck():
+    print(_vbscheck.remote())
+
+
 def _write_mt_bench_jsonl(path: str) -> int:
     from datasets import load_dataset
     ds = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
