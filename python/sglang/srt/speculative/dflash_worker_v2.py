@@ -225,13 +225,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.dynamic_verify_confidence_scale = float(
             os.environ.get("SGLANG_DFLASH_VBS_SCALE", "0.5")
         )  # sqrt: <1 tempers cumprod decay
-        # Batch statistic over per-request raw VBS: "mean" (more truncation, more
-        # throughput) or a percentile in [0,1] like "0.75"/"0.9" (less accept drop).
-        self.dynamic_verify_stat = os.environ.get("SGLANG_DFLASH_VBS_STAT", "mean")
-        # Diagnostic: run the FULL dynamic path (confidence, packing, gather) but
-        # remove the per-step GPU->CPU syncs and DON'T truncate (full block). Isolates
-        # the host-sync cost from the rest of the dynamic compute.
-        self._vbs_probe = os.environ.get("SGLANG_DFLASH_VBS_PROBE", "0") == "1"
         # Verify-token accounting (host-side ints only -> no extra device sync):
         # actual = sum(bs*verify_len), full = sum(bs*block_size) (what no-dynamic runs).
         self._vbs_tok_actual = 0  # padded (GEMM) verify tokens = sum(bs*effective_tpbs)
@@ -655,10 +648,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Per-request verify lengths for tight-packed dynamic-VBS.
 
         draft_conf: [bs, block_size-1]. Returns (per_req_vbs[bs] int32, cumsum[bs+1]
-        int32, effective_tpbs:int graph bucket, total_real:int, max_vbs:int). Each
-        request keeps its OWN length (est_accept+margin), so high-confidence requests
-        aren't truncated (accept preserved). The graph runs bs*effective_tpbs tokens
-        where effective_tpbs=bucket(mean(per_req_vbs)) >= mean, so total_real<=padded.
+        int32, effective_tpbs:int graph bucket, total_real:int). Each request keeps its
+        OWN length (est_accept+margin), so high-confidence requests aren't truncated
+        (accept preserved). The graph runs bs*effective_tpbs tokens where
+        effective_tpbs=bucket(mean(per_req_vbs)) >= mean, so total_real<=padded.
         """
         device = draft_conf.device
         block = int(self.block_size)
@@ -672,55 +665,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             .clamp_(self.dynamic_verify_buckets[0], block)
             .to(torch.int32)
         )
-        if self._vbs_probe:
-            # Keep all the GPU compute above, but skip the host sync and use a fixed
-            # full-block shape (no truncation). per_req_vbs forced to block so the
-            # packing is a consistent identity; total_real/effective_tpbs are host
-            # constants -> no GPU->CPU sync.
-            per_req_vbs = torch.full((bs,), block, dtype=torch.int32, device=device)
-            cumsum = torch.arange(
-                0, (bs + 1) * block, block, dtype=torch.int32, device=device
-            )
-            return per_req_vbs, cumsum, block, bs * block, block
         cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
-        # One host sync for all three scalars.
+        # One host sync for the two shape scalars (total_real, mean->bucket).
         stats = torch.stack(
-            [
-                per_req_vbs.sum(),
-                per_req_vbs.float().mean().ceil().to(torch.int32),
-                per_req_vbs.max(),
-            ]
+            [per_req_vbs.sum(), per_req_vbs.float().mean().ceil().to(torch.int32)]
         ).cpu()
         total_real = int(stats[0])
         mean_vbs = int(stats[1])
-        max_vbs = int(stats[2])
         effective_tpbs = self._dynamic_verify_bucket_lookup[max(1, min(mean_vbs, block))]
-        return per_req_vbs, cumsum, effective_tpbs, total_real, max_vbs
-
-    def _dynamic_verify_len(self, draft_conf: torch.Tensor) -> int:
-        """Estimate a single batch-wide verify length from draft confidence.
-
-        draft_conf: [bs, block_size-1] per-draft-token top-1 confidence proxy.
-        Expected accepted run length est_accept[b] = sum_t prod_{<=t} conf^scale.
-        Truncate the whole batch to ceil(mean(est_accept)+margin) rounded up to a
-        bucket (rectangular; one verify length for the batch). Costs one small host
-        sync to pick the shape — inherent to choosing a dynamic verify size.
-        """
-        if self.dynamic_verify_confidence_scale == 0.5:
-            scaled = torch.sqrt(draft_conf)
-        else:
-            scaled = draft_conf ** self.dynamic_verify_confidence_scale
-        est_accept = torch.cumprod(scaled, dim=1).sum(dim=1)  # [bs]
-        raw_vbs = torch.ceil(est_accept + self.dynamic_verify_margin)
-        if self.dynamic_verify_stat == "mean":
-            stat = raw_vbs.mean()
-        else:
-            # percentile in [0,1]: higher -> covers more requests -> less accept drop
-            q = max(0.0, min(1.0, float(self.dynamic_verify_stat)))
-            stat = torch.quantile(raw_vbs.float(), q)
-        batch_vbs = int(stat.clamp_(1, self.block_size).item())
-        return self._dynamic_verify_bucket_lookup[batch_vbs]
+        return per_req_vbs, cumsum, effective_tpbs, total_real
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1678,50 +1632,44 @@ class DFlashWorkerV2(BaseSpecWorker):
         tight = False
         per_req_vbs = vbs_cumsum = used_mask = None
         total_real = -1
-        max_vbs = block_size
         if do_dynamic:
             (
                 per_req_vbs,
                 vbs_cumsum,
                 effective_tpbs,
                 total_real,
-                max_vbs,
             ) = self._compute_per_request_vbs(draft_conf, bs)
-            if effective_tpbs < block_size or self._vbs_probe:
+            if effective_tpbs < block_size:
                 tight = True
                 total_padded = bs * effective_tpbs
                 verify_len = effective_tpbs
-                # Sync-free packing: build a permutation `dest` mapping every (b,c) to
-                # a packed slot -- real tokens (c < per_req_vbs[b]) -> [0:total_real]
-                # (contiguous per request), unused -> [total_real:bs*block_size]. A
-                # plain scatter then packs with NO data-dependent host sync (boolean
-                # indexing `x[mask]` would sync once per call). Padding slots get the
-                # allocated-but-unused cache locs (valid, never read).
+                # Sync-free tight-packing: scatter each (b,c) to a packed slot -- real
+                # tokens (c < per_req_vbs[b]) -> [0:total_real] (contiguous per request),
+                # unused -> the tail. No data-dependent host sync (boolean indexing would
+                # sync). valid_dest + used_mask are kept for the sync-free accept unpack.
                 col = self._block_pos_offsets  # [block_size] int64
                 per64 = per_req_vbs.to(torch.int64)
-                valid = col.unsqueeze(0) < per64.unsqueeze(1)  # [bs, block_size]
-                valid_dest = vbs_cumsum[:bs].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
-                unused_per_req = block_size - per64  # [bs]
+                used_mask = col.unsqueeze(0) < per64.unsqueeze(1)  # [bs, block_size]
+                self._tp_valid_dest = (
+                    vbs_cumsum[:bs].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
+                )
                 unused_cum = torch.zeros(bs, dtype=torch.int64, device=device)
                 if bs > 1:
-                    unused_cum[1:] = torch.cumsum(unused_per_req, dim=0)[:-1]
+                    unused_cum[1:] = torch.cumsum(block_size - per64, dim=0)[:-1]
                 unused_dest = (
                     total_real
                     + unused_cum.unsqueeze(1)
                     + (col.unsqueeze(0) - per64.unsqueeze(1))
                 )
-                dest_flat = torch.where(valid, valid_dest, unused_dest).reshape(-1)
+                dest_flat = torch.where(
+                    used_mask, self._tp_valid_dest, unused_dest
+                ).reshape(-1)
 
                 def _pack(src2d):
-                    out = torch.empty(
-                        bs * block_size, dtype=src2d.dtype, device=device
-                    )
+                    out = torch.empty(bs * block_size, dtype=src2d.dtype, device=device)
                     out.scatter_(0, dest_flat, src2d.reshape(-1))
                     return out[:total_padded]
 
-                # Keep for sync-free accept unpack (gather): valid mask + valid_dest.
-                used_mask = valid
-                self._tp_valid_dest = valid_dest  # [bs, block_size]
                 verify_input_ids = _pack(draft_tokens)
                 v_positions = _pack(positions_2d)
                 v_cache_loc = _pack(verify_out_cache_loc_2d)
@@ -1913,24 +1861,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden_flat = hidden.view(-1, hidden.shape[-1])
 
-        if tight and not self._vbs_probe:
-            # Gather only the committed packed tokens (write flat -> projects just
-            # those). Committed mask over packed [0:total_real] built sync-free:
-            # packed slot p -> request b (searchsorted) -> committed if its within-
-            # request offset < commit_lens[b]. One sync (nonzero) then index_select.
-            p = torch.arange(total_real, device=device)
-            b_of = torch.searchsorted(
-                vbs_cumsum[1 : bs + 1].contiguous(), p, right=True
+        if tight:
+            # Sync-free commit: unpack the packed verify hidden back to the rectangular
+            # [bs, block_size] layout (same gather as the prediction unpack above), then
+            # let the prefix-valid writer commit each request's first commit_lens[b] rows
+            # -- identical to the non-tight else branch below, but on the unpacked hidden.
+            # Avoids the data-dependent `nonzero` host sync (the main draft->verify bubble).
+            hidden_dim = hidden_flat.shape[-1]
+            hidden_ext = torch.cat(
+                [hidden_flat[:total_real], hidden_flat.new_zeros(1, hidden_dim)], dim=0
+            )  # index total_real -> zero row for the unused (masked) slots
+            src_idx = torch.where(
+                used_mask,
+                self._tp_valid_dest,
+                torch.full_like(self._tp_valid_dest, total_real),
             )
-            c_of = p - vbs_cumsum[:bs][b_of]
-            committed = c_of < commit_lens[b_of]
-            idx = torch.nonzero(committed, as_tuple=True)[0]  # one host sync
+            hidden_rect = hidden_ext[src_idx.reshape(-1)]  # [bs*block_size, hidden_dim]
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=hidden_flat[:total_real].index_select(0, idx),
-                cache_loc=v_cache_loc[:total_real].index_select(0, idx),
-                positions=v_positions[:total_real].index_select(0, idx),
-                cache_loc_2d=None,
-                commit_lens=None,
+                target_hidden=hidden_rect,
+                cache_loc=verify_out_cache_loc_2d.reshape(-1),
+                positions=positions_2d.reshape(-1),
+                cache_loc_2d=verify_out_cache_loc_2d,
+                commit_lens=commit_lens,
             )
         else:
             self._append_target_hidden_to_draft_kv_by_loc(
