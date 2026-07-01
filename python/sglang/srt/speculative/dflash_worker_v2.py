@@ -667,12 +667,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         cumsum = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         cumsum[1:] = torch.cumsum(per_req_vbs, dim=0)
-        # One host sync for the two shape scalars (total_real, mean->bucket).
-        stats = torch.stack(
-            [per_req_vbs.sum(), per_req_vbs.float().mean().ceil().to(torch.int32)]
-        ).cpu()
-        total_real = int(stats[0])
-        mean_vbs = int(stats[1])
+        # total_real = cumsum[-1] is the ONLY value that needs a host round-trip.
+        # mean is derived on the host: ceil(total_real/bs) == ceil(mean(per_req_vbs)),
+        # which drops the extra sum/mean/stack kernels queued before the sync (so the
+        # .cpu() drains a shorter stream) and shrinks the transfer to one scalar.
+        total_real = int(cumsum[bs].cpu())
+        mean_vbs = -(-total_real // bs)  # ceil(total_real / bs)
         effective_tpbs = self._dynamic_verify_bucket_lookup[max(1, min(mean_vbs, block))]
         return per_req_vbs, cumsum, effective_tpbs, total_real
 
