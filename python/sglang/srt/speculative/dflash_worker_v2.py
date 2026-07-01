@@ -533,12 +533,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._reuse_tree_buf:
             return None, None
-        # Worst case sum(seq_lens) == bs * max_context_len; matches the kernel's
-        # FULL_MASK size seq_lens_sum*num_verify + num_verify^2*bs.
+        # Size to EXACTLY the verify cuda-graph's custom_mask buffer
+        # (max_num_tokens * max_context_len = bs*num_verify * max_context_len).
+        # The graph replay copies our mask in via custom_mask[:mask.shape[0]] =
+        # mask, which requires mask.numel() <= graph-buffer size. The kernel's
+        # used region is num_verify*(seq_lens_sum + num_verify*bs); since
+        # seq_len+num_verify <= max_context_len per req, that region always fits
+        # in num_verify*bs*max_context_len -- so this size is both safe for the
+        # kernel write and copy-compatible with the graph buffer.
         max_context_len = self.target_worker.model_runner.attn_backend.max_context_len
-        need_mask = num_verify_tokens * int(bs) * (
-            max_context_len + num_verify_tokens
-        )
+        need_mask = num_verify_tokens * int(bs) * max_context_len
         need_pos = int(bs) * num_verify_tokens
         if (
             self._reuse_tree_mask_buf is None
