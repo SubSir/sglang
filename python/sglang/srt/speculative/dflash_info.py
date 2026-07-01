@@ -50,6 +50,12 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
+    # Optional reusable tree-mask / position buffers (EAGLE-style buffer reuse).
+    # When set, build_tree_kernel_efficient fills these in place instead of
+    # allocating fresh per-step buffers (see SGLANG_DFLASH_REUSE_TREE_BUF).
+    tree_mask_buf: Optional[torch.Tensor] = None
+    position_buf: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
@@ -94,7 +100,13 @@ class DFlashVerifyInput(SpecInput):
             # The tree mask buffer is sized from sum(seq_lens); the caller may have
             # temporarily set batch.seq_lens_sum to an over-allocated planning value,
             # so recompute the true sum here for a correctly sized FULL_MASK.
-            true_seq_lens_sum = int(batch.seq_lens.sum().item())
+            # When a preallocated tree_mask_buf is supplied (EAGLE-style reuse),
+            # the kernel ignores seq_lens_sum and writes into the (over-sized)
+            # buffer directly, saving a per-step alloc + memset (and the D2H sync).
+            if self.tree_mask_buf is not None:
+                true_seq_lens_sum = 0
+            else:
+                true_seq_lens_sum = int(batch.seq_lens.sum().item())
             (
                 tree_mask,
                 positions,
@@ -113,6 +125,8 @@ class DFlashVerifyInput(SpecInput):
                 spec_steps=depth,
                 num_verify_tokens=self.draft_token_num,
                 tree_mask_mode=TreeMaskMode.FULL_MASK,
+                tree_mask_buf=self.tree_mask_buf,
+                position_buf=self.position_buf,
             )
             batch.input_ids = draft_tokens
             self.draft_token = draft_tokens

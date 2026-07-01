@@ -255,6 +255,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             if server_args.speculative_eagle_topk is not None
             else 1
         )
+        # Reuse tree-mask / position buffers across verify steps instead of
+        # allocating + memsetting fresh ones every step (EAGLE-style). Default
+        # OFF; gated so we can measure on-vs-off. Buffers are lazily allocated
+        # on first tree-verify step (needs max_context_len from the backend).
+        self._reuse_tree_buf: bool = bool(
+            int(os.environ.get("SGLANG_DFLASH_REUSE_TREE_BUF", "0"))
+        )
+        self._reuse_tree_mask_buf: Optional[torch.Tensor] = None
+        self._reuse_tree_position_buf: Optional[torch.Tensor] = None
         # Tree verify node budget = --speculative-num-draft-tokens (may exceed the
         # draft block_size); falls back to block_size when unset.
         self._tree_num_draft_tokens: int = int(
@@ -510,6 +519,44 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+
+    def _get_reuse_tree_buffers(self, bs: int, num_verify_tokens: int):
+        """Lazily allocate max-sized tree-mask / position buffers reused across
+        verify steps (EAGLE-style). Returns (None, None) when reuse is disabled.
+
+        tree_mask (FULL_MASK) layout is per-request contiguous, sized
+        num_verify * (sum(seq_lens) + num_verify*bs). We over-allocate for the
+        worst case (max_context_len per req); the kernel writes only the used
+        front region and the verify attn indexes it via mask_indptr derived from
+        the real seq_lens, so the over-size is safe (mirrors EAGLE).
+        positions is sized exactly bs*num_verify (constant), reused verbatim.
+        """
+        if not self._reuse_tree_buf:
+            return None, None
+        # Worst case sum(seq_lens) == bs * max_context_len; matches the kernel's
+        # FULL_MASK size seq_lens_sum*num_verify + num_verify^2*bs.
+        max_context_len = self.target_worker.model_runner.attn_backend.max_context_len
+        need_mask = num_verify_tokens * int(bs) * (
+            max_context_len + num_verify_tokens
+        )
+        need_pos = int(bs) * num_verify_tokens
+        if (
+            self._reuse_tree_mask_buf is None
+            or self._reuse_tree_mask_buf.numel() < need_mask
+        ):
+            self._reuse_tree_mask_buf = torch.empty(
+                (need_mask,), dtype=torch.bool, device=self.device
+            )
+        if (
+            self._reuse_tree_position_buf is None
+            or self._reuse_tree_position_buf.numel() != need_pos
+        ):
+            self._reuse_tree_position_buf = torch.empty(
+                (need_pos,), dtype=torch.long, device=self.device
+            )
+        # Buffer must cover the kernel's worst-case FULL_MASK write region.
+        assert self._reuse_tree_mask_buf.numel() >= need_mask
+        return self._reuse_tree_mask_buf, self._reuse_tree_position_buf
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -1690,6 +1737,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             # positions=None / custom_mask=None signals prepare_for_verify to run
             # build_tree_kernel_efficient, which fills positions, custom_mask, the
             # retrieve buffers, and reorders draft_token into kernel layout.
+            tree_mask_buf, position_buf = self._get_reuse_tree_buffers(
+                bs, tree_num_draft_tokens
+            )
             verify_input = DFlashVerifyInput(
                 draft_token=tree_draft_tokens,
                 positions=None,
@@ -1699,6 +1749,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tree_parent_list=tree_parent_list,
                 tree_selected_index=tree_selected_index,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                tree_mask_buf=tree_mask_buf,
+                position_buf=position_buf,
             )
         else:
             # SGLANG_DOMINO_TIME_DRAFT=1: CUDA-event time JUST the draft-step
