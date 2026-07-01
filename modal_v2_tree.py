@@ -27,7 +27,7 @@ base_image = (
     modal.Image.from_registry(
         "lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96"
     )
-    .run_commands("echo v2tree5-treecudagraph > /tmp/build_time")
+    .run_commands("echo v2tree6-treefoldindraft > /tmp/build_time")
     # Overlay the tree-verify port (the speculative dir from the worktree).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
@@ -1157,6 +1157,81 @@ def cg(n: int = 128, budget: int = 32, topk: int = 4):
     print("LOSSLESS:", lossless, "(out_hash + accept_len + tokens identical)")
     if off.get("tok_s") and on.get("tok_s"):
         print(f"tok/s  OFF {off['tok_s']} -> ON {on['tok_s']}  = {100*(on['tok_s']/off['tok_s']-1):+.1f}%")
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def cgbench_same(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
+                 block_size: int = 16, topk: int = 4, budget: int = 32, n: int = 256,
+                 overlap: bool = True):
+    """SAME-CARD: in ONE container, run flag OFF then ON back-to-back -> clean
+    cuda-graph tok/s delta (no cross-container noise). Lossless via out_hash."""
+    import subprocess, time, signal, json, urllib.request, hashlib
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tk = AutoTokenizer.from_pretrained(target)
+    ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n))
+    fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    ps = [tk.apply_chat_template([{"role": "user", "content": fmt.format(q=ds[i]["question"])}],
+          tokenize=False, add_generation_prompt=True, enable_thinking=False) for i in range(n)]
+    def run(cudagraph):
+        env = dict(os.environ)
+        env["SGLANG_DFLASH_TREE_VERIFY"] = "1"; env["SGLANG_DFLASH_TREE_ALGO"] = "fused"
+        env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1" if overlap else "0"
+        env["DFLASH_DRAFT_ATTN_BACKEND"] = "triton"
+        # "on" = fold-in (topk head + tree build in one graph fed by draft-graph
+        # hidden buffer); "off" = fully eager. Separate-graph Option A stays off.
+        env["SGLANG_DFLASH_TREE_IN_DRAFT_GRAPH"] = "1" if cudagraph else "0"
+        env["SGLANG_DFLASH_TREE_CUDAGRAPH"] = "0"
+        server = ["python", "-m", "sglang.launch_server", "--model-path", target,
+                  "--trust-remote-code", "--mem-fraction-static", "0.85",
+                  "--max-running-requests", "1", "--attention-backend", "triton",
+                  "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
+                  "--speculative-dflash-block-size", str(block_size),
+                  "--speculative-eagle-topk", str(topk), "--speculative-num-draft-tokens", str(budget),
+                  "--port", "30000"]
+        srv = subprocess.Popen(server, env=env); ok = False
+        for _ in range(240):
+            try: urllib.request.urlopen("http://127.0.0.1:30000/health", timeout=2); ok = True; break
+            except Exception: time.sleep(2)
+        def send(p):
+            req = urllib.request.Request("http://127.0.0.1:30000/generate",
+                data=json.dumps({"text": p, "sampling_params": {"temperature": 0.0, "max_new_tokens": 512}}).encode(),
+                headers={"Content-Type": "application/json"})
+            return json.loads(urllib.request.urlopen(req, timeout=600).read())
+        send(ps[0]); send(ps[1])
+        t0 = time.perf_counter(); toks = 0; accs = []; texts = []
+        for p in ps:
+            r = send(p); m = r["meta_info"]; toks += m["completion_tokens"]; texts.append(r["text"])
+            if m.get("spec_verify_ct"): accs.append(m["completion_tokens"]/m["spec_verify_ct"])
+        dt = time.perf_counter() - t0
+        srv.send_signal(signal.SIGINT); time.sleep(5)
+        try: srv.wait(timeout=15)
+        except Exception: srv.kill()
+        time.sleep(3)
+        return {"cudagraph": cudagraph, "tok_s": round(toks/dt, 1),
+                "accept_len": round(sum(accs)/len(accs), 4) if accs else None, "tokens": toks,
+                "out_hash": hashlib.sha256("\x1e".join(texts).encode()).hexdigest()[:16]}
+    off = run(False); on = run(True)
+    lossless = (off["out_hash"] == on["out_hash"] and off["accept_len"] == on["accept_len"] and off["tokens"] == on["tokens"])
+    delta = 100*(on["tok_s"]/off["tok_s"]-1) if off["tok_s"] else None
+    res = {"overlap": overlap, "off": off, "on": on, "lossless": lossless, "delta_pct": round(delta, 1) if delta else None}
+    print("SAME-CARD RESULT:", json.dumps(res), flush=True)
+    json.dump(res, open(f"/results/cgsame_ov{int(overlap)}_b{budget}.json", "w")); results_vol.commit()
+    return json.dumps(res)
+
+
+@app.local_entrypoint()
+def cgsame(n: int = 256, budget: int = 32, topk: int = 4, overlap: bool = True):
+    """SAME-CARD cuda-graph off vs on (one container). Also pass --overlap False to
+    test whether the cuda-graph helps when overlap-plan-stream is NOT hiding launches."""
+    import json
+    r = json.loads(cgbench_same.remote(topk=topk, budget=budget, n=n, overlap=overlap))
+    print(f"overlap={r['overlap']}  LOSSLESS={r['lossless']}")
+    print(f"  OFF tok/s={r['off']['tok_s']} acc={r['off']['accept_len']}")
+    print(f"  ON  tok/s={r['on']['tok_s']} acc={r['on']['accept_len']}")
+    print(f"  cuda-graph delta = {r['delta_pct']:+}%")
 
 
 @app.local_entrypoint()
