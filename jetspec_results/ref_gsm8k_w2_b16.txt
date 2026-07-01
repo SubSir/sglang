@@ -1,0 +1,61 @@
+outputs saved → /root/JetSpec/bench/outputs/20260628_222530_Qwen3-8B/
+
+model=Qwen/Qwen3-8B head=JetSpec/jetspec-qwen3-8b
+dataset=gsm8k samples=32 world_size=1 block_size=16 tree_depth=16 width=2 budget=16 max_new=1024
+attn_implementation=sdpa torch_compile=False fused_moe_blocks=0 tree_attn_implementation=triton draft_attn=sdpa
+AR-greedy baseline: decode=81.2 tok/s/gpu  e2e=80.0 tok/s/gpu  (10000 tok, avg_decode_ms=3850.0, avg_wall_ms=3905.2)
+
+DFlash blocksize=16: decode=276.9 tok/s/gpu  e2e=273.5 tok/s/gpu  (10236 tok, accept_len=5.83, speedup=3.41  e2e_speedup=3.42)
+
+algorithm              accept_len     d0     d1     d2     d3   tree decode_tps  e2e_tps  speedup e2e_spdup
+-----------------------------------------------------------------------------------------------------------
+accum_logp                   5.68   0.95   0.85   0.73   0.60     16      300.6    296.0     3.70      3.70
+
+accept_len = tokens/forward (= reference Average Acceptance length).
+d_k = per-position accept rate.
+decode_tps = latency-derived from decode-only time (prefill excluded).
+e2e_tps = latency-derived from total wall time (prefill included).
+speedup = decode_tps / AR decode_tps.
+e2e_spdup = e2e_tps / AR e2e_tps.
+
+===STDERR(tail)===
+DFlash blocksize=16:  91%|█████████ | 29/32 [00:34<00:02,  1.16it/s]
+DFlash blocksize=16:  94%|█████████▍| 30/32 [00:35<00:01,  1.15it/s]
+DFlash blocksize=16:  97%|█████████▋| 31/32 [00:36<00:00,  1.20it/s]
+DFlash blocksize=16: 100%|██████████| 32/32 [00:37<00:00,  1.17it/s]
+DFlash blocksize=16: 100%|██████████| 32/32 [00:37<00:00,  1.17s/it]
+
+accum_logp tree decode:   0%|          | 0/32 [00:00<?, ?it/s]
+accum_logp tree decode:   3%|▎         | 1/32 [00:01<00:36,  1.19s/it]
+accum_logp tree decode:   6%|▋         | 2/32 [00:01<00:23,  1.25it/s]
+accum_logp tree decode:   9%|▉         | 3/32 [00:02<00:28,  1.03it/s]
+accum_logp tree decode:  12%|█▎        | 4/32 [00:03<00:22,  1.22it/s]
+accum_logp tree decode:  16%|█▌        | 5/32 [00:04<00:24,  1.11it/s]
+accum_logp tree decode:  19%|█▉        | 6/32 [00:05<00:27,  1.07s/it]
+accum_logp tree decode:  22%|██▏       | 7/32 [00:06<00:26,  1.05s/it]
+accum_logp tree decode:  25%|██▌       | 8/32 [00:09<00:33,  1.42s/it]
+accum_logp tree decode:  28%|██▊       | 9/32 [00:11<00:39,  1.72s/it]
+accum_logp tree decode:  31%|███▏      | 10/32 [00:12<00:34,  1.56s/it]
+accum_logp tree decode:  34%|███▍      | 11/32 [00:13<00:26,  1.28s/it]
+accum_logp tree decode:  38%|███▊      | 12/32 [00:14<00:23,  1.17s/it]
+accum_logp tree decode:  41%|████      | 13/32 [00:15<00:23,  1.23s/it]
+accum_logp tree decode:  44%|████▍     | 14/32 [00:17<00:24,  1.35s/it]
+accum_logp tree decode:  47%|████▋     | 15/32 [00:18<00:20,  1.23s/it]
+accum_logp tree decode:  50%|█████     | 16/32 [00:19<00:19,  1.24s/it]
+accum_logp tree decode:  53%|█████▎    | 17/32 [00:20<00:15,  1.06s/it]
+accum_logp tree decode:  56%|█████▋    | 18/32 [00:21<00:14,  1.03s/it]
+accum_logp tree decode:  59%|█████▉    | 19/32 [00:21<00:12,  1.03it/s]
+accum_logp tree decode:  62%|██████▎   | 20/32 [00:23<00:13,  1.14s/it]
+accum_logp tree decode:  66%|██████▌   | 21/32 [00:24<00:12,  1.14s/it]
+accum_logp tree decode:  69%|██████▉   | 22/32 [00:25<00:09,  1.03it/s]
+accum_logp tree decode:  72%|███████▏  | 23/32 [00:26<00:08,  1.03it/s]
+accum_logp tree decode:  75%|███████▌  | 24/32 [00:26<00:07,  1.09it/s]
+accum_logp tree decode:  78%|███████▊  | 25/32 [00:27<00:05,  1.17it/s]
+accum_logp tree decode:  81%|████████▏ | 26/32 [00:28<00:05,  1.10it/s]
+accum_logp tree decode:  84%|████████▍ | 27/32 [00:29<00:04,  1.06it/s]
+accum_logp tree decode:  88%|████████▊ | 28/32 [00:30<00:03,  1.12it/s]
+accum_logp tree decode:  91%|█████████ | 29/32 [00:31<00:02,  1.11it/s]
+accum_logp tree decode:  94%|█████████▍| 30/32 [00:32<00:01,  1.09it/s]
+accum_logp tree decode:  97%|█████████▋| 31/32 [00:33<00:00,  1.11it/s]
+accum_logp tree decode: 100%|██████████| 32/32 [00:34<00:00,  1.08it/s]
+accum_logp tree decode: 100%|██████████| 32/32 [00:34<00:00,  1.07s/it]

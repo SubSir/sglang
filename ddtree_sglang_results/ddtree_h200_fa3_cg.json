@@ -1,0 +1,14 @@
+{
+  "algo": "DDTREE",
+  "budget": 32,
+  "dataset": "gsm8k",
+  "gpu": "H200",
+  "ready": false,
+  "exit": -9,
+  "flags": [
+    "--attention-backend",
+    "fa3"
+  ],
+  "rows": [],
+  "stderr_tail": "see container logs"
+}

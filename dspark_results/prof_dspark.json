@@ -1,0 +1,14 @@
+{
+  "method": "dspark",
+  "draft": "deepseek-ai/dspark_qwen3_8b_block7",
+  "backbone": {
+    "n": 96,
+    "median_us": 1328.4,
+    "mean_us": 1395.4
+  },
+  "sampling": {
+    "n": 96,
+    "median_us": 618.5,
+    "mean_us": 614.5
+  }
+}

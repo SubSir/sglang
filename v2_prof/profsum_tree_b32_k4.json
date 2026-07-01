@@ -1,0 +1,169 @@
+{
+  "tag": "tree_b32_k4",
+  "tree": true,
+  "topk": 4,
+  "budget": 32,
+  "trace_files": [
+    "/results/prof_tree_b32_k4/1782720481.287905-TP-0.trace.json.gz",
+    "/results/prof_tree_b32_k4/1782720481.287905-TP-0.trace.json.gz"
+  ],
+  "wall_us": 3173281.9,
+  "gpu_busy_us": 4855212.0,
+  "gpu_util_pct": 153.0,
+  "accept_verify_ct": [
+    37,
+    25,
+    37,
+    46,
+    30,
+    43
+  ],
+  "top_gpu_kernels": [
+    {
+      "name": "scheduler.run_batch",
+      "us": 2004597.6
+    },
+    {
+      "name": "step[TARGET_VERIFY bs=1]",
+      "us": 1437380.1
+    },
+    {
+      "name": "nvjet_tst_192x32_64x7_4x1_v_bz_TNT",
+      "us": 279504.3
+    },
+    {
+      "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::Kernel",
+      "us": 174567.0
+    },
+    {
+      "name": "nvjet_tst_64x32_64x16_2x1_2cta_v_bz_splitK_TNT",
+      "us": 149926.4
+    },
+    {
+      "name": "nvjet_tst_32x64_64x16_4x1_v_bz_TNN",
+      "us": 92834.8
+    },
+    {
+      "name": "nvjet_tst_64x32_64x16_2x1_2cta_v_bz_TNT",
+      "us": 88667.6
+    },
+    {
+      "name": "void flashinfer::norm::FusedAddRMSNormKernel<8u, __nv_bfloat16>(__nv_b",
+      "us": 57071.1
+    },
+    {
+      "name": "nvjet_tst_384x32_64x4_4x1_v_bz_TNT",
+      "us": 44964.3
+    },
+    {
+      "name": "nvjet_tst_384x16_64x4_4x1_v_bz_TNT",
+      "us": 44380.3
+    },
+    {
+      "name": "nvjet_tst_192x16_64x8_4x1_v_bz_TNT",
+      "us": 37566.4
+    },
+    {
+      "name": "void flashinfer::PersistentVariableLengthMergeStatesKernel<8u, 16u, 8u",
+      "us": 34832.4
+    },
+    {
+      "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp",
+      "us": 28739.7
+    },
+    {
+      "name": "void (anonymous namespace)::act_and_mul_kernel<__nv_bfloat16, ((anonym",
+      "us": 25221.4
+    },
+    {
+      "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, ",
+      "us": 22719.4
+    },
+    {
+      "name": "scheduler.get_next_batch_to_run",
+      "us": 21149.4
+    },
+    {
+      "name": "void (anonymous namespace)::fused_rope_kernel<true, 128l, true, __nv_b",
+      "us": 19751.4
+    },
+    {
+      "name": "nvjet_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT",
+      "us": 19533.9
+    }
+  ],
+  "top_cpu_ops": [
+    {
+      "name": "threading.py(1030): _bootstrap",
+      "us": 11271304.0
+    },
+    {
+      "name": "threading.py(1073): _bootstrap_inner",
+      "us": 11271301.9
+    },
+    {
+      "name": "tqdm/_monitor.py(69): run",
+      "us": 9017001.9
+    },
+    {
+      "name": "threading.py(655): wait",
+      "us": 9017001.3
+    },
+    {
+      "name": "threading.py(359): wait",
+      "us": 9016999.1
+    },
+    {
+      "name": "threading.py(1010): run",
+      "us": 2254296.2
+    },
+    {
+      "name": "python/sglang/srt/utils/watchdog.py(127): _watchdog_thread",
+      "us": 2254295.4
+    },
+    {
+      "name": "python/sglang/srt/utils/watchdog.py(147): _watchdog_once",
+      "us": 2254293.6
+    },
+    {
+      "name": "<string>(1): <module>",
+      "us": 2254238.8
+    },
+    {
+      "name": "multiprocessing/spawn.py(122): spawn_main",
+      "us": 2254238.0
+    },
+    {
+      "name": "multiprocessing/spawn.py(135): _main",
+      "us": 2254236.8
+    },
+    {
+      "name": "multiprocessing/process.py(314): _bootstrap",
+      "us": 2254235.8
+    },
+    {
+      "name": "multiprocessing/process.py(108): run",
+      "us": 2254235.1
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(4303): run_scheduler_process",
+      "us": 2254234.1
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(1501): run_event_loop",
+      "us": 2254233.0
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(4170): dispatch_event_loop",
+      "us": 2254232.2
+    },
+    {
+      "name": "torch/utils/_contextlib.py(124): decorate_context",
+      "us": 2254227.6
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(1528): event_loop_normal",
+      "us": 2254227.1
+    }
+  ]
+}

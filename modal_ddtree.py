@@ -18,8 +18,10 @@ vol = modal.Volume.from_name("ddtree-results", create_if_missing=True)
 image = (
     modal.Image.from_registry("lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96")
     .run_commands(
-        "echo dd1 > /tmp/bt",
+        "echo dd2 > /tmp/bt",
         "git clone --depth 1 https://github.com/liranringel/ddtree /root/ddtree",
+        # DATA CONTROL: drop shuffle(seed=0) -> first-N (version-robust, matches sglang first-N).
+        "sed -i 's/\\.shuffle(seed=0)\\.select/.select/' /root/ddtree/benchmark.py",
         "pip install loguru",  # rest (torch/transformers/datasets/flash_attn/ninja) in base
     )
 )
@@ -76,11 +78,13 @@ def run(dataset, tree_budgets, max_samples, max_new, tag,
 
 
 @app.local_entrypoint()
-def bench(datasets: str = "gsm8k,mt-bench", tree_budgets: str = "16,32,64,128",
-          max_samples: int = 24, max_new: int = 1024):
-    for ds in datasets.split(","):
-        run.spawn(ds, tree_budgets, max_samples, max_new, f"qwen3-8b_{ds}")
-    print("launched ddtree:", datasets)
+def bench(datasets: str = "gsm8k,mt-bench", tree_budgets: str = "16,32,64,128,256",
+          max_samples: int = 32, max_new: int = 1024):
+    handles = [run.spawn(ds, tree_budgets, max_samples, max_new, f"qwen3-8b_{ds}")
+               for ds in datasets.split(",")]
+    print("launched ddtree:", datasets, "— waiting for completion")
+    for h in handles:
+        print(h.get())
 
 
 @app.function(image=image, volumes={"/results": vol})

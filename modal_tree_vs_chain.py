@@ -213,20 +213,25 @@ def sweep(
     samples_base: int = 32,
     backend: str = "flashinfer",
 ):
-    """Accept-length vs tree budget curve (cuda graph off, low mem to avoid OOM)."""
+    """Throughput (tok/s) + accept-length vs tree budget, conc=1, CUDA GRAPH ON.
+    topk scales with budget: topk4 (fused fast path) caps at ~244 nodes with block16,
+    so budget 256 needs topk>=5 (slow fallback) — that's the 'not enough candidates'
+    fix, not OOM."""
     # (label, tree_verify, topk, num_draft_tokens)
     configs = [
         ("chain_b16", False, 1, None),
         ("tree_topk4_budget16", True, 4, 16),
         ("tree_topk4_budget32", True, 4, 32),
         ("tree_topk4_budget64", True, 4, 64),
+        ("tree_topk4_budget128", True, 4, 128),
+        ("tree_topk8_budget256", True, 8, 256),  # topk8: enough candidates for 256 (slow fallback path)
     ]
     calls = []
     for label, tv, topk, ndt in configs:
         print(f">>> spawning {label}")
         calls.append((label, run.spawn(
             target_model, draft_model, data_names, tv, topk, block_size,
-            ndt, samples_base, backend, 0.6, True,  # mem_fraction=0.6, disable_cuda_graph
+            ndt, samples_base, backend, 0.85, False,  # mem_fraction=0.85, cuda graph ON
         )))
     os.makedirs("tree_vs_chain_results", exist_ok=True)
     for label, c in calls:
@@ -244,6 +249,37 @@ def sweep(
                 if "DFLASH output tok/s" in line:
                     tk = lines[i + 3].split("|")[2].strip() if i + 3 < len(lines) else "?"
             print(f">>> {label}: accept_len={al} toks/s={tk}")
+        except Exception as e:
+            print(f">>> FAILED {label}: {e}")
+
+
+@app.local_entrypoint()
+def concsweep(
+    target_model: str = "Qwen/Qwen3-8B",
+    draft_model: str = "z-lab/Qwen3-8B-DFlash-b16",
+    data_names: str = "gsm8k,mt-bench",
+    block_size: int = 16,
+    budget: int = 64,
+    samples_base: int = 32,
+    concurrencies: str = "1,8,32",
+    backend: str = "flashinfer",
+):
+    """Ours throughput vs concurrency (tree topk4 + chain), cuda graph ON."""
+    configs = [("chain_b16", False, 1, None), (f"tree_topk4_b{budget}", True, 4, budget)]
+    calls = []
+    for label, tv, topk, ndt in configs:
+        print(f">>> spawning {label} conc={concurrencies}")
+        calls.append((label, run.spawn(
+            target_model, draft_model, data_names, tv, topk, block_size,
+            ndt, samples_base, backend, 0.85, False, concurrencies,
+        )))
+    os.makedirs("tree_vs_chain_results", exist_ok=True)
+    for label, c in calls:
+        try:
+            res = c.get()
+            with open(f"tree_vs_chain_results/conc_{label}_{data_names.replace(',','-')}.md", "w") as f:
+                f.write(res)
+            print(f">>> done {label}\n{_v1_tables(res)}")
         except Exception as e:
             print(f">>> FAILED {label}: {e}")
 

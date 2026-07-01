@@ -1,0 +1,314 @@
+================================================================================
+Profiling mode=dflash, tensor_parallel_size=1, batch_size=1
+[CLEANUP] before: free=177.74 GiB total=178.35 GiB
+[CLEANUP] after: free=177.74 GiB total=178.35 GiB
+INFO 06-28 06:58:40 [utils.py:233] non-default args: {'trust_remote_code': True, 'max_model_len': 32768, 'gpu_memory_utilization': 0.85, 'max_num_batched_tokens': 51200, 'max_num_seqs': 1, 'speculative_config': {'method': 'dflash', 'model': 'JetSpec/jetspec-qwen3-8b', 'num_speculative_tokens': 15, 'max_model_len': 32768, 'head_type': 'causal', 'tree_width': 1, 'max_tree_budget': 16, 'tree_draft': 'accum_logp', 'tree_hybrid_alpha': 1.0, 'max_draft_passes': 5, 'tree_prune_ratio': 0.25, 'tree_construction': 'breadth_first', 'tree_attn_kernel': 'triton', 'tree_kv_layout': 'physical', 'num_cudagraph_tree_captures': 0}, 'attention_backend': 'FLASH_ATTN', 'model': 'Qwen/Qwen3-8B'}
+WARNING 06-28 06:58:40 [envs.py:1775] Unknown vLLM environment variable detected: VLLM_USE_V1
+ERROR 06-28 06:58:53 [gpt_oss_triton_kernels_moe.py:64] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: cannot import name 'SparseMatrix' from 'triton_kernels.tensor' (/usr/local/lib/python3.12/site-packages/vllm/third_party/triton_kernels/tensor.py)
+INFO 06-28 06:58:53 [model.py:549] Resolved architecture: Qwen3ForCausalLM
+INFO 06-28 06:58:53 [model.py:1679] Using max model len 32768
+INFO 06-28 06:59:04 [model.py:549] Resolved architecture: DFlashDraftModel
+INFO 06-28 06:59:04 [model.py:1679] Using max model len 40960
+INFO 06-28 06:59:04 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=51200.
+WARNING 06-28 06:59:04 [scheduler.py:281] max_num_batched_tokens (51200) exceeds max_num_seqs * max_model_len (32768). This may lead to unexpected behavior.
+INFO 06-28 06:59:04 [vllm.py:811] Asynchronous scheduling is enabled.
+INFO 06-28 06:59:04 [kernel.py:196] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+WARNING 06-28 06:59:06 [system_utils.py:152] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=94) INFO 06-28 06:59:15 [core.py:105] Initializing a V1 LLM engine (v0.23.0) with config: model='Qwen/Qwen3-8B', speculative_config=SpeculativeConfig(method='dflash', model='JetSpec/jetspec-qwen3-8b', num_spec_tokens=15), tokenizer='Qwen/Qwen3-8B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=Qwen/Qwen3-8B, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': [], 'compile_ranges_endpoints': [51200], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 32, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native']), enable_flashinfer_autotune=True, moe_backend='auto')
+(EngineCore pid=94) ERROR 06-28 06:59:17 [gpt_oss_triton_kernels_moe.py:64] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: cannot import name 'SparseMatrix' from 'triton_kernels.tensor' (/usr/local/lib/python3.12/site-packages/vllm/third_party/triton_kernels/tensor.py)
+(EngineCore pid=94) INFO 06-28 06:59:17 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.20.14.36:50491 backend=nccl
+(EngineCore pid=94) INFO 06-28 06:59:17 [parallel_state.py:1712] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=94) INFO 06-28 06:59:18 [vllm.py:811] Asynchronous scheduling is enabled.
+(EngineCore pid=94) INFO 06-28 06:59:18 [kernel.py:196] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+(EngineCore pid=94) WARNING 06-28 06:59:18 [__init__.py:206] min_p and logit_bias parameters won't work with speculative decoding.
+(EngineCore pid=94) INFO 06-28 06:59:19 [gpu_model_runner.py:6607] Starting to load model Qwen/Qwen3-8B...
+(EngineCore pid=94) INFO 06-28 06:59:19 [cuda.py:302] Using AttentionBackendEnum.FLASH_ATTN backend.
+(EngineCore pid=94) INFO 06-28 06:59:19 [flash_attn.py:626] Using FlashAttention version 4
+(EngineCore pid=94) INFO 06-28 06:59:40 [weight_utils.py:583] Time spent downloading weights for Qwen/Qwen3-8B: 19.305550 seconds
+(EngineCore pid=94) INFO 06-28 06:59:51 [default_loader.py:384] Loading weights took 10.12 seconds
+(EngineCore pid=94) INFO 06-28 06:59:51 [gpu_model_runner.py:6631] Loading drafter model...
+(EngineCore pid=94) INFO 06-28 06:59:55 [weight_utils.py:583] Time spent downloading weights for JetSpec/jetspec-qwen3-8b: 3.887270 seconds
+(EngineCore pid=94) INFO 06-28 06:59:55 [weight_utils.py:627] No model.safetensors.index.json found in remote.
+(EngineCore pid=94) INFO 06-28 06:59:56 [default_loader.py:384] Loading weights took 0.93 seconds
+(EngineCore pid=94) INFO 06-28 06:59:56 [eagle.py:1483] Detected EAGLE model without its own embed_tokens in the checkpoint. Sharing target model embedding weights with the draft model.
+(EngineCore pid=94) INFO 06-28 06:59:56 [eagle.py:1538] Detected EAGLE model without its own lm_head in the checkpoint. Sharing target model lm_head weights with the draft model.
+(EngineCore pid=94) INFO 06-28 06:59:56 [gpu_model_runner.py:6669] Using auxiliary layers from speculative config: (2, 10, 18, 26, 34)
+(EngineCore pid=94) INFO 06-28 06:59:57 [gpu_model_runner.py:6692] Model loading took 17.3 GiB memory and 36.958288 seconds
+(EngineCore pid=94) INFO 06-28 07:00:05 [backends.py:1051] Using cache directory: /root/.cache/vllm/torch_compile_cache/969dfc79ab/rank_0_0/backbone for vLLM's torch.compile
+(EngineCore pid=94) INFO 06-28 07:00:05 [backends.py:1111] Dynamo bytecode transform time: 7.80 s
+(EngineCore pid=94) INFO 06-28 07:00:11 [backends.py:372] Cache the graph of compile range (1, 51200) for later use
+(EngineCore pid=94) INFO 06-28 07:00:19 [backends.py:390] Compiling a graph for compile range (1, 51200) takes 13.94 s
+(EngineCore pid=94) INFO 06-28 07:00:24 [decorators.py:640] saved AOT compiled function to /root/.cache/vllm/torch_compile_cache/torch_aot_compile/ab249947e08cd85c55b499350eaa8c9b8fc5eb17e6027b758c745532477e4d7e/rank_0_0/model
+(EngineCore pid=94) INFO 06-28 07:00:24 [monitor.py:48] torch.compile took 26.40 s in total
+(EngineCore pid=94) INFO 06-28 07:00:25 [monitor.py:76] Initial profiling/warmup run took 1.54 s
+(EngineCore pid=94) INFO 06-28 07:00:27 [backends.py:1051] Using cache directory: /root/.cache/vllm/torch_compile_cache/969dfc79ab/rank_0_0/eagle_head for vLLM's torch.compile
+(EngineCore pid=94) INFO 06-28 07:00:27 [backends.py:1111] Dynamo bytecode transform time: 1.27 s
+(EngineCore pid=94) INFO 06-28 07:00:27 [backends.py:390] Compiling a graph for compile range (1, 51200) takes 0.37 s
+(EngineCore pid=94) INFO 06-28 07:00:28 [decorators.py:640] saved AOT compiled function to /root/.cache/vllm/torch_compile_cache/torch_aot_compile/73f35b384c061397baa2be5964eaa44a9c86b61d0d41c885ea6eb1a44d7ef218/rank_0_0/model
+(EngineCore pid=94) INFO 06-28 07:00:28 [monitor.py:48] torch.compile took 2.18 s in total
+(EngineCore pid=94) INFO 06-28 07:00:28 [monitor.py:76] Initial profiling/warmup run took 0.02 s
+(EngineCore pid=94) INFO 06-28 07:00:30 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=32
+(EngineCore pid=94) INFO 06-28 07:00:30 [dflash.py:477] DFlash draft CUDAGraph capture sizes (1): [16]
+(EngineCore pid=94) INFO 06-28 07:00:30 [gpu_model_runner.py:7786] Profiling CUDA graph memory: PIECEWISE=2 (largest=32), FULL=1 (largest=16)
+(EngineCore pid=94) INFO 06-28 07:00:48 [gpu_model_runner.py:7874] Estimated CUDA graph memory: 0.06 GiB total
+(EngineCore pid=94) INFO 06-28 07:00:48 [gpu_worker.py:436] Available KV cache memory: 127.41 GiB
+(EngineCore pid=94) INFO 06-28 07:00:48 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.8500 to 0.8503 to maintain the same effective KV cache size.
+(EngineCore pid=94) INFO 06-28 07:00:48 [kv_cache_utils.py:1319] GPU KV cache size: 814,640 tokens
+(EngineCore pid=94) INFO 06-28 07:00:48 [kv_cache_utils.py:1324] Maximum concurrency for 32,768 tokens per request: 24.86x
+(EngineCore pid=94) INFO 06-28 07:00:48 [dflash.py:477] DFlash draft CUDAGraph capture sizes (1): [16]
+(EngineCore pid=94) INFO 06-28 07:00:50 [gpu_model_runner.py:7971] Graph capturing finished in 1 secs, took 0.04 GiB
+(EngineCore pid=94) INFO 06-28 07:00:50 [gpu_worker.py:597] CUDA graph pool memory: 0.04 GiB (actual), 0.06 GiB (estimated), difference: 0.01 GiB (26.1%).
+(EngineCore pid=94) INFO 06-28 07:00:50 [core.py:283] init engine (profile, create kv cache, warmup model) took 52.78 seconds
+(EngineCore pid=94) INFO 06-28 07:00:52 [kernel.py:196] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+(EngineCore pid=94) INFO 06-28 07:00:52 [gpu_model_runner.py:5647] CUDA graph MISS: num_tokens=92, keys_initialized=True, configured_mode=FULL_AND_PIECEWISE
+(EngineCore pid=94) INFO 06-28 07:00:59 [gpu_model_runner.py:5637] CUDA graph HIT: mode=FULL, num_tokens=16 (unpadded=16), num_reqs=1, uniform=True
+(EngineCore pid=94) INFO 06-28 07:01:01 [gpu_model_runner.py:5637] CUDA graph HIT: mode=PIECEWISE, num_tokens=32 (unpadded=28), num_reqs=None, uniform=False
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=1/2 batch=1/4 prompts=1/8
+(EngineCore pid=94) INFO 06-28 07:01:01 [gpu_model_runner.py:5647] CUDA graph MISS: num_tokens=53, keys_initialized=True, configured_mode=FULL_AND_PIECEWISE
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=1/2 batch=2/4 prompts=2/8
+(EngineCore pid=94) INFO 06-28 07:01:01 [gpu_model_runner.py:5647] CUDA graph MISS: num_tokens=84, keys_initialized=True, configured_mode=FULL_AND_PIECEWISE
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=1/2 batch=3/4 prompts=3/8
+(EngineCore pid=94) INFO 06-28 07:01:02 [gpu_model_runner.py:5647] CUDA graph MISS: num_tokens=62, keys_initialized=True, configured_mode=FULL_AND_PIECEWISE
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=1/2 batch=4/4 prompts=4/8
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=2/2 batch=1/4 prompts=5/8
+(EngineCore pid=94) INFO 06-28 07:01:02 [gpu_model_runner.py:5637] CUDA graph HIT: mode=PIECEWISE, num_tokens=32 (unpadded=21), num_reqs=None, uniform=False
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=2/2 batch=2/4 prompts=6/8
+(EngineCore pid=94) INFO 06-28 07:01:02 [gpu_model_runner.py:5637] CUDA graph HIT: mode=PIECEWISE, num_tokens=32 (unpadded=20), num_reqs=None, uniform=False
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=2/2 batch=3/4 prompts=7/8
+(EngineCore pid=94) INFO 06-28 07:01:03 [gpu_model_runner.py:5637] CUDA graph HIT: mode=PIECEWISE, num_tokens=32 (unpadded=30), num_reqs=None, uniform=False
+[PROGRESS] prompt_set=gsm8k mode=dflash tp=1 bs=1 run=2/2 batch=4/4 prompts=8/8
+(EngineCore pid=94) INFO 06-28 07:01:03 [core.py:679] Waiting for in-flight requests to complete before sleeping...
+(EngineCore pid=94) INFO 06-28 07:01:03 [block_pool.py:472] Successfully reset prefix cache
+(EngineCore pid=94) INFO 06-28 07:01:03 [cumem.py:216] CuMemAllocator: sleep freed 0.00 GiB memory in total, of which 0.00 GiB is backed up in CPU and the rest 0.00 GiB is discarded directly.
+(EngineCore pid=94) INFO 06-28 07:01:03 [gpu_worker.py:175] Sleep mode freed 0.03 GiB memory, 147.51 GiB memory is still in use.
+(EngineCore pid=94) INFO 06-28 07:01:03 [abstract.py:326] It took 0.019964 seconds to fall asleep.
+(EngineCore pid=94) INFO 06-28 07:01:03 [core.py:1210] Shutdown initiated (timeout=0)
+(EngineCore pid=94) INFO 06-28 07:01:03 [core.py:1233] Shutdown complete
+[CLEANUP] before: free=30.82 GiB total=178.35 GiB
+[CLEANUP] after: free=177.74 GiB total=178.35 GiB
+[RESULT] mode=dflash tp=1 bs=1 prompt_tokens=582 output_tokens=1910 total_tokens=2492 elapsed_s=2.290 throughput_tok_s=834.09
+[THROUGHPUT] mode=dflash tp=1 bs=1 prefill_tok_s=0.00 decode_tok_s=0.00 e2e_output_tok_s=834.09 e2e_total_tok_s=1088.24 gpu_utilization=0.00%
+[BENCHMARK] mode=dflash tp=1 bs=1 num_samples=8 num_batches=8 mean_time_per_output_token_s=0.001220 benchmark_tok_s=819.41
+[SPEC_METRICS] mode=dflash tp=1 bs=1 num_drafts=387 num_draft_tokens=5805 num_accepted_tokens=1517 acceptance_rate=0.2613 acceptance_length=4.9199
+[PER_DEPTH_ACCEPTANCE] mode=dflash tp=1 bs=1 d0=0.8010 d1=0.6279 d2=0.5039 d3=0.3592 d4=0.2791 d5=0.2377 d6=0.2171 d7=0.1912 d8=0.1550 d9=0.1240 d10=0.1163 d11=0.0930 d12=0.0775 d13=0.0724 d14=0.0646
+[ACCEPTANCE_LEN_HIST] mode=dflash tp=1 bs=1 len0=0.1990 len1=0.1731 len2=0.1240 len3=0.1447 len4=0.0801 len5=0.0413 len6=0.0207 len7=0.0258 len8=0.0362 len9=0.0310 len10=0.0078 len11=0.0233 len12=0.0155 len13=0.0052 len14=0.0078 len15=0.0646
+--------------------------------------------------------------------------------
+Prompt: <|im_start|>user
+Janet’s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?
+Please reason step by step, and put your final answer within \boxed{}.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
+Generated: Let's break this down step by step to find out how much Janet makes at the farmers' market every day.
+
+---
+
+### **Step 1: Total eggs laid per day**
+Janet’s ducks lay **16 eggs per day**.
+
+---
+
+### **Step 2: Eggs used for breakfast**
+Janet eats **3 eggs for breakfast** every morning.
+
+So, eggs used for breakfast = **3**
+
+---
+
+### **Step 3: Eggs used for muffins**
+She bakes muffins every day using **4 eggs**.
+
+So, eggs used for muffins = **4**
+
+---
+
+### **Step 4: Total eggs used**
+Total eggs used = eggs for breakfast + eggs for muffins  
+= 3 + 4 = **7 eggs**
+
+---
+
+### **Step 5: Eggs left for sale**
+Eggs left for sale = total eggs laid - eggs used  
+= 16 - 7 = **9 eggs**
+
+---
+
+### **Step 6: Revenue from selling eggs**
+She sells the remaining eggs at **$2 per egg**.
+
+So, daily revenue = 9 eggs × $2/egg = **$18**
+
+---
+
+### ✅ Final Answer:
+$$
+\boxed{18}
+$$
+
+Janet makes **$18** every day at the farmers' market.
+--------------------------------------------------------------------------------
+Prompt: <|im_start|>user
+A robe takes 2 bolts of blue fiber and half that much white fiber.  How many bolts in total does it take?
+Please reason step by step, and put your final answer within \boxed{}.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
+Generated: Let's break this down step by step.
+
+### Step 1: Understand the quantities
+- A robe requires **2 bolts of blue fiber**.
+- It also requires **half that much white fiber**.
+
+So, the amount of white fiber is:
+
+$$
+\frac{1}{2} \times 2 = 1 \text{ bolt of white fiber}
+$$
+
+### Step 2: Add the quantities
+Now, add the blue and white fiber together:
+
+$$
+2 \text{ (blue)} + 1 \text{ (white)} = 3 \text{ bolts total}
+$$
+
+### Final Answer:
+$$
+\boxed{3}
+$$
+--------------------------------------------------------------------------------
+Prompt: <|im_start|>user
+Josh decides to try flipping a house.  He buys a house for $80,000 and then puts in $50,000 in repairs.  This increased the value of the house by 150%.  How much profit did he make?
+Please reason step by step, and put your final answer within \boxed{}.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
+Generated: Let's break this down step by step to find out how much **profit** Josh made.
+
+---
+
+### **Step 1: Initial Cost of the House**
+Josh buys the house for:
+
+$$
+\$80,000
+$$
+
+---
+
+### **Step 2: Cost of Repairs**
+He spends an additional:
+
+$$
+\$50,000
+$$
+
+on repairs.
+
+---
+
+### **Step 3: Total Investment**
+Total amount Josh invested is:
+
+$$
+\$80,000 + \$50,000 = \$130,000
+$$
+
+---
+
+### **Step 4: Increase in Value**
+The repairs increased the value of the house by **150%**.
+
+So, the **increase in value** is:
+
+$$
+150\% \text{ of } \$80,000 = 1.5 \times 80,000 = \$120,000
+$$
+
+---
+
+### **Step 5: Final Value of the House**
+The original value of the house was \$80,000, and it increased by \$120,000, so the **final value** is:
+
+$$
+\$80,000 + \$120,000 = \$200,000
+$$
+
+---
+
+### **Step 6: Profit Calculation**
+Profit = Final Value - Total Investment
+
+$$
+\text{Profit} = \$200,000 - \$130,000 = \boxed{\$70,000}
+$$
+
+---
+
+### ✅ Final Answer:
+$$
+\boxed{\$70,000}
+$$
+Wrote metrics summary to: vllm_profile_dflash/metrics_summary.txt
+
+===STDERR(tail)===
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.59it/s, est. speed input: 296.67 toks/s, output: 772.42 toks/s]
+
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1492.63it/s]
+
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.80it/s, est. speed input: 235.01 toks/s, output: 1026.72 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.80it/s, est. speed input: 235.01 toks/s, output: 1026.72 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.80it/s, est. speed input: 235.01 toks/s, output: 1026.72 toks/s]
+
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1478.95it/s]
+
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.04it/s, est. speed input: 312.79 toks/s, output: 902.97 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.04it/s, est. speed input: 312.79 toks/s, output: 902.97 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.04it/s, est. speed input: 312.79 toks/s, output: 902.97 toks/s]
+
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1467.57it/s]
+
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.65it/s, est. speed input: 243.81 toks/s, output: 718.14 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.65it/s, est. speed input: 243.81 toks/s, output: 718.14 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.65it/s, est. speed input: 243.81 toks/s, output: 718.14 toks/s]
+
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1566.21it/s]
+
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.72it/s, est. speed input: 303.13 toks/s, output: 789.23 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.72it/s, est. speed input: 303.13 toks/s, output: 789.23 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.71it/s, est. speed input: 303.13 toks/s, output: 789.23 toks/s]
+
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1629.49it/s]
+
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.75it/s, est. speed input: 230.89 toks/s, output: 1008.71 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.75it/s, est. speed input: 230.89 toks/s, output: 1008.71 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  2.75it/s, est. speed input: 230.89 toks/s, output: 1008.71 toks/s]
+
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]
+Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1520.78it/s]
+
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.19it/s, est. speed input: 322.11 toks/s, output: 929.90 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.19it/s, est. speed input: 322.11 toks/s, output: 929.90 toks/s]
+Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  5.19it/s, est. speed input: 322.11 toks/s, output: 929.90 toks/s]
+[rank0]:[W628 07:01:03.186067710 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

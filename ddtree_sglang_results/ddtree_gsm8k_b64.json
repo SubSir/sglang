@@ -1,0 +1,30 @@
+{
+  "algo": "DDTREE",
+  "budget": 64,
+  "dataset": "gsm8k",
+  "ready": true,
+  "exit": null,
+  "rows": [
+    {
+      "conc": 1,
+      "tok_s": 182.4,
+      "accept_len": 5.206,
+      "tokens": 12468,
+      "secs": 68.34
+    },
+    {
+      "conc": 8,
+      "tok_s": 321.0,
+      "accept_len": 3.143,
+      "tokens": 15757,
+      "secs": 49.09
+    },
+    {
+      "conc": 32,
+      "tok_s": 457.7,
+      "accept_len": 3.083,
+      "tokens": 16121,
+      "secs": 35.22
+    }
+  ]
+}

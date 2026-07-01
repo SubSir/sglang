@@ -1,0 +1,169 @@
+{
+  "tag": "chain",
+  "tree": false,
+  "topk": 1,
+  "budget": 16,
+  "trace_files": [
+    "/results/prof_chain/1782720476.1929605-TP-0.trace.json.gz",
+    "/results/prof_chain/1782720476.1929605-TP-0.trace.json.gz"
+  ],
+  "wall_us": 3386696.3,
+  "gpu_busy_us": 5482395.9,
+  "gpu_util_pct": 161.9,
+  "accept_verify_ct": [
+    47,
+    29,
+    51,
+    51,
+    39,
+    55
+  ],
+  "top_gpu_kernels": [
+    {
+      "name": "scheduler.run_batch",
+      "us": 2150490.0
+    },
+    {
+      "name": "step[TARGET_VERIFY bs=1]",
+      "us": 1756054.9
+    },
+    {
+      "name": "nvjet_tst_192x16_64x8_4x1_v_bz_TNT",
+      "us": 402256.4
+    },
+    {
+      "name": "nvjet_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT",
+      "us": 212854.7
+    },
+    {
+      "name": "nvjet_tst_32x64_64x16_4x1_v_bz_TNN",
+      "us": 135128.5
+    },
+    {
+      "name": "nvjet_tst_64x16_64x16_4x1_v_bz_TNT",
+      "us": 127926.6
+    },
+    {
+      "name": "nvjet_tst_384x16_64x4_4x1_v_bz_TNT",
+      "us": 114370.7
+    },
+    {
+      "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::Kernel",
+      "us": 99617.9
+    },
+    {
+      "name": "void flashinfer::norm::FusedAddRMSNormKernel<8u, __nv_bfloat16>(__nv_b",
+      "us": 72402.6
+    },
+    {
+      "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp",
+      "us": 36165.2
+    },
+    {
+      "name": "void flashinfer::PersistentVariableLengthMergeStatesKernel<8u, 16u, 8u",
+      "us": 34923.5
+    },
+    {
+      "name": "void (anonymous namespace)::act_and_mul_kernel<__nv_bfloat16, ((anonym",
+      "us": 31100.9
+    },
+    {
+      "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, ",
+      "us": 28006.7
+    },
+    {
+      "name": "scheduler.get_next_batch_to_run",
+      "us": 27418.7
+    },
+    {
+      "name": "void (anonymous namespace)::fused_rope_kernel<true, 128l, true, __nv_b",
+      "us": 25118.6
+    },
+    {
+      "name": "void (anonymous namespace)::fused_qknorm_warp<128l, true, __nv_bfloat1",
+      "us": 24303.2
+    },
+    {
+      "name": "void (anonymous namespace)::store_kvcache<2048l, 4, true, long>((anony",
+      "us": 21361.4
+    },
+    {
+      "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunc",
+      "us": 13577.9
+    }
+  ],
+  "top_cpu_ops": [
+    {
+      "name": "threading.py(1030): _bootstrap",
+      "us": 11712180.7
+    },
+    {
+      "name": "threading.py(1073): _bootstrap_inner",
+      "us": 11712177.7
+    },
+    {
+      "name": "tqdm/_monitor.py(69): run",
+      "us": 9369696.1
+    },
+    {
+      "name": "threading.py(655): wait",
+      "us": 9369695.2
+    },
+    {
+      "name": "threading.py(359): wait",
+      "us": 9369693.1
+    },
+    {
+      "name": "threading.py(1010): run",
+      "us": 2342477.5
+    },
+    {
+      "name": "python/sglang/srt/utils/watchdog.py(127): _watchdog_thread",
+      "us": 2342476.5
+    },
+    {
+      "name": "python/sglang/srt/utils/watchdog.py(147): _watchdog_once",
+      "us": 2342473.9
+    },
+    {
+      "name": "<string>(1): <module>",
+      "us": 2342410.1
+    },
+    {
+      "name": "multiprocessing/spawn.py(122): spawn_main",
+      "us": 2342408.9
+    },
+    {
+      "name": "multiprocessing/spawn.py(135): _main",
+      "us": 2342407.2
+    },
+    {
+      "name": "multiprocessing/process.py(314): _bootstrap",
+      "us": 2342406.0
+    },
+    {
+      "name": "multiprocessing/process.py(108): run",
+      "us": 2342405.0
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(4303): run_scheduler_process",
+      "us": 2342403.7
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(1501): run_event_loop",
+      "us": 2342402.0
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(4168): dispatch_event_loop",
+      "us": 2342401.1
+    },
+    {
+      "name": "torch/utils/_contextlib.py(124): decorate_context",
+      "us": 2342398.4
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(1567): event_loop_overlap",
+      "us": 2342397.5
+    }
+  ]
+}

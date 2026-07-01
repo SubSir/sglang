@@ -1,0 +1,30 @@
+{
+  "algo": "DDTREE",
+  "budget": 16,
+  "dataset": "mt-bench",
+  "ready": true,
+  "exit": null,
+  "rows": [
+    {
+      "conc": 1,
+      "tok_s": 122.4,
+      "accept_len": 3.575,
+      "tokens": 11265,
+      "secs": 92.04
+    },
+    {
+      "conc": 8,
+      "tok_s": 480.5,
+      "accept_len": 4.626,
+      "tokens": 18765,
+      "secs": 39.06
+    },
+    {
+      "conc": 32,
+      "tok_s": 650.1,
+      "accept_len": 3.819,
+      "tokens": 16614,
+      "secs": 25.56
+    }
+  ]
+}

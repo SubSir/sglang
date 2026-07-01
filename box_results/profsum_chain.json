@@ -1,0 +1,181 @@
+{
+  "tag": "chain",
+  "tree": false,
+  "topk": 1,
+  "budget": 16,
+  "trace_files": [
+    "/results/prof_chain/1782720476.1929605-TP-0.trace.json.gz",
+    "/results/prof_chain/1782720476.1929605-TP-0.trace.json.gz",
+    "/results/prof_chain/1782722216.1204915-TP-0.trace.json.gz",
+    "/results/prof_chain/1782722216.1204915-TP-0.trace.json.gz",
+    "/results/prof_chain/1782723228.9025643-TP-0.trace.json.gz",
+    "/results/prof_chain/1782723228.9025643-TP-0.trace.json.gz",
+    "/results/prof_chain/1782724551.3803833-TP-0.trace.json.gz",
+    "/results/prof_chain/1782724551.3803833-TP-0.trace.json.gz",
+    "/results/prof_chain/1782727067.169454-TP-0.trace.json.gz",
+    "/results/prof_chain/1782727067.169454-TP-0.trace.json.gz",
+    "/results/prof_chain/1782732628.3151002-TP-0.trace.json.gz",
+    "/results/prof_chain/1782732628.3151002-TP-0.trace.json.gz",
+    "/results/prof_chain/1782788741.5924551-TP-0.trace.json.gz",
+    "/results/prof_chain/1782788741.5924551-TP-0.trace.json.gz"
+  ],
+  "wall_us": 3407145.6,
+  "gpu_busy_us": 5445059.7,
+  "gpu_util_pct": 159.8,
+  "accept_verify_ct": [
+    47,
+    29,
+    51,
+    51,
+    39,
+    55
+  ],
+  "top_gpu_kernels": [
+    {
+      "name": "scheduler.run_batch",
+      "us": 2128458.3
+    },
+    {
+      "name": "step[TARGET_VERIFY bs=1]",
+      "us": 1742751.7
+    },
+    {
+      "name": "nvjet_tst_192x16_64x8_4x1_v_bz_TNT",
+      "us": 399020.1
+    },
+    {
+      "name": "nvjet_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT",
+      "us": 213170.7
+    },
+    {
+      "name": "nvjet_tst_32x64_64x16_4x1_v_bz_TNN",
+      "us": 137007.1
+    },
+    {
+      "name": "nvjet_tst_64x16_64x16_4x1_v_bz_TNT",
+      "us": 128111.3
+    },
+    {
+      "name": "nvjet_tst_384x16_64x4_4x1_v_bz_TNT",
+      "us": 113704.9
+    },
+    {
+      "name": "void flashinfer::BatchPrefillWithPagedKVCacheKernel<flashinfer::Kernel",
+      "us": 101855.9
+    },
+    {
+      "name": "void flashinfer::norm::FusedAddRMSNormKernel<8u, __nv_bfloat16>(__nv_b",
+      "us": 72352.1
+    },
+    {
+      "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp",
+      "us": 36076.6
+    },
+    {
+      "name": "void flashinfer::PersistentVariableLengthMergeStatesKernel<8u, 16u, 8u",
+      "us": 34181.9
+    },
+    {
+      "name": "void (anonymous namespace)::act_and_mul_kernel<__nv_bfloat16, ((anonym",
+      "us": 31345.6
+    },
+    {
+      "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, ",
+      "us": 27898.5
+    },
+    {
+      "name": "scheduler.get_next_batch_to_run",
+      "us": 26483.1
+    },
+    {
+      "name": "void (anonymous namespace)::fused_rope_kernel<true, 128l, true, __nv_b",
+      "us": 24946.1
+    },
+    {
+      "name": "void (anonymous namespace)::fused_qknorm_warp<128l, true, __nv_bfloat1",
+      "us": 24183.8
+    },
+    {
+      "name": "void (anonymous namespace)::store_kvcache<2048l, 4, true, long>((anony",
+      "us": 21103.1
+    },
+    {
+      "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunc",
+      "us": 13650.1
+    }
+  ],
+  "top_cpu_ops": [
+    {
+      "name": "threading.py(1030): _bootstrap",
+      "us": 11578721.5
+    },
+    {
+      "name": "threading.py(1073): _bootstrap_inner",
+      "us": 11578719.2
+    },
+    {
+      "name": "tqdm/_monitor.py(69): run",
+      "us": 9262934.0
+    },
+    {
+      "name": "threading.py(655): wait",
+      "us": 8397591.4
+    },
+    {
+      "name": "threading.py(359): wait",
+      "us": 8397580.7
+    },
+    {
+      "name": "threading.py(1010): run",
+      "us": 2315781.2
+    },
+    {
+      "name": "python/sglang/srt/utils/watchdog.py(127): _watchdog_thread",
+      "us": 2315780.0
+    },
+    {
+      "name": "python/sglang/srt/utils/watchdog.py(147): _watchdog_once",
+      "us": 2315778.8
+    },
+    {
+      "name": "<string>(1): <module>",
+      "us": 2315723.6
+    },
+    {
+      "name": "multiprocessing/spawn.py(122): spawn_main",
+      "us": 2315722.5
+    },
+    {
+      "name": "multiprocessing/spawn.py(135): _main",
+      "us": 2315721.2
+    },
+    {
+      "name": "multiprocessing/process.py(314): _bootstrap",
+      "us": 2315720.2
+    },
+    {
+      "name": "multiprocessing/process.py(108): run",
+      "us": 2315719.2
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(4303): run_scheduler_process",
+      "us": 2315718.0
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(1501): run_event_loop",
+      "us": 2315717.1
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(4168): dispatch_event_loop",
+      "us": 2315716.3
+    },
+    {
+      "name": "torch/utils/_contextlib.py(124): decorate_context",
+      "us": 2315714.2
+    },
+    {
+      "name": "python/sglang/srt/managers/scheduler.py(1567): event_loop_overlap",
+      "us": 2315713.6
+    }
+  ]
+}

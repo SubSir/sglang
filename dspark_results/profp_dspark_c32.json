@@ -1,0 +1,12 @@
+{
+  "method": "dspark",
+  "conc": 32,
+  "trace_file": "/results/tracep_dspark_c32/rank0.1782867345999199591.pt.trace.json.gz",
+  "n_propose_spans": 10,
+  "n_kernels": 2894,
+  "draft_gpu_us_total": 7711.8,
+  "verify_gpu_us_total": 51988.4,
+  "total_gpu_us": 59700.2,
+  "draft_gpu_us_per_step": 771.2,
+  "verify_gpu_us_per_step": 5198.8
+}

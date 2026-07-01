@@ -677,9 +677,13 @@ def main() -> None:
                     ["--mamba-scheduler-strategy", "extra_buffer"]
                 )
 
-            # Tree verify forces the verify step eager, which desyncs the spec-v2
-            # overlap pipeline; run synchronously when tree verify is on.
-            if os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1":
+            # Tree verify is mask-capable cuda-graph in the v2 port, so it runs
+            # fine WITH the overlap scheduler — keeping overlap ON hides the
+            # tree-build CPU work behind the GPU (measured: +15% tok/s, accept
+            # unchanged/lossless). Only disable when explicitly forced (some
+            # models/backends may still need it off).
+            if (os.environ.get("SGLANG_DFLASH_TREE_VERIFY", "0") == "1"
+                    and os.environ.get("SGLANG_DFLASH_FORCE_NO_OVERLAP", "0") == "1"):
                 common_server_args.append("--disable-overlap-schedule")
 
             # VL models (e.g. Qwen3.6-VL) route their vision tower through

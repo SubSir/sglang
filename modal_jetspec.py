@@ -19,8 +19,10 @@ vol = modal.Volume.from_name("jetspec-results", create_if_missing=True)
 image = (
     modal.Image.from_registry("lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96")
     .run_commands(
-        "echo js1 > /tmp/bt",
+        "echo js2 > /tmp/bt",
         "git clone --depth 1 https://github.com/hao-ai-lab/JetSpec /root/JetSpec",
+        # DATA CONTROL: drop shuffle(seed=0) -> first-N (matches sglang/DDTree first-N).
+        "sed -i 's/\\.shuffle(seed=0)\\.select/.select/' /root/JetSpec/bench/reference/benchmark.py",
         # bench+kernel extras (datasets, triton); skip flash-attn (sdpa base + triton tree
         # avoids the slow/fragile sm_100 flash-attn source build).
         "cd /root/JetSpec && pip install -e '.[bench,kernel]' --no-build-isolation || "
@@ -59,31 +61,124 @@ def run(script, extra_args, tag, env_extra=None):
 
 
 @app.local_entrypoint()
-def reference(datasets: str = "gsm8k", samples: int = 32):
-    """JetSpec tree vs DFlash baseline (HF reference): accept length + speedup, one run each."""
-    for ds in datasets.split(","):
-        run.remote(
+def reference(dataset: str = "gsm8k", samples: int = 32,
+              budgets: str = "16,32,64,128,256", width: str = "2"):
+    """Acc-len vs budget sweep (first-N data control). accum_logp tree.
+    First budget run also emits the DFlash chain baseline for reference."""
+    handles = []
+    for i, b in enumerate(budgets.split(",")):
+        extra = ["--include-dflash-baseline"] if i == 0 else []
+        handles.append(run.spawn(
             "bench/reference/benchmark.py",
-            ["--model", "Qwen/Qwen3-8B", "--dataset", ds, "--samples", str(samples),
-             "--algos", "accum_logp", "--width", "7", "--depth", "20", "--budget", "256",
+            ["--model", "Qwen/Qwen3-8B", "--dataset", dataset, "--samples", str(samples),
+             "--algos", "accum_logp", "--width", width, "--depth", "20", "--budget", b,
              "--max-new", "1024", "--tree-attn-implementation", "triton",
-             "--attn-implementation", "sdpa", "--include-dflash-baseline"],
-            f"reference_{ds}")
+             "--attn-implementation", "sdpa", *extra],
+            f"ref_{dataset}_w{width}_b{b}"))
+    print(f"launched JetSpec ref sweep: {dataset} budgets={budgets} width={width} — waiting")
+    for h in handles:
+        print(h.get()[-300:])
 
 
 @app.local_entrypoint()
-def engine(prompt_sets: str = "gsm8k,mt_bench", samples: int = 32):
-    """JetSpec engine wall-clock tok/s with cuda-graph drafter (headline numbers)."""
+def engine(prompt_sets: str = "gsm8k,mt_bench", samples: int = 32,
+           budgets: str = "16,32,64,128,256", widths: str = "7", tree_depth: int = 20,
+           draft_head: str = "JetSpec/jetspec-qwen3-8b", tag_suffix: str = ""):
+    """JetSpec engine wall-clock tok/s (conc=1) with cuda-graph drafter — budget x width
+    sweep. This is JetSpec's BEST/headline path (own engine, only conc=1). tree_depth=20
+    matches the official README config (b128/w7/depth20 -> their reported numbers).
+    draft_head: swap in a different DFlash head (e.g. z-lab/Qwen3-8B-DFlash-b16 = OUR
+    bidirectional head, which loads via the same DFlashDraftModel.from_pretrained and
+    runs bidirectional automatically since its config has no causal_head)."""
     env = {"JETSPEC_FUSE_GEMMS": "1",
            "JETSPEC_BACKEND": "triton_paged_tree_cudagraph_nogather"}
+    handles = []
     for ps in prompt_sets.split(","):
-        run.remote(
-            "bench/engine/tps_walltime.py",
-            ["--model", "Qwen/Qwen3-8B", "--prompt-set", ps, "--samples", str(samples),
-             "--max-tokens", "2048", "--tree-depth", "15", "--tree-width", "7",
-             "--budget", "127", "--algo", "accum_logp", "--drafter", "graphed",
-             "--warm-all", "--session"],
-            f"engine_{ps}", env_extra=env)
+        for b in budgets.split(","):
+            for w in widths.split(","):
+                handles.append(run.spawn(
+                    "bench/engine/tps_walltime.py",
+                    ["--model", "Qwen/Qwen3-8B", "--draft-head", draft_head,
+                     "--prompt-set", ps, "--samples", str(samples),
+                     "--max-tokens", "2048", "--tree-depth", str(tree_depth), "--tree-width", w,
+                     "--budget", b, "--algo", "accum_logp", "--drafter", "graphed",
+                     "--warm-all", "--session"],
+                    f"engine_{ps}_b{b}_w{w}_d{tree_depth}_s{samples}{tag_suffix}", env_extra=env))
+    print(f"launched JetSpec engine: {prompt_sets} b={budgets} w={widths} d={tree_depth} head={draft_head} — waiting")
+    for h in handles:
+        print(h.get()[-200:])
+
+
+@app.function(gpu="B200", timeout=10800, image=image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": vol})
+def head_ab(prompt_set: str = "gsm8k", samples: int = 80, budget: int = 128,
+            width: int = 7, tree_depth: int = 20):
+    """SAME-CARD A/B: jetspec head vs OUR DFlash head, both in JetSpec's fast engine,
+    back-to-back in ONE container (kills host variance). Compute per step is identical
+    (same DFlash arch, configs differ only in causal_head -> draft mask); so if our
+    head's acc (higher) holds, it should give >= throughput on the same card."""
+    import subprocess
+    env = dict(os.environ)
+    env["JETSPEC_FUSE_GEMMS"] = "1"
+    env["JETSPEC_BACKEND"] = "triton_paged_tree_cudagraph_nogather"
+    env["PYTHONPATH"] = "/root/JetSpec"
+    out = {}
+    for label, head in [("jetspec", "JetSpec/jetspec-qwen3-8b"),
+                        ("ourhead", "z-lab/Qwen3-8B-DFlash-b16")]:
+        cmd = ["python", "bench/engine/tps_walltime.py", "--model", "Qwen/Qwen3-8B",
+               "--draft-head", head, "--prompt-set", prompt_set, "--samples", str(samples),
+               "--max-tokens", "2048", "--tree-depth", str(tree_depth), "--tree-width", str(width),
+               "--budget", str(budget), "--algo", "accum_logp", "--drafter", "graphed",
+               "--warm-all", "--session"]
+        p = subprocess.run(cmd, cwd="/root/JetSpec", env=env, capture_output=True, text=True)
+        lines = [l for l in p.stdout.splitlines() if l.startswith("tree ")]
+        out[label] = lines[-1] if lines else ("ERR " + (p.stdout[-200:] + p.stderr[-300:]))
+        with open(f"/results/headab_{label}_{prompt_set}.txt", "w") as f:
+            f.write(p.stdout + "\n==ERR==\n" + p.stderr[-2000:])
+    vol.commit()
+    for k, v in out.items():
+        print(f">>> {k}: {v}", flush=True)
+    return out
+
+
+@app.function(gpu="B200", timeout=10800, image=image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": vol})
+def config_ab(prompt_set: str = "gsm8k", samples: int = 128, tree_depth: int = 20):
+    """SAME-CARD A/B: jetspec b128/w7 vs b32/w2, back-to-back in ONE container (kills
+    host variance) -> definitive answer to which jetspec config is faster."""
+    import subprocess
+    env = dict(os.environ)
+    env["JETSPEC_FUSE_GEMMS"] = "1"
+    env["JETSPEC_BACKEND"] = "triton_paged_tree_cudagraph_nogather"
+    env["PYTHONPATH"] = "/root/JetSpec"
+    out = {}
+    for label, budget, width in [("b128_w7", 128, 7), ("b32_w2", 32, 2)]:
+        cmd = ["python", "bench/engine/tps_walltime.py", "--model", "Qwen/Qwen3-8B",
+               "--draft-head", "JetSpec/jetspec-qwen3-8b", "--prompt-set", prompt_set,
+               "--samples", str(samples), "--max-tokens", "1024",
+               "--tree-depth", str(tree_depth), "--tree-width", str(width),
+               "--budget", str(budget), "--algo", "accum_logp", "--drafter", "graphed",
+               "--warm-all", "--session"]
+        p = subprocess.run(cmd, cwd="/root/JetSpec", env=env, capture_output=True, text=True)
+        lines = [l for l in p.stdout.splitlines() if l.startswith("tree ")]
+        out[label] = lines[-1] if lines else ("ERR " + (p.stdout[-200:] + p.stderr[-300:]))
+    for k, v in out.items():
+        print(f">>> {k}: {v}", flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def cfgab(prompt_sets: str = "gsm8k,math500", samples: int = 128):
+    hs = [(ps, config_ab.spawn(ps, samples)) for ps in prompt_sets.split(",")]
+    for ps, h in hs:
+        print(f"=== {ps} ==="); print(h.get())
+
+
+@app.local_entrypoint()
+def headab(prompt_set: str = "gsm8k", samples: int = 80, budget: int = 128):
+    print(head_ab.remote(prompt_set, samples, budget))
 
 
 @app.function(image=image, volumes={"/results": vol})

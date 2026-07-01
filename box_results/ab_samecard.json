@@ -1,0 +1,38 @@
+{
+  "math500": {
+    "dflash": {
+      "tok_s": 1104.3,
+      "accept": 7.816,
+      "per_forward_ms": 6.714,
+      "forward_ct": 7133,
+      "tokens": 52885,
+      "secs": 47.9
+    },
+    "domino_opt": {
+      "tok_s": 1182.4,
+      "accept": 9.275,
+      "per_forward_ms": 7.187,
+      "forward_ct": 6210,
+      "tokens": 52771,
+      "secs": 44.6
+    }
+  },
+  "mbpp": {
+    "dflash": {
+      "tok_s": 852.8,
+      "accept": 5.557,
+      "per_forward_ms": 6.408,
+      "forward_ct": 10699,
+      "tokens": 58464,
+      "secs": 68.6
+    },
+    "domino_opt": {
+      "tok_s": 883.4,
+      "accept": 6.253,
+      "per_forward_ms": 6.936,
+      "forward_ct": 9572,
+      "tokens": 58652,
+      "secs": 66.4
+    }
+  }
+}

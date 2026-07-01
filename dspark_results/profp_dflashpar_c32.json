@@ -1,0 +1,12 @@
+{
+  "method": "dspark",
+  "conc": 32,
+  "trace_file": "/results/tracep_dflashpar_c32/rank0.1782867192253671541.pt.trace.json.gz",
+  "n_propose_spans": 10,
+  "n_kernels": 2714,
+  "draft_gpu_us_total": 6248.3,
+  "verify_gpu_us_total": 50854.9,
+  "total_gpu_us": 57103.2,
+  "draft_gpu_us_per_step": 624.8,
+  "verify_gpu_us_per_step": 5085.5
+}

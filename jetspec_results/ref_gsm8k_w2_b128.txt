@@ -1,0 +1,59 @@
+outputs saved → /root/JetSpec/bench/outputs/20260628_222450_Qwen3-8B/
+
+model=Qwen/Qwen3-8B head=JetSpec/jetspec-qwen3-8b
+dataset=gsm8k samples=32 world_size=1 block_size=16 tree_depth=16 width=2 budget=128 max_new=1024
+attn_implementation=sdpa torch_compile=False fused_moe_blocks=0 tree_attn_implementation=triton draft_attn=sdpa
+AR-greedy baseline: decode=80.5 tok/s/gpu  e2e=79.4 tok/s/gpu  (10000 tok, avg_decode_ms=3882.7, avg_wall_ms=3935.6)
+
+algorithm              accept_len     d0     d1     d2     d3   tree decode_tps  e2e_tps  speedup e2e_spdup
+-----------------------------------------------------------------------------------------------------------
+accum_logp                   7.24   0.94   0.83   0.73   0.63    128      277.4    271.7     3.45      3.42
+
+accept_len = tokens/forward (= reference Average Acceptance length).
+d_k = per-position accept rate.
+decode_tps = latency-derived from decode-only time (prefill excluded).
+e2e_tps = latency-derived from total wall time (prefill included).
+speedup = decode_tps / AR decode_tps.
+e2e_spdup = e2e_tps / AR e2e_tps.
+
+===STDERR(tail)===
+AR decode:  91%|█████████ | 29/32 [01:54<00:10,  3.45s/it]
+AR decode:  94%|█████████▍| 30/32 [01:58<00:06,  3.47s/it]
+AR decode:  97%|█████████▋| 31/32 [02:01<00:03,  3.49s/it]
+AR decode: 100%|██████████| 32/32 [02:05<00:00,  3.71s/it]
+AR decode: 100%|██████████| 32/32 [02:05<00:00,  3.94s/it]
+
+accum_logp tree decode:   0%|          | 0/32 [00:00<?, ?it/s]
+accum_logp tree decode:   3%|▎         | 1/32 [00:00<00:30,  1.03it/s]
+accum_logp tree decode:   6%|▋         | 2/32 [00:01<00:20,  1.47it/s]
+accum_logp tree decode:   9%|▉         | 3/32 [00:02<00:24,  1.18it/s]
+accum_logp tree decode:  12%|█▎        | 4/32 [00:03<00:25,  1.12it/s]
+accum_logp tree decode:  16%|█▌        | 5/32 [00:05<00:34,  1.27s/it]
+accum_logp tree decode:  19%|█▉        | 6/32 [00:07<00:40,  1.57s/it]
+accum_logp tree decode:  22%|██▏       | 7/32 [00:08<00:36,  1.44s/it]
+accum_logp tree decode:  25%|██▌       | 8/32 [00:11<00:41,  1.74s/it]
+accum_logp tree decode:  28%|██▊       | 9/32 [00:13<00:46,  2.03s/it]
+accum_logp tree decode:  31%|███▏      | 10/32 [00:15<00:40,  1.85s/it]
+accum_logp tree decode:  34%|███▍      | 11/32 [00:15<00:31,  1.48s/it]
+accum_logp tree decode:  38%|███▊      | 12/32 [00:17<00:33,  1.67s/it]
+accum_logp tree decode:  41%|████      | 13/32 [00:19<00:31,  1.65s/it]
+accum_logp tree decode:  44%|████▍     | 14/32 [00:21<00:33,  1.88s/it]
+accum_logp tree decode:  47%|████▋     | 15/32 [00:22<00:26,  1.59s/it]
+accum_logp tree decode:  50%|█████     | 16/32 [00:24<00:23,  1.48s/it]
+accum_logp tree decode:  53%|█████▎    | 17/32 [00:24<00:18,  1.22s/it]
+accum_logp tree decode:  56%|█████▋    | 18/32 [00:25<00:15,  1.11s/it]
+accum_logp tree decode:  59%|█████▉    | 19/32 [00:26<00:13,  1.01s/it]
+accum_logp tree decode:  62%|██████▎   | 20/32 [00:27<00:14,  1.17s/it]
+accum_logp tree decode:  66%|██████▌   | 21/32 [00:29<00:13,  1.20s/it]
+accum_logp tree decode:  69%|██████▉   | 22/32 [00:29<00:10,  1.01s/it]
+accum_logp tree decode:  72%|███████▏  | 23/32 [00:30<00:08,  1.07it/s]
+accum_logp tree decode:  75%|███████▌  | 24/32 [00:31<00:06,  1.18it/s]
+accum_logp tree decode:  78%|███████▊  | 25/32 [00:31<00:05,  1.27it/s]
+accum_logp tree decode:  81%|████████▏ | 26/32 [00:32<00:04,  1.24it/s]
+accum_logp tree decode:  84%|████████▍ | 27/32 [00:33<00:04,  1.25it/s]
+accum_logp tree decode:  88%|████████▊ | 28/32 [00:34<00:03,  1.29it/s]
+accum_logp tree decode:  91%|█████████ | 29/32 [00:34<00:02,  1.30it/s]
+accum_logp tree decode:  94%|█████████▍| 30/32 [00:35<00:01,  1.31it/s]
+accum_logp tree decode:  97%|█████████▋| 31/32 [00:36<00:00,  1.31it/s]
+accum_logp tree decode: 100%|██████████| 32/32 [00:37<00:00,  1.32it/s]
+accum_logp tree decode: 100%|██████████| 32/32 [00:37<00:00,  1.16s/it]

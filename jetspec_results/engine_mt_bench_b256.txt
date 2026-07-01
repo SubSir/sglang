@@ -1,0 +1,24 @@
+
+backend=triton_paged_tree_cudagraph_nogather  head=JetSpec/jetspec-qwen3-8b  algo=accum_logp
+model=Qwen/Qwen3-8B  attn_implementation=sdpa  draft_attn=sdpa  torch_compile=False  fused_moe_blocks=0
+samples=32 world_size=1 budget=256 tree_depth=15 width=7 max_tokens=2048
+AR    : 11448 tok   86.135s  ->     132.9 tok/s   (1x baseline)
+tree  : 11828 tok   32.536s  ->     363.5 tok/s   accept_len=4.06
+
+WALL-CLOCK spec speedup = 2.74x   (spec 364 tok/s vs AR 133 tok/s)
+
+===STDERR(tail)===
+/usr/local/lib/python3.12/dist-packages/torchao/quantization/quant_api.py:1731: SyntaxWarning: invalid escape sequence '\.'
+  """Configuration class for applying different quantization configs to modules or parameters based on their fully qualified names (FQNs).
+
+Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]
+Fetching 5 files:  20%|██        | 1/5 [00:54<03:37, 54.41s/it]
+Fetching 5 files: 100%|██████████| 5/5 [00:54<00:00, 10.88s/it]
+
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:00<00:00, 53.32it/s]
+
+Generating train split:   0%|          | 0/80 [00:00<?, ? examples/s]
+Generating train split: 100%|██████████| 80/80 [00:00<00:00, 19441.70 examples/s]
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/compile_fx.py:322: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(

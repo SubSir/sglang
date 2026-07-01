@@ -1,0 +1,25 @@
+{
+  "algo": "DFLASH",
+  "budget": 16,
+  "ready": true,
+  "rows": [
+    {
+      "conc": 1,
+      "tok_s": 817.7,
+      "tokens": 9994,
+      "secs": 12.22
+    },
+    {
+      "conc": 8,
+      "tok_s": 3395.0,
+      "tokens": 10082,
+      "secs": 2.97
+    },
+    {
+      "conc": 32,
+      "tok_s": 8094.9,
+      "tokens": 9903,
+      "secs": 1.22
+    }
+  ]
+}

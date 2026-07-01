@@ -27,7 +27,7 @@ base_image = (
     modal.Image.from_registry(
         "lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96"
     )
-    .run_commands("echo v2tree6-treefoldindraft > /tmp/build_time")
+    .run_commands("echo v2tree7-reusetreebuf > /tmp/build_time")
     # Overlay the tree-verify port (the speculative dir from the worktree).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
@@ -1220,6 +1220,151 @@ def cgbench_same(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
     print("SAME-CARD RESULT:", json.dumps(res), flush=True)
     json.dump(res, open(f"/results/cgsame_ov{int(overlap)}_b{budget}.json", "w")); results_vol.commit()
     return json.dumps(res)
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def tcsame(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
+           block_size: int = 16, budget: int = 32, topk: int = 4, n: int = 128):
+    """SAME-CARD chain vs tree(ours-b{budget}): one container back-to-back, triton +
+    overlap on, conc=1. Reports tok/s + accept + PER-STEP wall ms (dt/total_verify_ct)."""
+    import subprocess, time, signal, json, urllib.request
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tk = AutoTokenizer.from_pretrained(target)
+    ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n))
+    fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    ps = [tk.apply_chat_template([{"role": "user", "content": fmt.format(q=ds[i]["question"])}],
+          tokenize=False, add_generation_prompt=True, enable_thinking=False) for i in range(n)]
+    def run(is_tree):
+        env = dict(os.environ)
+        env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if is_tree else "0"
+        env["SGLANG_DFLASH_TREE_ALGO"] = "fused"
+        env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
+        env["DFLASH_DRAFT_ATTN_BACKEND"] = "triton"
+        spec = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
+                "--speculative-dflash-block-size", str(block_size),
+                "--speculative-eagle-topk", str(topk if is_tree else 1)]
+        if is_tree: spec += ["--speculative-num-draft-tokens", str(budget)]
+        server = ["python", "-m", "sglang.launch_server", "--model-path", target,
+                  "--trust-remote-code", "--mem-fraction-static", "0.85",
+                  "--max-running-requests", "1", "--attention-backend", "triton", *spec, "--port", "30000"]
+        srv = subprocess.Popen(server, env=env)
+        for _ in range(240):
+            try: urllib.request.urlopen("http://127.0.0.1:30000/health", timeout=2); break
+            except Exception: time.sleep(2)
+        def send(p):
+            req = urllib.request.Request("http://127.0.0.1:30000/generate",
+                data=json.dumps({"text": p, "sampling_params": {"temperature": 0.0, "max_new_tokens": 512}}).encode(),
+                headers={"Content-Type": "application/json"})
+            return json.loads(urllib.request.urlopen(req, timeout=600).read())
+        send(ps[0]); send(ps[1])
+        t0 = time.perf_counter(); toks = 0; vct = 0; accs = []
+        for p in ps:
+            r = send(p); m = r["meta_info"]; toks += m["completion_tokens"]
+            v = m.get("spec_verify_ct")
+            if v: vct += v; accs.append(m["completion_tokens"]/v)
+        dt = time.perf_counter() - t0
+        srv.send_signal(signal.SIGINT); time.sleep(5)
+        try: srv.wait(timeout=15)
+        except Exception: srv.kill()
+        time.sleep(3)
+        return {"is_tree": is_tree, "tok_s": round(toks/dt, 1),
+                "accept_len": round(sum(accs)/len(accs), 4) if accs else None,
+                "step_ms": round(dt*1000/vct, 4) if vct else None, "verify_ct": vct, "tokens": toks}
+    ch = run(False); tr = run(True)
+    res = {"chain": ch, "tree": tr,
+           "tok_s_gain_pct": round(100*(tr["tok_s"]/ch["tok_s"]-1), 1),
+           "accept_gain_pct": round(100*(tr["accept_len"]/ch["accept_len"]-1), 1),
+           "step_ms_overhead_pct": round(100*(tr["step_ms"]/ch["step_ms"]-1), 1)}
+    print("TCSAME:", json.dumps(res), flush=True)
+    json.dump(res, open(f"/results/tcsame_b{budget}.json", "w")); results_vol.commit()
+    return json.dumps(res)
+
+
+@app.local_entrypoint()
+def tc(n: int = 128, budget: int = 32, topk: int = 4):
+    import json
+    r = json.loads(tcsame.remote(budget=budget, topk=topk, n=n))
+    c, t = r["chain"], r["tree"]
+    print(f"CHAIN: tok/s={c['tok_s']} accept={c['accept_len']} step_ms={c['step_ms']}")
+    print(f"TREE : tok/s={t['tok_s']} accept={t['accept_len']} step_ms={t['step_ms']}")
+    print(f"tok/s gain {r['tok_s_gain_pct']:+}%  |  accept gain {r['accept_gain_pct']:+}%  |  step_ms overhead {r['step_ms_overhead_pct']:+}%")
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def reusebuf_same(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
+                  block_size: int = 16, topk: int = 4, budget: int = 32, n: int = 128):
+    """SAME-CARD ours-b{budget} tree: SGLANG_DFLASH_REUSE_TREE_BUF OFF then ON,
+    back-to-back in one container. triton verify, overlap on, conc=1. Reports
+    per-step wall ms + tok/s (reuse on vs off) and LOSSLESS via out_hash."""
+    import subprocess, time, signal, json, urllib.request, hashlib
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tk = AutoTokenizer.from_pretrained(target)
+    ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n))
+    fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    ps = [tk.apply_chat_template([{"role": "user", "content": fmt.format(q=ds[i]["question"])}],
+          tokenize=False, add_generation_prompt=True, enable_thinking=False) for i in range(n)]
+    def run(reuse):
+        env = dict(os.environ)
+        env["SGLANG_DFLASH_TREE_VERIFY"] = "1"; env["SGLANG_DFLASH_TREE_ALGO"] = "fused"
+        env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
+        env["DFLASH_DRAFT_ATTN_BACKEND"] = "triton"
+        env["SGLANG_DFLASH_REUSE_TREE_BUF"] = "1" if reuse else "0"
+        server = ["python", "-m", "sglang.launch_server", "--model-path", target,
+                  "--trust-remote-code", "--mem-fraction-static", "0.85",
+                  "--max-running-requests", "1", "--attention-backend", "triton",
+                  "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
+                  "--speculative-dflash-block-size", str(block_size),
+                  "--speculative-eagle-topk", str(topk), "--speculative-num-draft-tokens", str(budget),
+                  "--port", "30000"]
+        srv = subprocess.Popen(server, env=env)
+        for _ in range(240):
+            try: urllib.request.urlopen("http://127.0.0.1:30000/health", timeout=2); break
+            except Exception: time.sleep(2)
+        def send(p):
+            req = urllib.request.Request("http://127.0.0.1:30000/generate",
+                data=json.dumps({"text": p, "sampling_params": {"temperature": 0.0, "max_new_tokens": 512}}).encode(),
+                headers={"Content-Type": "application/json"})
+            return json.loads(urllib.request.urlopen(req, timeout=600).read())
+        send(ps[0]); send(ps[1])
+        t0 = time.perf_counter(); toks = 0; vct = 0; accs = []; texts = []
+        for p in ps:
+            r = send(p); m = r["meta_info"]; toks += m["completion_tokens"]; texts.append(r["text"])
+            v = m.get("spec_verify_ct")
+            if v: vct += v; accs.append(m["completion_tokens"]/v)
+        dt = time.perf_counter() - t0
+        srv.send_signal(signal.SIGINT); time.sleep(5)
+        try: srv.wait(timeout=15)
+        except Exception: srv.kill()
+        time.sleep(3)
+        return {"reuse": reuse, "tok_s": round(toks/dt, 1),
+                "accept_len": round(sum(accs)/len(accs), 4) if accs else None,
+                "step_ms": round(dt*1000/vct, 4) if vct else None, "verify_ct": vct, "tokens": toks,
+                "out_hash": hashlib.sha256("\x1e".join(texts).encode()).hexdigest()[:16]}
+    off = run(False); on = run(True)
+    lossless = (off["out_hash"] == on["out_hash"] and off["accept_len"] == on["accept_len"]
+                and off["tokens"] == on["tokens"])
+    res = {"off": off, "on": on, "lossless": lossless,
+           "tok_s_gain_pct": round(100*(on["tok_s"]/off["tok_s"]-1), 1) if off["tok_s"] else None,
+           "step_ms_delta_pct": round(100*(on["step_ms"]/off["step_ms"]-1), 1) if off["step_ms"] else None}
+    print("REUSEBUF:", json.dumps(res), flush=True)
+    json.dump(res, open(f"/results/reusebuf_b{budget}.json", "w")); results_vol.commit()
+    return json.dumps(res)
+
+
+@app.local_entrypoint()
+def reusebuf(n: int = 128, budget: int = 32, topk: int = 4):
+    import json
+    r = json.loads(reusebuf_same.remote(budget=budget, topk=topk, n=n))
+    off, on = r["off"], r["on"]
+    print(f"OFF: tok/s={off['tok_s']} accept={off['accept_len']} step_ms={off['step_ms']} hash={off['out_hash']}")
+    print(f"ON : tok/s={on['tok_s']} accept={on['accept_len']} step_ms={on['step_ms']} hash={on['out_hash']}")
+    print(f"LOSSLESS={r['lossless']}  |  tok/s gain {r['tok_s_gain_pct']:+}%  |  step_ms delta {r['step_ms_delta_pct']:+}%")
 
 
 @app.local_entrypoint()
