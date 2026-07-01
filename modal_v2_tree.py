@@ -27,7 +27,7 @@ base_image = (
     modal.Image.from_registry(
         "lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96"
     )
-    .run_commands("echo v2tree7-reusetreebuf > /tmp/build_time")
+    .run_commands("echo v2tree8-reusetreebuf-fix > /tmp/build_time")
     # Overlay the tree-verify port (the speculative dir from the worktree).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
