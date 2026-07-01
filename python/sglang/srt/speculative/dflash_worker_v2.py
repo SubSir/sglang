@@ -728,10 +728,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 hs = _cast_hs(hidden_states[start:end])
                 logits = torch.matmul(hs, weight.T)
                 if return_confidence:
-                    top2v, top2i = torch.topk(logits, 2, dim=-1)
-                    out_tokens[start:end] = top2i[:, 0].to(torch.long)
+                    top1v, top1i = logits.max(dim=-1)
+                    logits.scatter_(1, top1i.unsqueeze(1), float("-inf"))
+                    top2v, _ = logits.max(dim=-1)
+                    out_tokens[start:end] = top1i.to(torch.long)
                     out_confidence[start:end] = torch.sigmoid(
-                        (top2v[:, 0] - top2v[:, 1]).float()
+                        (top1v - top2v).float()
                     )
                 else:
                     out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
@@ -790,11 +792,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
                     if return_confidence:
-                        top2v, top2i = torch.topk(base_logits, 2, dim=-1)
-                        out_tokens[start:end].copy_(top2i[:, 0])
+                        # top-2 via two max passes -- much cheaper than torch.topk(k=2),
+                        # which launches ~8 kernels (sort/radix) vs max's single reduction.
+                        top1v, top1i = base_logits.max(dim=-1)
+                        base_logits.scatter_(
+                            1, top1i.unsqueeze(1), float("-inf")
+                        )  # mask top1 before the second max
+                        top2v, _ = base_logits.max(dim=-1)
+                        out_tokens[start:end].copy_(top1i)
                         out_tokens[start:end].add_(org_vocab_start)
                         out_confidence[start:end] = torch.sigmoid(
-                            (top2v[:, 0] - top2v[:, 1]).float()
+                            (top1v - top2v).float()
                         )
                     else:
                         local_max, local_arg = _ensure_local_reduce_buffers(
