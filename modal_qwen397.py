@@ -61,18 +61,27 @@ def _write_mt_bench_jsonl(path):
     return len(ds)
 
 
-def _launch_args(ngpu, dynamic, mem_fraction, max_running):
+def _launch_args(ngpu, dynamic, mem_fraction, max_running, block_size=16):
+    # Mirrors the official z-lab/Qwen3.5-397B-A17B-DFlash launch (linear-attn draft +
+    # mamba scheduler + trtllm_mha target attn + tc_piecewise prefill graph). The earlier
+    # flashinfer/num-draft-tokens config crashed verify graph capture -- wrong for this draft.
+    mr = max(max_running, 1)
     cmd = [
-        "python", "-m", "sglang.launch_server", "--model-path", MODEL,
+        "python", "-m", "sglang.launch_server", "--model-path", MODEL, "--trust-remote-code",
         "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", DRAFT,
-        "--speculative-num-draft-tokens", str(NUM_DRAFT_TOKENS),
-        "--tp-size", str(ngpu), "--attention-backend", "flashinfer", "--page-size", "1",
-        "--mem-fraction-static", str(mem_fraction),
-        "--max-running-requests", str(max(max_running, 1)),
-        # trtllm BF16 MoE fails the verify cuda-graph capture; use triton MoE for the
-        # speculative verify forward (cuda-graph-safe).
-        "--speculative-moe-runner-backend", "triton",
-        "--trust-remote-code", "--port", "30000",
+        "--speculative-dflash-block-size", str(block_size),
+        "--speculative-draft-attention-backend", "fa4",
+        "--attention-backend", "trtllm_mha",
+        "--linear-attn-prefill-backend", "triton",
+        "--linear-attn-decode-backend", "flashinfer",
+        "--mamba-ssm-dtype", "bfloat16",  # required by flashinfer linear-attn decode on SM100 (B200)
+        "--mamba-scheduler-strategy", "extra_buffer",
+        "--tp-size", str(ngpu),
+        "--max-running-requests", str(mr),
+        "--cuda-graph-max-bs-decode", str(mr),
+        "--cuda-graph-backend-prefill", "tc_piecewise",
+        "--flashinfer-allreduce-fusion-backend", "auto",
+        "--mem-fraction-static", str(mem_fraction), "--port", "30000",
     ]
     cmd.append("--speculative-dflash-dynamic-vbs" if dynamic is True
                else "--no-speculative-dflash-dynamic-vbs" if dynamic is False else "")
@@ -81,22 +90,28 @@ def _launch_args(ngpu, dynamic, mem_fraction, max_running):
 
 @app.function(gpu="B200:8", cloud="aws", timeout=7200, image=image,
               volumes={"/cache": vol}, secrets=[SECRET])
-def qsmoke(ngpu: int = 8, mem_fraction: float = 0.88):
+def qsmoke(ngpu: int = 8, mem_fraction: float = 0.8, block_size: int = 8):
     import subprocess, signal, time, requests
     _write_mt_bench_jsonl("/root/mt-bench.jsonl")
-    cmd = _launch_args(ngpu, None, mem_fraction, 8)
+    cmd = _launch_args(ngpu, None, mem_fraction, 32, block_size)
     print(">>> SERVER:", " ".join(cmd), flush=True)
-    srv = subprocess.Popen(cmd, cwd="/root/sglang", env=dict(os.environ))
+    env = dict(os.environ); env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
+    srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
     base = "http://127.0.0.1:30000"; ready = False
-    for _ in range(700):
+    for _ in range(1400):
         if srv.poll() is not None: return {"error": f"exited rc={srv.returncode}"}
         try:
             if requests.get(base + "/health", timeout=5).status_code == 200: ready = True; break
         except Exception: pass
         time.sleep(3)
     if not ready: srv.send_signal(signal.SIGINT); return {"error": "not ready"}
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    prompt = tok.apply_chat_template(
+        [{"role": "user", "content": "Explain speculative decoding in two sentences."}],
+        tokenize=False, add_generation_prompt=True)
     t0 = time.perf_counter()
-    r = requests.post(base + "/generate", json={"text": "Explain speculative decoding in two sentences.",
+    r = requests.post(base + "/generate", json={"text": prompt,
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 128}}, timeout=600)
     o = r.json(); m = o.get("meta_info", {})
     res = {"ok": True, "secs": round(time.perf_counter() - t0, 1),
@@ -108,14 +123,14 @@ def qsmoke(ngpu: int = 8, mem_fraction: float = 0.88):
 
 
 @app.local_entrypoint()
-def qsmoke_main(mem_fraction: float = 0.88):
+def qsmoke_main(mem_fraction: float = 0.8):
     print(qsmoke.remote(8, mem_fraction))
 
 
 @app.function(gpu="B200:8", cloud="aws", timeout=12000, image=image,
               volumes={"/cache": vol}, secrets=[SECRET])
 def qfinal_bench(concurrency: int, num_prompts: int = 256, max_new_tokens: int = 1024,
-                 mem_fraction: float = 0.88, vbs_margin: float = 0.0, vbs_min_bs: int = 1, ngpu: int = 8):
+                 mem_fraction: float = 0.8, vbs_margin: float = 0.0, block_size: int = 16, ngpu: int = 8):
     import subprocess, signal, time, statistics
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from transformers import AutoTokenizer
@@ -132,14 +147,14 @@ def qfinal_bench(concurrency: int, num_prompts: int = 256, max_new_tokens: int =
         prompts.append(p)
 
     def run(dynamic):
-        cmd = _launch_args(ngpu, dynamic, mem_fraction, max(concurrency, 1))
+        cmd = _launch_args(ngpu, dynamic, mem_fraction, max(concurrency, 1), block_size)
         env = dict(os.environ)
+        env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
         env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
-        env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
-        print(">>> SERVER:", " ".join(cmd), f"(margin={vbs_margin} min_bs={vbs_min_bs})", flush=True)
+        print(">>> SERVER:", " ".join(cmd), f"(margin={vbs_margin} block={block_size})", flush=True)
         srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
         base = "http://127.0.0.1:30000"; ready = False
-        for _ in range(700):
+        for _ in range(1400):
             if srv.poll() is not None: return {"error": f"exited rc={srv.returncode}"}
             try:
                 if requests.get(base + "/health", timeout=5).status_code == 200: ready = True; break
@@ -179,12 +194,12 @@ def qfinal_bench(concurrency: int, num_prompts: int = 256, max_new_tokens: int =
 
 @app.local_entrypoint()
 def qfinal(concurrencies: str = "1,32,128", num_prompts: int = 256, low_prompts: int = 64,
-           vbs_margin: float = 0.0, vbs_min_bs: int = 1):
+           vbs_margin: float = 0.0, block_size: int = 16):
     concs = [int(c) for c in concurrencies.split(",")]
-    handles = [(c, qfinal_bench.spawn(c, (num_prompts if c >= 32 else low_prompts), 1024, 0.88,
-                                      vbs_margin, vbs_min_bs, 8)) for c in concs]
+    handles = [(c, qfinal_bench.spawn(c, (num_prompts if c >= 32 else low_prompts), 1024, 0.8,
+                                      vbs_margin, block_size, 8)) for c in concs]
     print(f"\n==== Qwen3.5-397B-A17B dynamic-VBS FINAL (same 8xB200, serial; margin={vbs_margin} "
-          f"min_bs={vbs_min_bs}) ====")
+          f"block={block_size}) ====")
     print(f"{'conc':>6} {'n':>6} | {'no-dyn':>9} {'acc':>6} | {'dyn':>9} {'acc':>6} | ratio")
     for c, h in handles:
         try:

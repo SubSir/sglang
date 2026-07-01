@@ -166,7 +166,8 @@ def bench(dynamic, concurrency: int, num_prompts: int = 512,
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def final_bench(concurrency: int, num_prompts: int = 1024,
                 max_new_tokens: int = 1024, mem_fraction: float = 0.75,
-                vbs_margin: float = 1.0, vbs_stat: str = "mean", vbs_min_bs: int = 48):
+                vbs_margin: float = 1.0, vbs_stat: str = "mean", vbs_min_bs: int = 48,
+                overlap: int = 0):
     """Final fair comparison: run no-dynamic then dynamic SERIALLY on the SAME card,
     each over `num_prompts` samples (dataset looped). Returns both + ratio."""
     import subprocess, signal, time, statistics
@@ -201,6 +202,7 @@ def final_bench(concurrency: int, num_prompts: int = 1024,
         env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
         env["SGLANG_DFLASH_VBS_STAT"] = str(vbs_stat)
         env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
+        if overlap: env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
         srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
         base = "http://127.0.0.1:30000"; ready = False
         for _ in range(300):
@@ -250,16 +252,16 @@ def final_bench(concurrency: int, num_prompts: int = 1024,
 @app.local_entrypoint()
 def final(concurrencies: str = "1,32,64,128", num_prompts: int = 1024,
           low_prompts: int = 256, vbs_margin: float = 1.0, vbs_stat: str = "mean",
-          vbs_min_bs: int = 48):
+          vbs_min_bs: int = 48, overlap: int = 0):
     """Same-card serial no-dyn vs dyn across concurrencies (the deliverable). Low conc
     uses fewer prompts (slow, ~sequential); high conc uses the full num_prompts."""
     concs = [int(c) for c in concurrencies.split(",")]
     handles = []
     for c in concs:
         n = num_prompts if c >= 32 else low_prompts
-        handles.append((c, final_bench.spawn(c, n, 1024, 0.75, vbs_margin, vbs_stat, vbs_min_bs)))
+        handles.append((c, final_bench.spawn(c, n, 1024, 0.75, vbs_margin, vbs_stat, vbs_min_bs, overlap)))
     print(f"\n==== DFlash dynamic-VBS FINAL (same card, serial; margin={vbs_margin} "
-          f"stat={vbs_stat} min_bs={vbs_min_bs}) ====")
+          f"stat={vbs_stat} min_bs={vbs_min_bs} overlap={overlap}) ====")
     print(f"{'conc':>6} {'n':>6} | {'no-dyn':>9} {'acc':>6} | {'dyn':>9} {'acc':>6} | ratio")
     for c, h in handles:
         try:
@@ -443,7 +445,7 @@ _trace_vol = modal.Volume.from_name("dflash-traces", create_if_missing=True)
               volumes={"/traces": _trace_vol},
               secrets=[modal.Secret.from_name("huggingface-secret")])
 def trace(concurrency: int = 32, num_steps: int = 40, vbs_margin: float = 0.0,
-          vbs_min_bs: int = 1, mem_fraction: float = 0.75):
+          vbs_min_bs: int = 1, mem_fraction: float = 0.75, overlap: int = 1):
     """Capture sglang torch-profiler traces for no-dyn AND dyn on the SAME card
     (serial), at `concurrency`. Saves chrome traces to the dflash-traces volume.
     Download: modal volume get dflash-traces /<dir> ./"""
@@ -485,6 +487,7 @@ def trace(concurrency: int = 32, num_steps: int = 40, vbs_margin: float = 0.0,
         env["SGLANG_TORCH_PROFILER_DIR"] = prof_dir
         env["SGLANG_DFLASH_VBS_MARGIN"] = str(vbs_margin)
         env["SGLANG_DFLASH_VBS_MIN_BS"] = str(vbs_min_bs)
+        if overlap: env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
         print(f">>> [{tag}]", " ".join(cmd), flush=True)
         srv = subprocess.Popen(cmd, cwd="/root/sglang", env=env)
         base = "http://127.0.0.1:30000"; ready = False
@@ -555,8 +558,8 @@ def trace(concurrency: int = 32, num_steps: int = 40, vbs_margin: float = 0.0,
 
 @app.local_entrypoint()
 def trace_main(concurrency: int = 32, num_steps: int = 40, vbs_margin: float = 0.0,
-               vbs_min_bs: int = 1):
-    print(json.dumps(trace.remote(concurrency, num_steps, vbs_margin, vbs_min_bs), indent=2))
+               vbs_min_bs: int = 1, overlap: int = 1):
+    print(json.dumps(trace.remote(concurrency, num_steps, vbs_margin, vbs_min_bs, 0.75, overlap), indent=2))
 
 
 def _mode(s):
