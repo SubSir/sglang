@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -1082,6 +1083,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     CaptureHiddenMode.NULL
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
+                ),
+                # The compact-mask kernel layout is a graph-baked constexpr, so it MUST
+                # be set at capture time (not just on the runtime spec_info) or the
+                # captured kernel reads the wrong mask stride at replay. Read the same
+                # env the worker reads so capture and replay agree.
+                compact_tree_mask=(
+                    os.environ.get("SGLANG_DFLASH_COMPACT_TREE_MASK", "0") == "1"
                 ),
             )
 
