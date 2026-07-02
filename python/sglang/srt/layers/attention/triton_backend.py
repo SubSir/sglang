@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -136,18 +135,6 @@ class TritonAttnBackend(AttentionBackend):
         # Split-KV EAGLE-verify kernel (ROCm/Triton). Registered here; enabled
         # below once topk is known (the path is only valid at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
-
-        # Lean tree-verify attention kernel (opt-in). Replaces the general
-        # extend_attention_fwd on the DFlash compact-tree-mask verify forward.
-        self.dflash_tree_attn = os.environ.get("SGLANG_DFLASH_TREE_ATTN", "0") == "1"
-        if self.dflash_tree_attn:
-            from sglang.srt.layers.attention.triton_ops.dflash_tree_attn import (
-                dflash_tree_verify_attn_fwd,
-            )
-
-            self.dflash_tree_verify_attn_fwd = torch.compiler.disable(
-                dflash_tree_verify_attn_fwd
-            )
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -1305,38 +1292,6 @@ class TritonAttnBackend(AttentionBackend):
                 max_bs=self.req_to_token_pool.size,
             )
         ):
-            return o
-
-        # Lean tree-verify kernel: only for the compact-tree-mask verify forward,
-        # and only when none of the general features (SWA/sinks/logit_cap/fp8/xai)
-        # are in play — otherwise fall through to the general kernel. Branch is on
-        # constants at capture time, so it is cuda-graph-safe (eager + replay).
-        if (
-            self.dflash_tree_attn
-            and self.forward_metadata.custom_mask is not None
-            and getattr(forward_batch.spec_info, "compact_tree_mask", False)
-            and sliding_window_size < 0
-            and sinks is None
-            and logits_soft_cap == 0.0
-            and k_descale == 1.0
-            and v_descale == 1.0
-            and layer.xai_temperature_len < 0
-        ):
-            self.dflash_tree_verify_attn_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous(),
-                v.contiguous(),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.forward_metadata.qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.forward_metadata.custom_mask,
-                self.forward_metadata.mask_indptr,
-                self.forward_metadata.max_extend_len,
-                layer.scaling,
-            )
             return o
 
         self.extend_attention_fwd(
