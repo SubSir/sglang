@@ -953,7 +953,7 @@ def build_tree_verify_tokens(
     device = topk_probs.device
 
     timer = timing_ctx_factory or (lambda _key: nullcontext())
-    use_fused_triton = topk == 4 and is_cuda() and topk_probs.is_cuda
+    use_fused_triton = topk in (4, 8, 16) and is_cuda() and topk_probs.is_cuda
 
     if use_fused_triton:
         from sglang.srt.speculative.triton_ops.dflash_tree_expand_topk import (

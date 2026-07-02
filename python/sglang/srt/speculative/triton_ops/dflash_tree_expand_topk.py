@@ -131,7 +131,7 @@ def dflash_expand_topk4(
 
 
 @triton.jit
-def _dflash_tree_verify_steps_topk4_kernel(
+def _dflash_tree_verify_steps_kernel(
     probs_ptr,
     ids_ptr,
     out_scores_ptr,
@@ -148,174 +148,138 @@ def _dflash_tree_verify_steps_topk4_kernel(
     out_t_sb,
     out_p_sb,
     bs,
+    TOPK: tl.constexpr,
+    TOPK_SQ: tl.constexpr,
     NUM_STEPS: tl.constexpr,
 ):
-    """One program per batch: full tree-verify score/token/parent generation for topk==4."""
+    """One program per batch: full tree-verify score/token/parent generation for power-of-2 topk.
+
+    Vectorized generalization of the old topk4-unrolled kernel. TOPK must be a power of 2
+    (so ``tl.arange(0, TOPK)`` / ``tl.arange(0, TOPK_SQ)`` are legal) and TOPK_SQ == TOPK*TOPK.
+    """
     b = tl.program_id(0)
     if b >= bs:
         return
 
-    offs4 = tl.arange(0, TOPK)
-    offs16 = tl.arange(0, TOPK_SQ)
+    offs_k = tl.arange(0, TOPK)
+    offs_sq = tl.arange(0, TOPK_SQ)
 
-    sc0v = tl.load(
-        probs_ptr + b * stride_p_b + 0 * stride_p_s + offs4 * stride_p_k
+    # Step 0: scores = probs[:, 0]; tokens = ids[:, 0]; parents = arange(-1, topk).
+    sc = tl.load(
+        probs_ptr + b * stride_p_b + 0 * stride_p_s + offs_k * stride_p_k
     ).to(tl.float32)
-    tl.store(out_scores_ptr + b * out_s_sb + 0 * out_s_r + offs4, sc0v)
+    tl.store(out_scores_ptr + b * out_s_sb + 0 * out_s_r + offs_k, sc)
 
-    tok00 = tl.load(ids_ptr + b * stride_i_b + 0 * stride_i_s + offs4 * stride_i_k)
-    tl.store(out_tokens_ptr + b * out_t_sb + offs4, tok00)
+    tok0 = tl.load(ids_ptr + b * stride_i_b + 0 * stride_i_s + offs_k * stride_i_k)
+    tl.store(out_tokens_ptr + b * out_t_sb + offs_k, tok0)
 
-    # Match ``torch.arange(-1, topk)`` → 5 entries for topk == 4 (no tl.arange(0,5): not pow2).
+    # Match ``torch.arange(-1, topk)`` → width topk+1: [-1, 0, 1, ..., topk-1].
     if NUM_STEPS > 1:
         pb = out_parents_ptr + b * out_p_sb
         tl.store(pb + 0, -1)
-        tl.store(pb + 1, 0)
-        tl.store(pb + 2, 1)
-        tl.store(pb + 3, 2)
-        tl.store(pb + 4, 3)
-
-    sca = tl.sum(sc0v * (offs4 == 0))
-    scb = tl.sum(sc0v * (offs4 == 1))
-    scc = tl.sum(sc0v * (offs4 == 2))
-    scd = tl.sum(sc0v * (offs4 == 3))
+        tl.store(pb + 1 + offs_k, offs_k.to(tl.int64))
 
     for i in tl.static_range(1, NUM_STEPS):
-        t0 = tl.load(
-            probs_ptr + b * stride_p_b + i * stride_p_s + 0 * stride_p_k
-        ).to(tl.float32)
-        t1 = tl.load(
-            probs_ptr + b * stride_p_b + i * stride_p_s + 1 * stride_p_k
-        ).to(tl.float32)
-        t2 = tl.load(
-            probs_ptr + b * stride_p_b + i * stride_p_s + 2 * stride_p_k
-        ).to(tl.float32)
-        t3 = tl.load(
-            probs_ptr + b * stride_p_b + i * stride_p_s + 3 * stride_p_k
+        t = tl.load(
+            probs_ptr + b * stride_p_b + i * stride_p_s + offs_k * stride_p_k
         ).to(tl.float32)
 
-        c = offs16 % TOPK
-        tc = tl.where(c == 0, t0, tl.where(c == 1, t1, tl.where(c == 2, t2, t3)))
-        p = offs16 // TOPK
-        sp = tl.where(
-            p == 0,
-            sca,
-            tl.where(p == 1, scb, tl.where(p == 2, scc, scd)),
-        )
-        expand_prod = sp * tc
+        # expand_prod[p, c] = parent-path-score sc[p] * step child-prob t[c].
+        expand_2d = sc[:, None] * t[None, :]
 
+        # Store the expand-scores block: rows base_row + p, columns 0..TOPK-1.
         base_row = 1 + (i - 1) * TOPK
-        for rr in tl.static_range(TOPK):
-            for cc in tl.static_range(TOPK):
-                idx = rr * TOPK + cc
-                ev = tl.sum(expand_prod * (offs16 == idx))
-                tl.store(
-                    out_scores_ptr
-                    + b * out_s_sb
-                    + (base_row + rr) * out_s_r
-                    + cc,
-                    ev,
-                )
-
-        ids16 = offs16.to(tl.int64)
-        vals = expand_prod
-        ids = ids16
-        remaining = offs16 == offs16
-        neg_inf = -3.4e38
-
-        masked = tl.where(remaining, vals, neg_inf)
-        mx = tl.max(masked)
-        is_elig = remaining & (masked == mx)
-        pick = tl.min(tl.where(is_elig, offs16, TOPK_SQ))
-        remaining = remaining & (offs16 != pick)
-        v0 = tl.sum(tl.where(offs16 == pick, vals, 0.0))
-        i0 = tl.sum(tl.where(offs16 == pick, ids, 0))
-
-        masked = tl.where(remaining, vals, neg_inf)
-        mx = tl.max(masked)
-        is_elig = remaining & (masked == mx)
-        pick = tl.min(tl.where(is_elig, offs16, TOPK_SQ))
-        remaining = remaining & (offs16 != pick)
-        v1 = tl.sum(tl.where(offs16 == pick, vals, 0.0))
-        i1 = tl.sum(tl.where(offs16 == pick, ids, 0))
-
-        masked = tl.where(remaining, vals, neg_inf)
-        mx = tl.max(masked)
-        is_elig = remaining & (masked == mx)
-        pick = tl.min(tl.where(is_elig, offs16, TOPK_SQ))
-        remaining = remaining & (offs16 != pick)
-        v2 = tl.sum(tl.where(offs16 == pick, vals, 0.0))
-        i2 = tl.sum(tl.where(offs16 == pick, ids, 0))
-
-        masked = tl.where(remaining, vals, neg_inf)
-        mx = tl.max(masked)
-        is_elig = remaining & (masked == mx)
-        pick = tl.min(tl.where(is_elig, offs16, TOPK_SQ))
-        remaining = remaining & (offs16 != pick)
-        v3 = tl.sum(tl.where(offs16 == pick, vals, 0.0))
-        i3 = tl.sum(tl.where(offs16 == pick, ids, 0))
-
-        sca = v0
-        scb = v1
-        scc = v2
-        scd = v3
-
-        k0 = tl.load(ids_ptr + b * stride_i_b + i * stride_i_s + 0 * stride_i_k)
-        k1 = tl.load(ids_ptr + b * stride_i_b + i * stride_i_s + 1 * stride_i_k)
-        k2 = tl.load(ids_ptr + b * stride_i_b + i * stride_i_s + 2 * stride_i_k)
-        k3 = tl.load(ids_ptr + b * stride_i_b + i * stride_i_s + 3 * stride_i_k)
-        tok_lane = tl.where(
-            c == 0, k0, tl.where(c == 1, k1, tl.where(c == 2, k2, k3))
+        tl.store(
+            out_scores_ptr
+            + b * out_s_sb
+            + (base_row + offs_k)[:, None] * out_s_r
+            + offs_k[None, :],
+            expand_2d,
         )
+
+        # Top-TOPK over the flat [TOPK_SQ] products; lowest-flat-index tie-break (lossless).
+        vals = tl.reshape(expand_2d, (TOPK_SQ,))
+        ids_sq = offs_sq.to(tl.int64)
+        remaining = offs_sq == offs_sq
+        neg_inf = -3.4e38
+        topv = tl.zeros((TOPK,), tl.float32)
+        topi = tl.zeros((TOPK,), tl.int64)
+        for r in tl.static_range(TOPK):
+            masked = tl.where(remaining, vals, neg_inf)
+            mx = tl.max(masked)
+            is_elig = remaining & (masked == mx)
+            pick = tl.min(tl.where(is_elig, offs_sq, TOPK_SQ))
+            remaining = remaining & (offs_sq != pick)
+            vk = tl.sum(tl.where(offs_sq == pick, vals, 0.0))
+            ik = tl.sum(tl.where(offs_sq == pick, ids_sq, 0))
+            topv = tl.where(offs_k == r, vk, topv)
+            topi = tl.where(offs_k == r, ik, topi)
+
+        sc = topv
+
+        # Tokens: lane [p, c] = step_ids[c] (independent of parent p).
+        k = tl.load(ids_ptr + b * stride_i_b + i * stride_i_s + offs_k * stride_i_k)
+        tok_2d = tl.broadcast_to(k[None, :], (TOPK, TOPK))
         tok_base = TOPK + (i - 1) * TOPK_SQ
-        tl.store(out_tokens_ptr + b * out_t_sb + tok_base + offs16, tok_lane)
+        tl.store(
+            out_tokens_ptr
+            + b * out_t_sb
+            + tok_base
+            + offs_k[:, None] * TOPK
+            + offs_k[None, :],
+            tok_2d,
+        )
 
         if i < NUM_STEPS - 1:
             par_shift = TOPK_SQ * (i - 1) + TOPK
             par_base = (TOPK + 1) + (i - 1) * TOPK
-            tl.store(out_parents_ptr + b * out_p_sb + par_base + 0, i0 + par_shift)
-            tl.store(out_parents_ptr + b * out_p_sb + par_base + 1, i1 + par_shift)
-            tl.store(out_parents_ptr + b * out_p_sb + par_base + 2, i2 + par_shift)
-            tl.store(out_parents_ptr + b * out_p_sb + par_base + 3, i3 + par_shift)
+            tl.store(
+                out_parents_ptr + b * out_p_sb + par_base + offs_k,
+                topi + par_shift,
+            )
 
 
 def dflash_tree_verify_select_topk4_fused(
     topk_probs: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the full per-step expand + top-4 recurrence in one Triton kernel (topk == 4).
+    """Run the full per-step expand + top-``topk`` recurrence in one Triton kernel.
 
+    ``topk`` is inferred from ``topk_probs.shape[2]`` and must be a power of 2 in (4, 8, 16).
     Matches ``build_tree_verify_tokens`` tensor layout for ``score_list_cat``,
-    ``ss_token_list``, and ``parent_list`` (parents exclude the last step).
+    ``ss_token_list``, and ``parent_list`` (parents exclude the last step). Name kept for callers.
 
     Args:
-        topk_probs: [bs, num_steps, 4]
-        topk_ids: [bs, num_steps, 4]
+        topk_probs: [bs, num_steps, topk]
+        topk_ids: [bs, num_steps, topk]
 
     Returns:
-        score_list_cat: [bs, 4 * (1 + 4 * (num_steps - 1))] (``score_list`` flattened)
-        tokens_flat: [bs, 4 + 16 * (num_steps - 1)]
+        score_list_cat: [bs, topk * (1 + topk * (num_steps - 1))] (``score_list`` flattened)
+        tokens_flat: [bs, topk + topk**2 * (num_steps - 1)]
         parents_flat: [bs, 0] if ``num_steps == 1``, else
-        ``[bs, 1 + 4 * (num_steps - 1)]`` (matches ``torch.arange(-1, 4)`` width 5 at step 0).
+        ``[bs, 1 + topk * (num_steps - 1)]`` (matches ``torch.arange(-1, topk)`` at step 0).
     """
-    assert topk_probs.dim() == 3 and topk_probs.shape[2] == _DFLASH_EXPAND_TOPK
+    assert topk_probs.dim() == 3
     assert topk_ids.shape == topk_probs.shape
-    bs, num_steps, _ = topk_probs.shape
+    bs, num_steps, topk = topk_probs.shape
+    # ponytail: power-of-2 keeps tl.arange(0, topk**2) legal; (4, 8, 16) is the used range.
+    assert topk in (4, 8, 16) and (topk & (topk - 1)) == 0, f"unsupported topk={topk}"
+    topk_sq = topk * topk
     device = topk_probs.device
     dtype = topk_probs.dtype
 
-    score_rows = 1 + _DFLASH_EXPAND_TOPK * (num_steps - 1)
-    tok_width = _DFLASH_EXPAND_TOPK + _DFLASH_EXPAND_TOPK_SQ * (num_steps - 1)
+    score_rows = 1 + topk * (num_steps - 1)
+    tok_width = topk + topk_sq * (num_steps - 1)
     if num_steps <= 1:
         par_width = 0
     else:
-        par_width = 1 + _DFLASH_EXPAND_TOPK * (num_steps - 1)
+        par_width = 1 + topk * (num_steps - 1)
 
-    out_scores = torch.empty((bs, score_rows, _DFLASH_EXPAND_TOPK), device=device, dtype=dtype)
+    out_scores = torch.empty((bs, score_rows, topk), device=device, dtype=dtype)
     out_tokens = torch.empty((bs, tok_width), device=device, dtype=topk_ids.dtype)
     out_parents = torch.empty((bs, par_width), device=device, dtype=torch.int64)
 
-    _dflash_tree_verify_steps_topk4_kernel[(bs,)](
+    _dflash_tree_verify_steps_kernel[(bs,)](
         topk_probs,
         topk_ids,
         out_scores,
@@ -332,6 +296,8 @@ def dflash_tree_verify_select_topk4_fused(
         out_tokens.stride(0),
         out_parents.stride(0),
         bs,
+        TOPK=topk,
+        TOPK_SQ=topk_sq,
         NUM_STEPS=num_steps,
         num_warps=1,
     )
