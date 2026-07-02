@@ -283,6 +283,7 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    COMPACT_TREE_MASK: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SKIP_PREFIX: tl.constexpr,
     SKIP_EXTEND: tl.constexpr,
@@ -461,18 +462,31 @@ def _fwd_kernel(
 
         final_mask = mask_m[:, None] & mask_n[None, :]
         if USE_CUSTOM_MASK:
-            custom_mask = tl.load(
-                mask_ptr
-                + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None])
-                * (cur_seq_len + window_kv_offset)
-                + window_kv_offset
-                + cur_seq_len_prefix
-                + start_n
-                + offs_n[None, :],
-                mask=(mask_m[:, None] & mask_n[None, :]),
-                other=0,
-            )
+            if COMPACT_TREE_MASK:
+                # Compact QLEN_ONLY layout: row-stride is N (extend len), no prefix
+                # columns. Incompatible with sliding window (not used by DFlash tree).
+                custom_mask = tl.load(
+                    mask_ptr
+                    + cur_seq_mask_start_idx
+                    + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len_extend
+                    + start_n
+                    + offs_n[None, :],
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                    other=0,
+                )
+            else:
+                custom_mask = tl.load(
+                    mask_ptr
+                    + cur_seq_mask_start_idx
+                    + (cur_block_m * BLOCK_M + offs_m[:, None])
+                    * (cur_seq_len + window_kv_offset)
+                    + window_kv_offset
+                    + cur_seq_len_prefix
+                    + start_n
+                    + offs_n[None, :],
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                    other=0,
+                )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
@@ -602,6 +616,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    compact_tree_mask=False,
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
@@ -697,6 +712,7 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        COMPACT_TREE_MASK=compact_tree_mask,
         STORE_LSE=STORE_LSE,
         SKIP_PREFIX=skip_prefix,
         SKIP_EXTEND=skip_extend,

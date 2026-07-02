@@ -501,7 +501,11 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
+        if getattr(spec_info, "compact_tree_mask", False):
+            # QLEN_ONLY: per-request mask stride is N (no context×N prefix cols).
+            seq_mask_len = torch.full_like(seq_lens, self.num_draft_tokens**2)
+        else:
+            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
@@ -783,9 +787,15 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
+            if getattr(spec_info, "compact_tree_mask", False):
+                # QLEN_ONLY: per-request mask stride is N (no context×N prefix cols).
+                seq_mask_len = torch.full_like(
+                    forward_batch.seq_lens, self.num_draft_tokens**2
+                )
+            else:
+                seq_mask_len = self.num_draft_tokens * (
+                    forward_batch.seq_lens + self.num_draft_tokens
+                )
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
@@ -1302,6 +1312,9 @@ class TritonAttnBackend(AttentionBackend):
             v_descale,
             layer.scaling,
             logit_cap=logits_soft_cap,
+            compact_tree_mask=getattr(
+                forward_batch.spec_info, "compact_tree_mask", False
+            ),
             sliding_window_size=sliding_window_size,
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,

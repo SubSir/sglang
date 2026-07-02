@@ -264,6 +264,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._reuse_tree_buf: bool = bool(
             int(os.environ.get("SGLANG_DFLASH_REUSE_TREE_BUF", "0"))
         )
+        # Compact tree mask (opt-in). The triton extend kernel runs with
+        # skip_prefix_custom_mask=True and never reads the context×N prefix mask
+        # columns, so store only the N×N tree-ancestor block (QLEN_ONLY) instead
+        # of the full num_verify×(context+num_verify) mask. Saves the context×N
+        # alloc/memset/build that scales with seq_len×batch. Default OFF =
+        # byte-identical to the FULL_MASK path.
+        self._compact_tree_mask: bool = (
+            os.environ.get("SGLANG_DFLASH_COMPACT_TREE_MASK", "0") == "1"
+        )
         self._reuse_tree_mask_buf: Optional[torch.Tensor] = None
         self._reuse_tree_position_buf: Optional[torch.Tensor] = None
         # Tree construction algorithm: "fused" (default, GPU topk4) or "ddtree"
@@ -549,8 +558,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # seq_len+num_verify <= max_context_len per req, that region always fits
         # in num_verify*bs*max_context_len -- so this size is both safe for the
         # kernel write and copy-compatible with the graph buffer.
-        max_context_len = self.target_worker.model_runner.attn_backend.max_context_len
-        need_mask = num_verify_tokens * int(bs) * max_context_len
+        if self._compact_tree_mask:
+            # QLEN_ONLY layout: only the N×N tree-ancestor block per request.
+            need_mask = num_verify_tokens * int(bs) * num_verify_tokens
+        else:
+            max_context_len = (
+                self.target_worker.model_runner.attn_backend.max_context_len
+            )
+            need_mask = num_verify_tokens * int(bs) * max_context_len
         need_pos = int(bs) * num_verify_tokens
         if (
             self._reuse_tree_mask_buf is None
@@ -1775,6 +1790,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 tree_mask_buf=tree_mask_buf,
                 position_buf=position_buf,
+                compact_tree_mask=self._compact_tree_mask,
             )
         else:
             # SGLANG_DOMINO_TIME_DRAFT=1: CUDA-event time JUST the draft-step

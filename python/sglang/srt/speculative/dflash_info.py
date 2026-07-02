@@ -56,6 +56,12 @@ class DFlashVerifyInput(SpecInput):
     tree_mask_buf: Optional[torch.Tensor] = None
     position_buf: Optional[torch.Tensor] = None
 
+    # Store only the N×N tree-ancestor mask block (TreeMaskMode.QLEN_ONLY) instead
+    # of the full num_verify×(context+num_verify) mask. Safe because the triton
+    # extend kernel skips the prefix mask columns. Gated by
+    # SGLANG_DFLASH_COMPACT_TREE_MASK; default False = FULL_MASK behavior.
+    compact_tree_mask: bool = False
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
@@ -124,7 +130,11 @@ class DFlashVerifyInput(SpecInput):
                 topk=int(self.topk),
                 spec_steps=depth,
                 num_verify_tokens=self.draft_token_num,
-                tree_mask_mode=TreeMaskMode.FULL_MASK,
+                tree_mask_mode=(
+                    TreeMaskMode.QLEN_ONLY
+                    if self.compact_tree_mask
+                    else TreeMaskMode.FULL_MASK
+                ),
                 tree_mask_buf=self.tree_mask_buf,
                 position_buf=self.position_buf,
             )
@@ -204,10 +214,14 @@ class DFlashVerifyInput(SpecInput):
         )
         mask = self.custom_mask
         if mask is not None:
-            mask_numel = (
-                paged_kernel_lens_sum * self.draft_token_num
-                + (self.draft_token_num**2) * bs
-            )
+            if self.compact_tree_mask:
+                # QLEN_ONLY: only the N×N block per request (no context×N prefix).
+                mask_numel = (self.draft_token_num**2) * bs
+            else:
+                mask_numel = (
+                    paged_kernel_lens_sum * self.draft_token_num
+                    + (self.draft_token_num**2) * bs
+                )
             if mask.numel() < mask_numel:
                 # FIXME(attn): temporary fix for custom mask padding with cuda graph
                 mask = torch.cat(
