@@ -18,6 +18,8 @@ app = modal.App("dflash-v2-tree")
 # dflash-v2-results ./pulled` to retrieve, or the `pull` entrypoint below).
 results_vol = modal.Volume.from_name("dflash-v2-results", create_if_missing=True)
 
+# dflash-tree-buffer-reuse now includes compact N×N mask + generalized topk fused
+# kernel (merged from the ex-worktree). compact defaults OFF (env-gated).
 WT = "/Users/subsir/Desktop/Studio/Python/sglang-v2-tree"
 UPSTREAM_COMMIT = "e0c0c0a45"
 
@@ -27,7 +29,7 @@ base_image = (
     modal.Image.from_registry(
         "lmsysorg/sglang:nightly-dev-cu12-20260627-13b5bd96"
     )
-    .run_commands("echo v2tree8-reusetreebuf-fix > /tmp/build_time")
+    .run_commands("echo v2tree12-fused-compact > /tmp/build_time")
     # Overlay the tree-verify port (the speculative dir from the worktree).
     .add_local_dir(
         f"{WT}/python/sglang/srt/speculative",
@@ -39,10 +41,24 @@ base_image = (
         remote_path="/tmp/port_arg_groups",
         copy=True,
     )
+    # compact tree mask edits live in layers/attention (extend_attention kernel +
+    # triton_backend) -> overlay that dir too, else the kernel change never lands.
+    .add_local_dir(
+        f"{WT}/python/sglang/srt/layers/attention",
+        remote_path="/tmp/port_attention",
+        copy=True,
+    )
     # Domino port edits models/dflash.py (GRU projector) -> overlay it too.
     .add_local_file(
         f"{WT}/python/sglang/srt/models/dflash.py",
         remote_path="/tmp/port_models_dflash.py",
+        copy=True,
+    )
+    # compact tree mask sets the graph-baked COMPACT_TREE_MASK constexpr at capture
+    # time in the decode cuda-graph runner -> overlay that file too.
+    .add_local_file(
+        f"{WT}/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+        remote_path="/tmp/port_decode_cg_runner.py",
         copy=True,
     )
     .add_local_dir("./benchmark", remote_path="/root/benchmark", copy=True)
@@ -52,7 +68,9 @@ base_image = (
         "echo \"sglang at $SGLANG_DIR\" && "
         "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
         "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && "
+        "cp -rf /tmp/port_attention/. \"$SGLANG_DIR/srt/layers/attention/\" && "
         "cp -f /tmp/port_models_dflash.py \"$SGLANG_DIR/srt/models/dflash.py\" && "
+        "cp -f /tmp/port_decode_cg_runner.py \"$SGLANG_DIR/srt/model_executor/runner/decode_cuda_graph_runner.py\" && "
         "echo overlaid tree-verify + domino port",
         "python3 /tmp/patch_cudagraph.py",
     )
@@ -131,7 +149,7 @@ def fa4dbg():
 def _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_size,
                 num_draft_tokens, samples_base, concurrencies, backend,
                 mem_fraction, tp, gpu_count, skip_baseline, result_tag,
-                disable_cuda_graph, tree_algo, depth_bonus, force_width):
+                disable_cuda_graph, tree_algo, depth_bonus, force_width, compact=False):
     """Shared bench body (image-agnostic) used by run() [cu12] and fa4_run() [cu13]."""
     import sys, importlib.util
 
@@ -166,6 +184,9 @@ def _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_
     env = os.environ
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
     env["SGLANG_DFLASH_TREE_ALGO"] = tree_algo  # "fused" | "ddtree"
+    # compact N×N tree mask (opt-in); set explicitly each call so serial same-card
+    # runs don't inherit a stale value.
+    env["SGLANG_DFLASH_COMPACT_TREE_MASK"] = "1" if compact else "0"
     # ddtree ablation knobs (default None = builder defaults)
     if depth_bonus is not None:
         env["SGLANG_DDTREE_DEPTH_BONUS"] = str(depth_bonus)
@@ -200,12 +221,53 @@ def _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_
 def run(target_model, draft_model, data_names, tree_verify, topk, block_size,
         num_draft_tokens, samples_base, concurrencies, backend="flashinfer",
         mem_fraction=0.8, tp=1, gpu_count=1, skip_baseline=True, result_tag=None,
-        disable_cuda_graph=False, tree_algo="fused", depth_bonus=None, force_width=None):
+        disable_cuda_graph=False, tree_algo="fused", depth_bonus=None, force_width=None,
+        compact=False):
     """cu12 (validated triton) bench entrypoint. One server launch; sweeps datasets."""
     return _bench_impl(target_model, draft_model, data_names, tree_verify, topk, block_size,
                        num_draft_tokens, samples_base, concurrencies, backend,
                        mem_fraction, tp, gpu_count, skip_baseline, result_tag,
-                       disable_cuda_graph, tree_algo, depth_bonus, force_width)
+                       disable_cuda_graph, tree_algo, depth_bonus, force_width, compact)
+
+
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def run_compact_ab(target_model, draft_model, data_names, topk, block_size,
+                   num_draft_tokens, samples_base, concurrencies, backend, tag_prefix):
+    """SAME CARD, serial: identical tree config run with compact mask OFF then ON.
+
+    Two server launches in one container (second reuses the freed GPU). Must use the
+    triton backend — the compact N×N mask lives in the triton extend kernel.
+    """
+    out = {}
+    for compact in (False, True):
+        tag = f"{tag_prefix}_compact{1 if compact else 0}"
+        print(f">>> {tag} launching (compact={compact})", flush=True)
+        out[tag] = _bench_impl(
+            target_model, draft_model, data_names, True, topk, block_size,
+            num_draft_tokens, samples_base, concurrencies, backend,
+            0.8, 1, 1, True, tag, False, "fused", None, None, compact)
+    return out
+
+
+@app.local_entrypoint()
+def compact_ab(dataset: str = "gsm8k", budget: int = 128, topk: int = 8,
+               n: int = 512, block_size: int = 16):
+    """Same-card A/B: tree budget-N FULL_MASK vs compact N×N mask, conc=1.
+
+    Verifies (a) losslessness — accept_len must match between compact0/compact1 —
+    and (b) the throughput delta. triton backend (compact lives there).
+    """
+    os.makedirs("v2_tree_results", exist_ok=True)
+    res = run_compact_ab.remote(
+        "Qwen/Qwen3-8B", "z-lab/Qwen3-8B-DFlash-b16", dataset, topk, block_size,
+        budget, n, "1", "triton", f"compact_ab_{dataset}_b{budget}")
+    for tag, r in res.items():
+        with open(f"v2_tree_results/{tag}.md", "w") as f:
+            f.write(r)
+        print(f"\n>>> {tag}")
+        print(_tables(r))
 
 
 @app.function(gpu="B200", cloud="aws", timeout=10800, image=fa4_image,
@@ -886,6 +948,11 @@ def profile_decode(tree_verify: bool, topk: int, budget: int, tag: str,
     env["SGLANG_DFLASH_TREE_VERIFY"] = "1" if tree_verify else "0"
     env["SGLANG_DFLASH_BLOCK_VERIFY"] = "0" if tree_verify else "1"
     env["DFLASH_DRAFT_ATTN_BACKEND"] = backend
+    # match the real bench: compact N² mask + reuse buffer + overlap (tree only)
+    if tree_verify:
+        env["SGLANG_DFLASH_COMPACT_TREE_MASK"] = env.get("SGLANG_DFLASH_COMPACT_TREE_MASK", "1")
+        env["SGLANG_DFLASH_REUSE_TREE_BUF"] = "1"
+        env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
     spec = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
             "--speculative-dflash-block-size", str(block_size),
             "--speculative-eagle-topk", str(topk if tree_verify else 1)]
@@ -1226,7 +1293,8 @@ def cgbench_same(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
               secrets=[modal.Secret.from_name("huggingface-secret")],
               volumes={"/results": results_vol})
 def tcsame(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
-           block_size: int = 16, budget: int = 32, topk: int = 4, n: int = 128):
+           block_size: int = 16, budget: int = 32, topk: int = 4, n: int = 128,
+           reuse: bool = False):
     """SAME-CARD chain vs tree(ours-b{budget}): one container back-to-back, triton +
     overlap on, conc=1. Reports tok/s + accept + PER-STEP wall ms (dt/total_verify_ct)."""
     import subprocess, time, signal, json, urllib.request
@@ -1243,6 +1311,7 @@ def tcsame(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
         env["SGLANG_DFLASH_TREE_ALGO"] = "fused"
         env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
         env["DFLASH_DRAFT_ATTN_BACKEND"] = "triton"
+        env["SGLANG_DFLASH_REUSE_TREE_BUF"] = "1" if (is_tree and reuse) else "0"
         spec = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
                 "--speculative-dflash-block-size", str(block_size),
                 "--speculative-eagle-topk", str(topk if is_tree else 1)]
@@ -1283,11 +1352,96 @@ def tcsame(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
     return json.dumps(res)
 
 
+@app.function(gpu="B200", timeout=10800, image=base_image,
+              secrets=[modal.Secret.from_name("huggingface-secret")],
+              volumes={"/results": results_vol})
+def dtsame(target="Qwen/Qwen3-8B", draft="z-lab/Qwen3-8B-DFlash-b16",
+           block_size: int = 16, budget: int = 32, topk: int = 4, n: int = 128, fw: int = 16,
+           dataset: str = "gsm8k"):
+    """SAME-CARD ours-fused vs ddtree(fw): one container back-to-back, triton + overlap
+    + buffer-reuse ON for BOTH, conc=1. Only build-tree differs (GPU EAGLE vs CPU heap).
+    Reports tok/s + accept + per-step ms + out_hash (both should be lossless vs target)."""
+    import subprocess, time, signal, json, urllib.request, hashlib
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tk = AutoTokenizer.from_pretrained(target)
+    fmt = "{q}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    if dataset == "math500":
+        d = load_dataset("HuggingFaceH4/MATH-500", split="test"); qs = [d[i % len(d)]["problem"] for i in range(n)]
+    elif dataset == "mt-bench":
+        d = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train"); qs = [d[i % len(d)]["prompt"][0] for i in range(n)]; fmt = "{q}"
+    else:
+        d = load_dataset("openai/gsm8k", "main", split="test"); qs = [d[i % len(d)]["question"] for i in range(n)]
+    ds = [{"question": q} for q in qs]
+    ps = [tk.apply_chat_template([{"role": "user", "content": fmt.format(q=ds[i]["question"])}],
+          tokenize=False, add_generation_prompt=True, enable_thinking=False) for i in range(n)]
+    def run(algo):
+        env = dict(os.environ)
+        env["SGLANG_DFLASH_TREE_VERIFY"] = "1"; env["SGLANG_DFLASH_TREE_ALGO"] = algo
+        env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"; env["DFLASH_DRAFT_ATTN_BACKEND"] = "triton"
+        env["SGLANG_DFLASH_REUSE_TREE_BUF"] = "1"
+        if algo == "ddtree": env["SGLANG_DDTREE_FORCE_WIDTH"] = str(fw)
+        server = ["python", "-m", "sglang.launch_server", "--model-path", target,
+                  "--trust-remote-code", "--mem-fraction-static", "0.85",
+                  "--max-running-requests", "1", "--attention-backend", "triton",
+                  "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", draft,
+                  "--speculative-dflash-block-size", str(block_size),
+                  "--speculative-eagle-topk", str(topk), "--speculative-num-draft-tokens", str(budget),
+                  "--port", "30000"]
+        srv = subprocess.Popen(server, env=env)
+        for _ in range(240):
+            try: urllib.request.urlopen("http://127.0.0.1:30000/health", timeout=2); break
+            except Exception: time.sleep(2)
+        def send(p):
+            req = urllib.request.Request("http://127.0.0.1:30000/generate",
+                data=json.dumps({"text": p, "sampling_params": {"temperature": 0.0, "max_new_tokens": 512}}).encode(),
+                headers={"Content-Type": "application/json"})
+            return json.loads(urllib.request.urlopen(req, timeout=600).read())
+        send(ps[0]); send(ps[1])
+        t0 = time.perf_counter(); toks = 0; vct = 0; accs = []; texts = []
+        for p in ps:
+            r = send(p); m = r["meta_info"]; toks += m["completion_tokens"]; texts.append(r["text"])
+            v = m.get("spec_verify_ct")
+            if v: vct += v; accs.append(m["completion_tokens"]/v)
+        dt = time.perf_counter() - t0
+        srv.send_signal(signal.SIGINT); time.sleep(5)
+        try: srv.wait(timeout=15)
+        except Exception: srv.kill()
+        time.sleep(3)
+        return {"algo": algo, "tok_s": round(toks/dt, 1),
+                "accept_len": round(sum(accs)/len(accs), 4) if accs else None,
+                "step_ms": round(dt*1000/vct, 4) if vct else None,
+                "out_hash": hashlib.sha256("\x1e".join(texts).encode()).hexdigest()[:16], "tokens": toks}
+    fu = run("fused"); dd = run("ddtree")
+    res = {"fused": fu, "ddtree": dd,
+           "ddtree_accept_gain_pct": round(100*(dd["accept_len"]/fu["accept_len"]-1), 2),
+           "ddtree_tok_s_delta_pct": round(100*(dd["tok_s"]/fu["tok_s"]-1), 2),
+           "same_output": fu["out_hash"] == dd["out_hash"]}
+    res["dataset"] = dataset
+    print("DTSAME:", json.dumps(res), flush=True)
+    json.dump(res, open(f"/results/dtsame_{dataset}_b{budget}_fw{fw}.json", "w")); results_vol.commit()
+    return json.dumps(res)
+
+
 @app.local_entrypoint()
-def tc(n: int = 128, budget: int = 32, topk: int = 4):
+def dt(n: int = 128, budget: int = 32, topk: int = 4, fw: int = 16, datasets: str = "gsm8k,math500,mt-bench"):
     import json
-    r = json.loads(tcsame.remote(budget=budget, topk=topk, n=n))
+    hs = [(ds, dtsame.spawn(budget=budget, topk=topk, n=n, fw=fw, dataset=ds)) for ds in datasets.split(",")]
+    for ds, h in hs:
+        r = json.loads(h.get()); f, d = r["fused"], r["ddtree"]
+        print(f"\n=== {ds} ===")
+        print(f"OURS-FUSED : tok/s={f['tok_s']} accept={f['accept_len']} step_ms={f['step_ms']} hash={f['out_hash']}")
+        print(f"DDTREE(w{fw}): tok/s={d['tok_s']} accept={d['accept_len']} step_ms={d['step_ms']} hash={d['out_hash']}")
+        print(f"ddtree accept {r['ddtree_accept_gain_pct']:+}% | ddtree tok/s {r['ddtree_tok_s_delta_pct']:+}% | same output: {r['same_output']}")
+    print(f"ddtree accept gain {r['ddtree_accept_gain_pct']:+}%  |  ddtree tok/s {r['ddtree_tok_s_delta_pct']:+}%  |  same greedy output: {r['same_output']}")
+
+
+@app.local_entrypoint()
+def tc(n: int = 128, budget: int = 32, topk: int = 4, reuse: bool = False):
+    import json
+    r = json.loads(tcsame.remote(budget=budget, topk=topk, n=n, reuse=reuse))
     c, t = r["chain"], r["tree"]
+    print(f"(tree reuse-buf = {reuse})")
     print(f"CHAIN: tok/s={c['tok_s']} accept={c['accept_len']} step_ms={c['step_ms']}")
     print(f"TREE : tok/s={t['tok_s']} accept={t['accept_len']} step_ms={t['step_ms']}")
     print(f"tok/s gain {r['tok_s_gain_pct']:+}%  |  accept gain {r['accept_gain_pct']:+}%  |  step_ms overhead {r['step_ms_overhead_pct']:+}%")
@@ -1420,6 +1574,16 @@ def profov(budget: int = 32, topk: int = 4):
     h_tree = profile_decode.spawn(True, topk, budget, f"tree_ov_b{budget}_k{topk}", overlap=True)
     for h in (h_chain, h_tree):
         print(h.get()[:1500])
+
+
+@app.local_entrypoint()
+def proftriton(budget: int = 128, topk: int = 8):
+    """Profile tree verify on the TRITON backend (matches the real bench: triton
+    extend_attention + compact mask + fused kernel + overlap). Apples-to-apples
+    with the jetspec trace bucketing."""
+    h = profile_decode.spawn(True, topk, budget, f"tree_triton_b{budget}_k{topk}",
+                             overlap=True, backend="triton")
+    print(h.get()[:1800])
 
 
 @app.function(image=base_image, volumes={"/results": results_vol})

@@ -19,6 +19,9 @@ import modal
 
 app = modal.App("gpu-box")
 vol = modal.Volume.from_name("dflash-v2-results", create_if_missing=True)
+# dflash-tree-buffer-reuse now includes compact-mask + generalized topk(4/8/16)
+# fused kernel (merged from the ex-worktree). speculative/ overlay picks up the
+# fused kernel; compact-mask (layers/attention) is env-gated off by default.
 WT = "/Users/subsir/Desktop/Studio/Python/sglang-v2-tree"
 
 # sglang cu12 nightly + our v2 tree-verify overlay + dev tools + node/claude-code.
@@ -33,6 +36,11 @@ box_image = (
     # overlay our v2 tree-verify port + the bench harness
     .add_local_dir(f"{WT}/python/sglang/srt/speculative", "/tmp/port_speculative", copy=True)
     .add_local_dir(f"{WT}/python/sglang/srt/arg_groups", "/tmp/port_arg_groups", copy=True)
+    # compact-mask lives in layers/attention + the decode cuda-graph runner; overlay
+    # them too (else compact reads box-baseline versions -> mask/verify mismatch).
+    .add_local_dir(f"{WT}/python/sglang/srt/layers/attention", "/tmp/port_attention", copy=True)
+    .add_local_file(f"{WT}/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+                    "/tmp/port_cgrunner.py", copy=True)
     .add_local_dir("./benchmark", "/root/benchmark", copy=True)
     .add_local_file("./patch_cudagraph.py", "/tmp/patch_cudagraph.py", copy=True)
     .add_local_file("./ONBOX.md", "/root/ONBOX.md", copy=True)
@@ -42,13 +50,17 @@ box_image = (
     .run_commands(
         "SGLANG_DIR=$(python3 -c 'import sglang,os;print(os.path.dirname(sglang.__file__))') && "
         "cp -rf /tmp/port_speculative/. \"$SGLANG_DIR/srt/speculative/\" && "
-        "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && echo overlaid v2 port",
+        "cp -rf /tmp/port_arg_groups/. \"$SGLANG_DIR/srt/arg_groups/\" && "
+        "cp -rf /tmp/port_attention/. \"$SGLANG_DIR/srt/layers/attention/\" && "
+        "cp -f /tmp/port_cgrunner.py \"$SGLANG_DIR/srt/model_executor/runner/decode_cuda_graph_runner.py\" && "
+        "echo overlaid v2 port",
         "python3 /tmp/patch_cudagraph.py || true",
     )
 )
 
 
 @app.function(gpu="B200", timeout=12 * 3600, image=box_image,
+              cpu=32.0, memory=131072,
               secrets=[modal.Secret.from_name("huggingface-secret")],
               volumes={"/results": vol})
 def box(label: str = "box", hours: float = 8.0):
