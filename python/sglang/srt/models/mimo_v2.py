@@ -880,6 +880,9 @@ class MiMoV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        # DFLASH/EAGLE aux hidden-state capture (empty = disabled, no behavior change).
+        self.layers_to_capture: List[int] = []
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.get_input_embeddings()(input_ids) * self.config.scale_emb
@@ -907,6 +910,10 @@ class MiMoV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        # ponytail: DFLASH aux capture only wired on the normal (non-TBO) path; the
+        # draft-target verify forward doesn't run TBO. Add TBO capture if that changes.
+        aux_hidden_states = []
 
         if forward_batch.can_run_tbo:
             tbo_start_layer = self.start_layer
@@ -937,6 +944,13 @@ class MiMoV2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
+                # DFLASH: capture the input to layer i (= output of layer i-1). With
+                # the +1 convention in set_dflash_layers_to_capture this yields the
+                # post-target-layer hidden states the draft consumes.
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual if residual is not None else hidden_states
+                    )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -964,6 +978,8 @@ class MiMoV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if self.layers_to_capture:
+            return hidden_states, hidden_states_before_norm, aux_hidden_states
         return hidden_states, hidden_states_before_norm
 
     # If this function is called, it should always initialize KV cache scale
@@ -1028,6 +1044,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
+        self.capture_aux_hidden_states = False  # set by set_dflash_layers_to_capture
 
         if not self.config.encoder_only:
             self.model = MiMoV2Model(
@@ -1195,6 +1212,18 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def get_input_embeddings(self) -> Optional[nn.Embedding]:
         return self.model.embed_tokens if self.model is not None else None
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        # Capture "after target layer k" == "before layer k+1" (qwen3/minimax convention).
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     @torch.no_grad()
     def forward(
         self,
@@ -1208,6 +1237,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             not self.config.encoder_only
         ), "forward() should not be called in encoder_only mode"
 
+        aux_hidden_states = None
         if self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(
                 input_ids=input_ids,
@@ -1218,13 +1248,17 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if len(out) == 3:  # DFLASH capture active
+                hidden_states, hidden_states_before_norm, aux_hidden_states = out
+            else:
+                hidden_states, hidden_states_before_norm = out
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1232,6 +1266,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states=aux_hidden_states,
                 hidden_states_before_norm=hidden_states_before_norm,
             )
         else:

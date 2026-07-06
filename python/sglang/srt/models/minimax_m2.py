@@ -1250,8 +1250,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
         # For EAGLE3
         self.capture_aux_hidden_states = False
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def get_input_embeddings(self) -> nn.Embedding:
+        # DFLASH / EAGLE expect the embedding MODULE (no args), matching qwen3.
+        # (Model.get_input_embeddings(input_ids) stays for the internal forward path.)
+        return self.model.embed_tokens
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
         if not get_pp_group().is_last_rank:
@@ -1267,6 +1269,16 @@ class MiniMaxM2ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not get_pp_group().is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i"; to capture after target layer k (HF-style)
+        # capture before layer k+1 (same +1 convention as EAGLE3 / qwen3).
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
