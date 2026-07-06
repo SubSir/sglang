@@ -1219,3 +1219,98 @@ def build_tree_verify_tokens_ddtree(
     parent_list = torch.from_numpy(parent_list_np).to(device=device)
     selected_index = torch.from_numpy(sel_np).to(device=device)
     return draft_tokens, parent_list, selected_index
+
+
+def _build_single_jetspec(top_log_probs, top_token_ids, width, depth_limit, budget):
+    """JetSpec accum_logp builder — faithful port of JetSpec
+    ``jetspec/tree/baselines/accum_logp.py::_build_from_topk``.
+
+    Best-first heap on cumulative log-prob, but every popped node gets a FULL
+    ``width``-way fan-out: the same top-``width`` children at its depth, shared
+    across all parents at that depth (Approach-A independent marginals). This is the
+    key difference from ddtree, which expands per-candidate (one sibling + one first
+    child at a time). Returns (node_token_ids, parent_pos) in the SAME convention as
+    ``_build_single_ddtree``: non-root nodes in insertion order; parent_pos[j] =
+    1-based pos of j's parent (0=root); node j sits at 1-based pos j+1."""
+    k = width
+    D = depth_limit
+    node_token_ids: list[int] = []
+    parent_pos: list[int] = []
+    # heap entry: (neg_cum_lp, counter, node_pos, depth). node_pos is 1-based (0=root).
+    counter = 0
+    heap = [(0.0, 0, 0, 0)]
+    while heap and len(node_token_ids) < budget:
+        neg_cum_lp, _, node_pos, d = heapq.heappop(heap)
+        if d >= D:
+            continue
+        children_to_add = min(k, budget - len(node_token_ids))
+        for j in range(children_to_add):
+            new_pos = len(node_token_ids) + 1  # 1-based pos of this new child
+            node_token_ids.append(int(top_token_ids[d, j]))
+            parent_pos.append(node_pos)
+            child_cum_lp = -neg_cum_lp + float(top_log_probs[d, j])
+            counter += 1
+            heapq.heappush(heap, (-child_cum_lp, counter, new_pos, d + 1))
+    return node_token_ids, parent_pos
+
+
+def build_tree_verify_tokens_jetspec(
+    *,
+    verified_id: torch.Tensor,
+    topk_probs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+    num_draft_tokens: int,
+    timing_ctx_factory: Optional[Callable[[str], ContextManager[Any]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """JetSpec accum_logp CPU builder. Drop-in for build_tree_verify_tokens (same
+    inputs/outputs in the EAGLE kernel layout). tree_width = ``topk`` (the sampled
+    width = --speculative-eagle-topk). Reuses the ddtree -> EAGLE conversion; only the
+    per-request tree construction differs (JetSpec full-fanout vs ddtree per-candidate)."""
+    import numpy as np
+
+    bs = topk_probs.shape[0]
+    num_steps = topk_probs.shape[1]
+    device = topk_probs.device
+    budget = num_draft_tokens - 1
+    L = num_steps
+    width = topk  # JetSpec fan-out = kernel topk = sampled width = eagle-topk
+
+    log_probs = torch.log(topk_probs.clamp_min(1e-20))
+    lp_np = log_probs.to(device="cpu", dtype=torch.float32).numpy()
+    ids_np = topk_ids.to(device="cpu", dtype=torch.long).numpy()
+    verified_cpu = verified_id.to(device="cpu", dtype=torch.long)
+
+    draft_np = np.zeros((bs, num_draft_tokens), dtype=np.int64)
+    depth_w = (num_draft_tokens - 1 + topk - 1) // topk
+    pl_width = topk * depth_w + 1
+    parent_list_np = np.full((bs, pl_width), -1, dtype=np.int64)
+    sel_np = np.zeros((bs, budget), dtype=np.int64)
+
+    for b in range(bs):
+        node_tokens, parent_pos = _build_single_jetspec(lp_np[b], ids_np[b], width, L, budget)
+        n = len(node_tokens)
+        parent_list, cand, ordered_tokens = _ddtree_to_eagle_arrays(
+            parent_pos, node_tokens, width
+        )
+        draft_np[b, 0] = int(verified_cpu[b])
+        if n > 0:
+            draft_np[b, 1 : 1 + n] = ordered_tokens
+            sel_np[b, :n] = cand
+            parent_list_np[b, : len(parent_list)] = parent_list
+        if n < budget:
+            used_max_slot = (max(cand) // width) if cand else 0
+            slot = used_max_slot + 1
+            for j in range(n, budget):
+                if slot >= pl_width:
+                    sel_np[b, j] = sel_np[b, j - 1] + 1
+                    continue
+                c = slot * width
+                sel_np[b, j] = c
+                parent_list_np[b, slot] = 0
+                slot += 1
+
+    draft_tokens = torch.from_numpy(draft_np.reshape(-1)).to(device=device)
+    parent_list = torch.from_numpy(parent_list_np).to(device=device)
+    selected_index = torch.from_numpy(sel_np).to(device=device)
+    return draft_tokens, parent_list, selected_index

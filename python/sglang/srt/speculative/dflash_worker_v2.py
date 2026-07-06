@@ -28,6 +28,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     build_tree_verify_tokens,
     build_tree_verify_tokens_ddtree,
+    build_tree_verify_tokens_jetspec,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -847,10 +848,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         added_vocab_start = int(shard.added_vocab_start_index)
 
         if return_topk is not None:
-            if tp_size != 1 or num_added != 0:
+            if num_added != 0:
                 raise RuntimeError(
-                    "DFLASH tree verify return_topk only supports tp_size == 1 "
-                    "with no added vocab."
+                    "DFLASH tree verify return_topk does not support added vocab."
                 )
             k = int(return_topk)
             out_topk_ids = torch.empty(
@@ -859,23 +859,52 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_topk_probs = torch.empty(
                 (num_tokens, k), dtype=weight_dtype, device=hidden_states.device
             )
+            neg = torch.finfo(torch.float32).min
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
+                chunk_len = end - start
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
-                    topk_vals, topk_idx = torch.topk(base_logits, k=k, dim=-1)
-                    out_topk_probs[start:end] = torch.softmax(topk_vals, dim=-1).to(
-                        weight_dtype
-                    )
-                    out_topk_ids[start:end] = (
-                        topk_idx.to(torch.long) + org_vocab_start
-                    )
-                    out_tokens[start:end] = out_topk_ids[start:end, 0]
+                    base_logits = torch.matmul(hs, weight[:num_org].T).float()
+                    local_vals, local_idx = torch.topk(base_logits, k=k, dim=-1)
+                    local_ids = local_idx.to(torch.long) + org_vocab_start
                 else:
-                    out_tokens[start:end] = 0
-                    out_topk_probs[start:end] = 0
-                    out_topk_ids[start:end] = 0
+                    local_vals = torch.full(
+                        (chunk_len, k), neg, dtype=torch.float32, device=hs.device
+                    )
+                    local_ids = torch.zeros(
+                        (chunk_len, k), dtype=torch.long, device=hs.device
+                    )
+                if tp_size > 1:
+                    # lm_head is vocab-sharded across tp: gather each shard's local top-k
+                    # (with global ids) and take the GLOBAL top-k over the tp_size*k cands.
+                    gv = torch.empty(
+                        tp_size * chunk_len * k, dtype=local_vals.dtype, device=hs.device
+                    )
+                    gi = torch.empty(
+                        tp_size * chunk_len * k, dtype=local_ids.dtype, device=hs.device
+                    )
+                    tp_group.all_gather_into_tensor(gv, local_vals.contiguous().view(-1))
+                    tp_group.all_gather_into_tensor(gi, local_ids.contiguous().view(-1))
+                    allv = (
+                        gv.view(tp_size, chunk_len, k)
+                        .permute(1, 0, 2)
+                        .reshape(chunk_len, tp_size * k)
+                    )
+                    alli = (
+                        gi.view(tp_size, chunk_len, k)
+                        .permute(1, 0, 2)
+                        .reshape(chunk_len, tp_size * k)
+                    )
+                    top_vals, top_pos = torch.topk(allv, k=k, dim=-1)
+                    top_ids = torch.gather(alli, 1, top_pos)
+                else:
+                    top_vals, top_ids = local_vals, local_ids
+                out_topk_probs[start:end] = torch.softmax(top_vals, dim=-1).to(
+                    weight_dtype
+                )
+                out_topk_ids[start:end] = top_ids
+                out_tokens[start:end] = out_topk_ids[start:end, 0]
             return out_tokens, out_topk_ids, out_topk_probs
 
         def _ensure_local_reduce_buffers(
@@ -1738,9 +1767,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             tree_num_draft_tokens = int(self._tree_num_draft_tokens)
             num_steps = int(draft_hidden.shape[1]) - 1
             use_ddtree = self._tree_algo == "ddtree"
+            use_jetspec = self._tree_algo == "jetspec"
             # DDTree picks an adaptive width up to 6; sample at least that wide so
             # the CPU builder has the candidates it needs. The kernel `topk` then
-            # equals this sampled width (= max branching factor).
+            # equals this sampled width (= max branching factor). JetSpec's fan-out
+            # width == tree_topk (the eagle-topk), so it samples exactly tree_topk.
             sample_width = max(tree_topk, 6) if use_ddtree else tree_topk
             topk_result = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(
@@ -1758,6 +1789,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             builder = (
                 build_tree_verify_tokens_ddtree
                 if use_ddtree
+                else build_tree_verify_tokens_jetspec
+                if use_jetspec
                 else build_tree_verify_tokens
             )
             (
