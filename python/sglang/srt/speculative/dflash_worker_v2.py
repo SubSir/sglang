@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import List, Optional, Tuple, cast
 
@@ -29,6 +30,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     build_tree_verify_tokens,
+    build_tree_verify_tokens_ddtree,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -286,6 +288,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             if server_args.speculative_eagle_topk is not None
             else 1
         )
+        # COMPARISON-ONLY (not in the PR branch): tree construction algorithm.
+        # "fused" (default, GPU kernel, graph-capturable) or the CPU best-first
+        # builder "ddtree" (data-dependent best-first heap search -> cannot be
+        # captured into a cuda graph, so they always run eager). Selected via
+        # SGLANG_DFLASH_TREE_ALGO for A/B benchmarking.
+        self._tree_algo: str = os.environ.get(
+            "SGLANG_DFLASH_TREE_ALGO", "fused"
+        ).lower()
         # Tree-mask / position buffers reused across verify steps instead of
         # allocating + memsetting fresh ones every step (EAGLE-style). Lazily
         # allocated on the first tree-verify step (needs max_context_len).
@@ -475,6 +485,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start = int(shard.org_vocab_start_index)
         max_bs = max(self.server_args.cuda_graph_config.decode.bs)
         if self._tree_verify_enabled:
+            # Only the fused GPU builder can be folded into the graph; the CPU
+            # the ddtree CPU builder is data-dependent heap search -> eager only.
+            if self._tree_algo != "fused":
+                return _eager(f"tree_algo={self._tree_algo} (CPU builder, eager)")
             # Tree top-k needs the base-vocab fast path (full weight, no offset), which
             # matches the eager return_topk path (already tp=1 / no-added-vocab gated).
             if org_vocab_start != 0:
@@ -1816,6 +1830,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             tree_topk = int(self._tree_verify_topk)
             tree_num_draft_tokens = int(self._tree_num_draft_tokens)
             num_steps = int(self.block_size) - 1
+            # verify_topk = the width used to ENCODE parent_list/selected_index; it
+            # must be passed to DFlashVerifyInput.topk so the kernel's parent_tb_idx
+            # math matches. fused uses tree_topk; ddtree samples wider.
+            verify_topk = tree_topk
             if sampler_fast_path:
                 # Top-k sample AND draft-tree build already ran in-graph
                 # (_DflashTreeDraftSampler); read its static output buffers.
@@ -1824,27 +1842,39 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tree_parent_list = s.out_parent_list[:bs]
                 tree_selected_index = s.out_selected_index[:bs]
             else:
+                # COMPARISON: pick the tree builder. ddtree samples wider (adaptive
+                # width up to 6) so the CPU heap has candidates; fused samples
+                # exactly tree_topk. Both run eager here (only fused can also be
+                # graph-captured, handled by the fast path above).
+                use_ddtree = self._tree_algo == "ddtree"
+                sample_width = max(tree_topk, 6) if use_ddtree else tree_topk
+                verify_topk = sample_width
                 topk_result = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]
                     ),
                     lm_head=lm_head,
-                    return_topk=tree_topk,
+                    return_topk=sample_width,
                 )
                 _, draft_topk_ids, draft_topk_probs = cast(
                     Tuple[torch.Tensor, torch.Tensor, torch.Tensor], topk_result
                 )
-                draft_topk_ids = draft_topk_ids.view(bs, num_steps, tree_topk)
-                draft_topk_probs = draft_topk_probs.view(bs, num_steps, tree_topk)
+                draft_topk_ids = draft_topk_ids.view(bs, num_steps, sample_width)
+                draft_topk_probs = draft_topk_probs.view(bs, num_steps, sample_width)
+                builder = (
+                    build_tree_verify_tokens_ddtree
+                    if use_ddtree
+                    else build_tree_verify_tokens
+                )
                 (
                     tree_draft_tokens,
                     tree_parent_list,
                     tree_selected_index,
-                ) = build_tree_verify_tokens(
+                ) = builder(
                     verified_id=block_ids[:, 0],  # [bs]
                     topk_probs=draft_topk_probs,
                     topk_ids=draft_topk_ids,
-                    topk=tree_topk,
+                    topk=sample_width,
                     num_draft_tokens=tree_num_draft_tokens,
                 )
             # positions=None / custom_mask=None signals prepare_for_verify to run
@@ -1860,7 +1890,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 custom_mask=None,
                 # Kernel parent_tb_idx math uses this topk; must equal the width
                 # used to encode parent_list/selected_index.
-                topk=tree_topk,
+                topk=verify_topk,
                 tree_parent_list=tree_parent_list,
                 tree_selected_index=tree_selected_index,
                 capture_hidden_mode=CaptureHiddenMode.FULL,

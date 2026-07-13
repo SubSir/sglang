@@ -944,3 +944,204 @@ def build_tree_verify_tokens(
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
     draft_tokens = torch.cat([verified_id[:, None], draft_tokens], dim=1).flatten()
     return draft_tokens, parent_list, top_scores_index
+
+
+# --- DDTree CPU builder ------------------------------------------------------
+# A best-first (heap) tree builder ported from the DDTree reference
+# (build_ddtree_tree / _build_single_tree). It produces an *irregular* tree
+# (adaptive width + depth bonus) and re-encodes it into the SAME
+# (draft_tokens, parent_list, selected_index) contract that EAGLE's
+# build_tree_kernel_efficient consumes, so the v2 KV/accept/mask path is reused
+# unchanged. Selected via SGLANG_DFLASH_TREE_ALGO=ddtree.
+import heapq
+
+import numpy as np
+
+# Depth bonus: a small constant added to child logprobs to bias toward deeper
+# trees (favours spine growth over wide shallow fan-out). ponytail: tunable knob.
+# Overridable via env for ablation (SGLANG_DDTREE_DEPTH_BONUS).
+import os as _os
+
+_DDTREE_DEPTH_BONUS: float = float(_os.environ.get("SGLANG_DDTREE_DEPTH_BONUS", "0.2"))
+# Force a fixed builder width (0 = use DDTree adaptive min(budget//L+1,2..6)).
+_DDTREE_FORCE_WIDTH: int = int(_os.environ.get("SGLANG_DDTREE_FORCE_WIDTH", "0"))
+
+
+def _build_single_ddtree(
+    top_log_probs: "np.ndarray",
+    top_token_ids: "np.ndarray",
+    topk: int,
+    depth_limit: int,
+    budget: int,
+):
+    """Heap best-first build for one request. Returns (node_token_ids[N],
+    parent_pos[N]) where parent_pos[j] is the *pruned position* (0=root) of the
+    parent of selected node j, in heap/insertion order (parent always < child).
+    Mirrors DDTree _build_single_tree (siblings + first-child push, depth bonus)."""
+    node_token_ids = [0] * budget
+    parent_pos = [0] * budget  # parent pruned pos of node j (1-based pos = j+1)
+    first_logw = float(top_log_probs[0, 0])
+    # heap entry: (-logw, ranks, parent_pruned_pos, depth, rank, logw)
+    heap = [(-first_logw, (0,), 0, 1, 0, first_logw)]
+    node_count = 0
+    while heap and node_count < budget:
+        _, ranks, parent_idx, depth, rank, logw = heapq.heappop(heap)
+        node_token_ids[node_count] = int(top_token_ids[depth - 1, rank])
+        parent_pos[node_count] = parent_idx
+        current_idx = node_count + 1
+        node_count += 1
+
+        # next sibling under the SAME parent (rank+1)
+        if rank + 1 < topk:
+            sibling_logw = (
+                logw
+                - float(top_log_probs[depth - 1, rank])
+                + float(top_log_probs[depth - 1, rank + 1])
+            )
+            heapq.heappush(
+                heap,
+                (-sibling_logw, ranks[:-1] + (rank + 1,), parent_idx, depth, rank + 1, sibling_logw),
+            )
+        # first child of this node (rank 0 at next depth) + depth bonus
+        if depth < depth_limit:
+            child_logw = logw + float(top_log_probs[depth, 0]) + _DDTREE_DEPTH_BONUS
+            heapq.heappush(
+                heap,
+                (-child_logw, ranks + (0,), current_idx, depth + 1, 0, child_logw),
+            )
+    return node_token_ids[:node_count], parent_pos[:node_count]
+
+
+def _ddtree_to_eagle_arrays(parent_pos, node_token_ids, topk):
+    """Re-encode an irregular tree into EAGLE (parent_list, selected_index,
+    ordered_tokens). cand[j] = parent_pos*topk + sibling_rank; the kernel reads
+    parent_tb_idx = selected_index[j]//topk and parent_list[parent_tb_idx] = parent
+    cand. selected_index must be ascending, so we relabel via BFS-by-parent (which
+    makes cand monotonic) and reorder tokens to match. Verified by round-trip
+    against the kernel's recovery logic (see scratchpad)."""
+    N = len(parent_pos)
+    # BFS over pruned positions so children of pos 0 precede children of pos 1...,
+    # which guarantees ascending cand. children[p] = old node indices with parent p.
+    children: dict[int, list[int]] = {}
+    for j in range(N):
+        children.setdefault(parent_pos[j], []).append(j)
+    new_order: list[int] = []
+    oldpos_to_newpos = {0: 0}
+    queue = [0]
+    while queue:
+        ppos = queue.pop(0)
+        for oldj in children.get(ppos, []):
+            new_order.append(oldj)
+            newpos = len(new_order)  # 1-based pruned pos
+            oldpos_to_newpos[oldj + 1] = newpos
+            queue.append(oldj + 1)
+    # cand[j] (new order) = new_parent_pos*topk + sibling_rank
+    cand = [0] * N
+    ordered_tokens = [0] * N
+    sib: dict[int, int] = {}
+    for newpos, oldj in enumerate(new_order, start=1):
+        npp = oldpos_to_newpos[parent_pos[oldj]]
+        r = sib.get(npp, 0)
+        sib[npp] = r + 1
+        cand[newpos - 1] = npp * topk + r
+        ordered_tokens[newpos - 1] = node_token_ids[oldj]
+    # parent_list[k] = cand of node at pruned pos k (k in 1..N); parent_list[0]=-1
+    parent_list = [-1] + cand
+    return parent_list, cand, ordered_tokens
+
+
+def build_tree_verify_tokens_ddtree(
+    *,
+    verified_id: torch.Tensor,
+    topk_probs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+    num_draft_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DDTree CPU best-first builder. Drop-in for build_tree_verify_tokens: same
+    inputs/outputs (draft_tokens, parent_list, selected_index) in the layout the
+    EAGLE kernel consumes. topk_probs/topk_ids are log-domain-friendly draft
+    probabilities of width `topk` per step (the worker samples width >= the
+    DDTree adaptive width when this path is active).
+
+    Adaptive width: per DDTree, w = min(max(budget//L+1, 2), V, 6), capped at the
+    sampled width. The kernel `topk` param MUST be >= the max branching factor =
+    that adaptive width, so the caller passes topk = sampled width and we honour it.
+    """
+    import numpy as np
+
+    bs = topk_probs.shape[0]
+    num_steps = topk_probs.shape[1]  # = block_size - 1 = draft horizon L
+    device = topk_probs.device
+    budget = num_draft_tokens - 1  # non-root nodes
+
+    L = num_steps
+    sampled_width = topk_ids.shape[2]
+    if _DDTREE_FORCE_WIDTH > 0:
+        adaptive_w = min(_DDTREE_FORCE_WIDTH, sampled_width)
+    else:
+        adaptive_w = min(max(budget // max(L, 1) + 1, 2), sampled_width)
+
+    # log-prob domain for additive scoring (probs are post-softmax topk slices).
+    log_probs = torch.log(topk_probs.clamp_min(1e-20))
+    lp_np = log_probs.to(device="cpu", dtype=torch.float32).numpy()
+    ids_np = topk_ids.to(device="cpu", dtype=torch.long).numpy()
+    verified_cpu = verified_id.to(device="cpu", dtype=torch.long)
+
+    # Output: padded to num_draft_tokens. Unused tail nodes are encoded as
+    # self-consistent leaves of root with dummy tokens so the kernel stays valid
+    # (they just never get accepted). parent_list padded with -1.
+    draft_np = np.zeros((bs, num_draft_tokens), dtype=np.int64)
+    # parent_list width sets the kernel's ancestor-walk `depth` via
+    # prepare_for_verify: depth = (W-1)//topk + 1. The mask kernel climbs at most
+    # `depth` ancestors, so depth MUST cover the deepest branch. ddtree's depth
+    # bonus builds spines up to L=num_steps, so size W for depth == num_steps
+    # (same as the fused builder). Sizing it by node-count/topk gave depth ~7 and
+    # truncated deep spines -> their ancestor mask was wrong -> rejected.
+    pl_width = topk * (num_steps - 1) + 1
+    parent_list_np = np.full((bs, pl_width), -1, dtype=np.int64)
+    sel_np = np.zeros((bs, budget), dtype=np.int64)
+
+    for b in range(bs):
+        node_tokens, parent_pos = _build_single_ddtree(
+            lp_np[b], ids_np[b], adaptive_w, L, budget
+        )
+        n = len(node_tokens)
+        # Encode cand in base `topk` (== DFlashVerifyInput.topk the kernel decodes
+        # with: parent_tb_idx = selected_index // topk). adaptive_w only caps the
+        # search fan-out; the sibling rank still fits in [0, topk) so base topk is
+        # correct. Using adaptive_w here would encode in a different base than the
+        # kernel decodes -> parent recovery wrong -> accept collapses.
+        parent_list, cand, ordered_tokens = _ddtree_to_eagle_arrays(
+            parent_pos, node_tokens, topk
+        )
+        draft_np[b, 0] = int(verified_cpu[b])
+        if n > 0:
+            draft_np[b, 1 : 1 + n] = ordered_tokens
+            sel_np[b, :n] = cand
+            parent_list_np[b, : len(parent_list)] = parent_list
+        # Pad remaining selected slots: extra leaves hung off root with unique
+        # cand values so selected_index stays strictly ascending and the kernel
+        # treats them as depth-1 dead leaves (token 0). They won't be accepted.
+        if n < budget:
+            # Pad: chain extra dead leaves so each gets a FRESH slot (no clobber of
+            # real nodes' parent pointers). cand stays strictly ascending. Each pad
+            # links to root (cand 0) -> harmless depth-1 leaves, token 0, never
+            # accepted. We advance cand to a fresh slot boundary per pad.
+            used_max_slot = (max(cand) // topk) if cand else 0
+            slot = used_max_slot + 1
+            for j in range(n, budget):
+                if slot >= pl_width:
+                    # ran out of slots; reuse last cand+1 in same slot (still a valid
+                    # leaf, just shares a parent row already set to root).
+                    sel_np[b, j] = sel_np[b, j - 1] + 1
+                    continue
+                c = slot * topk  # rank 0 in a fresh slot
+                sel_np[b, j] = c
+                parent_list_np[b, slot] = 0  # parent = root
+                slot += 1
+
+    draft_tokens = torch.from_numpy(draft_np.reshape(-1)).to(device=device)
+    parent_list = torch.from_numpy(parent_list_np).to(device=device)
+    selected_index = torch.from_numpy(sel_np).to(device=device)
+    return draft_tokens, parent_list, selected_index

@@ -194,11 +194,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         server_args.speculative_eagle_topk = 1
 
     # The fused tree kernel indexes topk**2, so the tree branching factor must be a
-    # power of 2 in {4, 8, 16}. Validate at launch for a clear error.
-    if _dflash_tree_verify and int(server_args.speculative_eagle_topk) not in (
-        4,
-        8,
-        16,
+    # power of 2 in {4, 8, 16}. Validate at launch for a clear error. (COMPARE branch:
+    # the CPU ddtree builder has no such restriction, so skip the check for it.)
+    _fused_tree = os.environ.get("SGLANG_DFLASH_TREE_ALGO", "fused") == "fused"
+    if (
+        _dflash_tree_verify
+        and _fused_tree
+        and int(server_args.speculative_eagle_topk) not in (4, 8, 16)
     ):
         raise ValueError(
             "--speculative-dflash-tree-verify requires --speculative-eagle-topk in "
