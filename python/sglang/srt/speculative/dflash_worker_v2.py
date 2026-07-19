@@ -1,7 +1,7 @@
 import logging
 import math
 from dataclasses import replace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -145,6 +145,60 @@ class _DflashDraftSampler:
         selected = self.selected_ids[:, :n]
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
+
+
+class _SelectorDraftSampler:
+    """Capture-safe greedy selector decode, folded into the draft cuda graph.
+
+    Runs the P160 lattice decode (base_logits -> lattice -> K x K transition ->
+    greedy path) inside the draft graph; the block_size-1 draft tokens are written
+    to a static buffer read by the worker after replay. Greedy only — matching the
+    dflash/dspark in-graph samplers; T=1 ancestral sampling stays eager.
+
+    Consumes block positions 0..block_size-2 (pos 0 = anchor, shift-style p160),
+    mirroring the eager `_propose_selector_block` slice.
+    """
+
+    def __init__(
+        self, *, draft_model, selector, embed_weight, block_size, decoder, max_bs, device
+    ):
+        self.draft_model = draft_model
+        self.selector = selector
+        self.embed_weight = embed_weight
+        self.block_size = int(block_size)
+        self.decoder = decoder
+        max_tokens = int(max_bs) * (self.block_size - 1)
+        # Proposed draft tokens: written in-graph, read by the worker after replay.
+        self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+
+    def __call__(self, hidden_states, input_ids=None):
+        bs = hidden_states.shape[0] // self.block_size
+        hs = hidden_states.view(bs, self.block_size, -1)[:, :-1, :]  # pos 0 = anchor
+        num_pred = hs.shape[1]
+        base_logits = self.draft_model.compute_base_logits(
+            hs.reshape(-1, hs.shape[-1])
+        ).view(bs, num_pred, -1)
+        candidate_ids, unary_logits, candidate_factors, hidden_factors = (
+            self.selector.prepare_lattice(
+                base_logits=base_logits,
+                hidden_states=hs,
+                embedding_weight=self.embed_weight,
+            )
+        )
+        transition_scores = self.selector.transition_scores(
+            unary_logits=unary_logits,
+            candidate_factors=candidate_factors,
+            hidden_factors=hidden_factors,
+        )
+        if self.decoder == "normalized-map":
+            tokens = self.selector.decode_normalized_map(
+                candidate_ids=candidate_ids, transition_scores=transition_scores
+            )
+        else:
+            tokens = self.selector.decode_local(
+                candidate_ids=candidate_ids, transition_scores=transition_scores
+            )
+        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -365,6 +419,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
             return _eager("no target lm_head")
+
+        selector = getattr(self.draft_model, "candidate_selector", None)
+        if selector is not None:
+            # Fold the greedy selector decode into the draft cuda graph (T=1 sampling
+            # stays eager, same as the dflash/dspark in-graph samplers). compute_base_logits
+            # needs the target lm_head attached before capture.
+            if not torch.is_floating_point(lm_head.weight):
+                return _eager("selector: quantized lm_head")
+            self.draft_model.attach_shared_modules(lm_head=lm_head)
+            decoder = envs.SGLANG_DFLASH_SELECTOR_DECODER.get()
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH selector greedy decode folded into the draft cuda graph "
+                    "(decoder=%s).",
+                    decoder,
+                )
+            return _SelectorDraftSampler(
+                draft_model=self.draft_model,
+                selector=selector,
+                embed_weight=target_model.get_input_embeddings().weight,
+                block_size=self.block_size,
+                decoder=decoder,
+                max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+                device=self.device,
+            )
         if not torch.is_floating_point(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
@@ -721,6 +800,151 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
+
+    def _propose_selector_block(
+        self,
+        *,
+        draft_logits_output,
+        bs: int,
+        embed_module,
+        lm_head,
+        sampling_info=None,
+    ) -> torch.Tensor:
+        """Decode the draft block with the candidate selector.
+
+        The DFLASH block is [bonus, mask*(block_size-1)]; the selector consumes the
+        block_size-1 prediction slots (draft hidden [:, :-1, :], pos0 = anchor) and
+        returns that many draft tokens, matching the block layout of `draft_next`.
+
+        Greedy (all-greedy sampling_info): decode_local / decode_normalized_map.
+        Non-greedy: T=1 lossless ancestral sampling; stashes (log_q, candidate_ids,
+        q_rows) on self._selector_sample for the verify-side rejection.
+        """
+        self._selector_sample = None
+        draft_model = self.draft_model
+        selector = draft_model.candidate_selector
+        if draft_model.lm_head is None:
+            draft_model.attach_shared_modules(lm_head=lm_head)
+
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH selector draft returned no hidden states.")
+        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+        # p160 is shift-style: block position 0 (the anchor/bonus) produces the FIRST
+        # prediction (its base_logits argmax == first new token), positions 1..k-1 the
+        # rest. So the selector consumes positions 0..block_size-2 ([anchor, mask*..]),
+        # NOT 1..block_size-1. Its block_size-1 outputs become draft_tokens[:, 1:].
+        pred_hidden = draft_hidden[:, :-1, :]  # [bs, block_size-1, H], pos0 = anchor
+        num_pred = pred_hidden.shape[1]
+        if num_pred != selector.block_size:
+            raise ValueError(
+                f"DFLASH selector expects block_size-1={num_pred} prediction slots to "
+                f"equal the selector block_size={selector.block_size}. Launch with "
+                f"--speculative-num-draft-tokens {selector.block_size + 1}."
+            )
+
+        base_logits = draft_model.compute_base_logits(
+            pred_hidden.reshape(-1, pred_hidden.shape[-1])
+        ).view(bs, num_pred, -1)
+        candidate_ids, unary_logits, candidate_factors, hidden_factors = (
+            selector.prepare_lattice(
+                base_logits=base_logits,
+                hidden_states=pred_hidden,
+                embedding_weight=embed_module.weight,
+            )
+        )
+        transition_scores = selector.transition_scores(
+            unary_logits=unary_logits,
+            candidate_factors=candidate_factors,
+            hidden_factors=hidden_factors,
+        )
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            # T=1 lossless ancestral sampling. One iid uniform per block slot.
+            uniforms = torch.rand(
+                bs, num_pred, device=base_logits.device, dtype=torch.float32
+            )
+            tokens, log_q, q_rows = selector.sample_temperature_one(
+                candidate_ids=candidate_ids,
+                unary_logits=unary_logits,
+                transition_scores=transition_scores,
+                uniforms=uniforms,
+            )
+            self._selector_sample = {
+                "log_q": log_q,
+                "candidate_ids": candidate_ids,
+                "q_rows": q_rows,
+            }
+            return tokens.view(bs, num_pred)
+        decoder = envs.SGLANG_DFLASH_SELECTOR_DECODER.get()
+        if decoder == "normalized-map":
+            tokens = selector.decode_normalized_map(
+                candidate_ids=candidate_ids, transition_scores=transition_scores
+            )
+        elif decoder == "local":
+            tokens = selector.decode_local(
+                candidate_ids=candidate_ids, transition_scores=transition_scores
+            )
+        else:
+            raise ValueError(
+                f"Unknown SGLANG_DFLASH_SELECTOR_DECODER={decoder!r} "
+                "(expected 'local' or 'normalized-map')."
+            )
+        return tokens.view(bs, num_pred)
+
+    def _selector_sampling_accept(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        sample: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Lossless T=1 verify for the selector.
+
+        Accept draft j with prob min(1, p_j/q_j) (prefix); at the first reject, draw
+        the bonus from the residual (p - q)+ over the vocab (q expanded from the
+        selector's K-candidate row). If every draft is accepted, q=0 at the trailing
+        slot so the bonus is a plain target sample. Matches the reference _verify T=1.
+        """
+        bs, block = candidates.shape
+        device = candidates.device
+        vocab = int(next_token_logits.shape[-1])
+        target_probs = torch.softmax(
+            next_token_logits.view(bs, block, vocab).float(), dim=-1
+        )
+        log_q = sample["log_q"]  # [bs, block-1]
+        candidate_ids = sample["candidate_ids"]  # [bs, block-1, K]
+        q_rows = sample["q_rows"]  # [bs, block-1, K]
+
+        drafts = candidates[:, 1:]  # [bs, block-1]
+        # p_j = target prob of draft j, predicted at block position j.
+        p_all = (
+            target_probs[:, : block - 1].gather(-1, drafts.unsqueeze(-1)).squeeze(-1)
+        )
+        q_all = log_q.exp().clamp_min(torch.finfo(torch.float32).tiny)
+        accept_prob = (p_all / q_all).clamp(max=1.0)
+        uniforms = torch.rand(bs, block - 1, device=device, dtype=torch.float32)
+        individually = uniforms < accept_prob
+        prefix = individually.to(torch.int64).cumprod(dim=1)
+        accept_len = prefix.sum(dim=1)  # [bs], in [0, block-1]
+
+        rows = torch.arange(bs, device=device)
+        # Reject block position = accept_len (target prediction after last accepted).
+        p_row = target_probs[rows, accept_len]  # [bs, vocab]
+        # Selector q row at the first-rejected draft (none if all accepted).
+        sel_pos = accept_len.clamp_max(block - 2)
+        has_draft = (accept_len < block - 1).unsqueeze(-1).float()  # [bs,1]
+        q_full = torch.zeros(bs, vocab, device=device, dtype=torch.float32)
+        q_full.scatter_(
+            -1,
+            candidate_ids[rows, sel_pos],
+            q_rows[rows, sel_pos].float() * has_draft,
+        )
+        residual = (p_row - q_full).clamp_min(0.0)
+        residual_sum = residual.sum(dim=-1, keepdim=True)
+        # Degenerate guard: if residual mass vanished, fall back to the target dist.
+        residual = torch.where(residual_sum > 0, residual / residual_sum, p_row)
+        bonus = torch.multinomial(residual, num_samples=1).squeeze(-1)
+        return accept_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1585,7 +1809,30 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if getattr(self.draft_model, "candidate_selector", None) is not None:
+            all_greedy = (
+                batch.sampling_info is None or batch.sampling_info.is_all_greedy
+            )
+            if (
+                self._draft_sampler is not None
+                and draft_out.can_run_graph
+                and all_greedy
+            ):
+                # Greedy decode was folded into the draft graph; read its output.
+                self._selector_sample = None
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
+            else:
+                # T=1 sampling, or graph unavailable: eager selector decode.
+                draft_next = self._propose_selector_block(
+                    draft_logits_output=draft_logits_output,
+                    bs=bs,
+                    embed_module=embed_module,
+                    lm_head=lm_head,
+                    sampling_info=batch.sampling_info,
+                )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1659,7 +1906,22 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        if (
+        if getattr(self, "_selector_sample", None) is not None:
+            # Selector T=1: lossless min(1, p/q) prefix accept + residual (p-q)+ bonus.
+            accept_len, bonus = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sample=self._selector_sample,
+            )
+            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+            out_tokens = torch.empty(
+                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            )
+            if int(self.block_size) > 1:
+                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+        elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
