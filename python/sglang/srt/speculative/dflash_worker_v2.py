@@ -807,7 +807,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         returns that many draft tokens, matching the block layout of `draft_next`.
 
         Greedy (all-greedy sampling_info): decode_local.
-        Non-greedy: T=1 lossless ancestral sampling; stashes (candidate_ids,
+        Non-greedy: lossless ancestral sampling at the request temperature;
+        stashes (candidate_ids,
         q_rows) on self._selector_sample for the verify-side rejection.
         """
         self._selector_sample = None
@@ -846,11 +847,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             uniforms = torch.rand(
                 bs, num_pred, device=base_logits.device, dtype=torch.float32
             )
-            tokens, q_rows = selector.sample_temperature_one(
+            # Same temperature prep as DSpark: clamp so greedy rows in a mixed batch
+            # do not divide by zero.
+            temperatures = sampling_info.temperatures.view(-1).to(
+                torch.float32
+            ).clamp_min(1e-5)
+            tokens, q_rows = selector.sample_path(
                 candidate_ids=candidate_ids,
                 unary_logits=unary_logits,
                 transition_scores=transition_scores,
                 uniforms=uniforms,
+                temperatures=temperatures,
             )
             self._selector_sample = {
                 "candidate_ids": candidate_ids,

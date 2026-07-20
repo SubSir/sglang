@@ -733,25 +733,31 @@ class CandidateSelector(nn.Module):
         return candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
 
     @torch.no_grad()
-    def sample_temperature_one(
+    def sample_path(
         self,
         *,
         candidate_ids: torch.Tensor,
         unary_logits: torch.Tensor,
         transition_scores: torch.Tensor,
         uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Ancestral sample one path (inverse-CDF, one uniform per block position):
-        position 0 ~ softmax(unary[:, 0]), position i ~ the predecessor-selected row.
+        position 0 ~ softmax(unary[:, 0]), position i ~ the predecessor-selected row,
+        both scaled by the per-request temperature so q matches the target's shape
+        (a matched q is what keeps the rejection-sampling accept rate high).
         Returns (tokens, q_rows); q_rows is the exact per-position categorical over
         the K candidates along the path, consumed by the rejection-sampling verify."""
         top_k = self.top_k
-        initial_probs = torch.softmax(unary_logits[:, 0].float(), dim=-1)
+        temps = temperatures.view(-1, 1)
+        initial_probs = torch.softmax(unary_logits[:, 0].float() / temps, dim=-1)
         initial_indices = (
             uniforms[:, :1].ge(initial_probs.cumsum(dim=-1)).sum(dim=-1).clamp_max(top_k - 1)
         )
 
-        transition_probs = torch.softmax(transition_scores.float(), dim=-1)
+        transition_probs = torch.softmax(
+            transition_scores.float() / temps[:, :, None, None], dim=-1
+        )
         local_maps = (
             uniforms[:, 1:, None, None]
             .ge(transition_probs.cumsum(dim=-1))
