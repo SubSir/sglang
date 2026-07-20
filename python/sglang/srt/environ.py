@@ -747,10 +747,6 @@ class Envs:
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
-    # DFLASH candidate-selector draft greedy decoder: "local" (per-edge argmax +
-    # prefix-scan compose) or "normalized-map" (global Viterbi over the normalized
-    # K x K chain).
-    SGLANG_DFLASH_SELECTOR_DECODER = EnvStr("local")
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

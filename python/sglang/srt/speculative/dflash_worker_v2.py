@@ -160,16 +160,22 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, selector, embed_weight, block_size, decoder, max_bs, device
+        self, *, draft_model, selector, embed_weight, block_size, max_bs, device
     ):
         self.draft_model = draft_model
         self.selector = selector
         self.embed_weight = embed_weight
         self.block_size = int(block_size)
-        self.decoder = decoder
         max_tokens = int(max_bs) * (self.block_size - 1)
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        # Both prepared before cuda-graph capture so the decode neither allocates nor
+        # recomputes inside the graph:
+        #  - prefix-scan ping-pong buffers (num_pred = block_size-1)
+        #  - token_projection(rms_norm(embed)) folded into a [vocab, r] table, so
+        #    build_lattice only gathers instead of embed+rms_norm+projection.
+        selector.alloc_decode_buffers(int(max_bs), self.block_size - 1, device)
+        selector.build_projected_token_table(embed_weight)
 
     def __call__(self, hidden_states, input_ids=None):
         bs = hidden_states.shape[0] // self.block_size
@@ -178,26 +184,14 @@ class _SelectorDraftSampler:
         base_logits = self.draft_model.compute_base_logits(
             hs.reshape(-1, hs.shape[-1])
         ).view(bs, num_pred, -1)
-        candidate_ids, unary_logits, candidate_factors, hidden_factors = (
-            self.selector.prepare_lattice(
-                base_logits=base_logits,
-                hidden_states=hs,
-                embedding_weight=self.embed_weight,
-            )
+        candidate_ids, unary_logits, transition_scores = self.selector.build_lattice(
+            base_logits=base_logits,
+            hidden_states=hs,
+            embedding_weight=self.embed_weight,
         )
-        transition_scores = self.selector.transition_scores(
-            unary_logits=unary_logits,
-            candidate_factors=candidate_factors,
-            hidden_factors=hidden_factors,
+        tokens = self.selector.decode_local(
+            candidate_ids=candidate_ids, transition_scores=transition_scores
         )
-        if self.decoder == "normalized-map":
-            tokens = self.selector.decode_normalized_map(
-                candidate_ids=candidate_ids, transition_scores=transition_scores
-            )
-        else:
-            tokens = self.selector.decode_local(
-                candidate_ids=candidate_ids, transition_scores=transition_scores
-            )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
 
 
@@ -428,19 +422,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not torch.is_floating_point(lm_head.weight):
                 return _eager("selector: quantized lm_head")
             self.draft_model.attach_shared_modules(lm_head=lm_head)
-            decoder = envs.SGLANG_DFLASH_SELECTOR_DECODER.get()
             if self.ps.tp_rank == 0:
                 logger.info(
-                    "DFLASH selector greedy decode folded into the draft cuda graph "
-                    "(decoder=%s).",
-                    decoder,
+                    "DFLASH selector greedy decode folded into the draft cuda graph."
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 selector=selector,
                 embed_weight=target_model.get_input_embeddings().weight,
                 block_size=self.block_size,
-                decoder=decoder,
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
             )
@@ -816,8 +806,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         block_size-1 prediction slots (draft hidden [:, :-1, :], pos0 = anchor) and
         returns that many draft tokens, matching the block layout of `draft_next`.
 
-        Greedy (all-greedy sampling_info): decode_local / decode_normalized_map.
-        Non-greedy: T=1 lossless ancestral sampling; stashes (log_q, candidate_ids,
+        Greedy (all-greedy sampling_info): decode_local.
+        Non-greedy: T=1 lossless ancestral sampling; stashes (candidate_ids,
         q_rows) on self._selector_sample for the verify-side rejection.
         """
         self._selector_sample = None
@@ -846,49 +836,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         base_logits = draft_model.compute_base_logits(
             pred_hidden.reshape(-1, pred_hidden.shape[-1])
         ).view(bs, num_pred, -1)
-        candidate_ids, unary_logits, candidate_factors, hidden_factors = (
-            selector.prepare_lattice(
-                base_logits=base_logits,
-                hidden_states=pred_hidden,
-                embedding_weight=embed_module.weight,
-            )
-        )
-        transition_scores = selector.transition_scores(
-            unary_logits=unary_logits,
-            candidate_factors=candidate_factors,
-            hidden_factors=hidden_factors,
+        candidate_ids, unary_logits, transition_scores = selector.build_lattice(
+            base_logits=base_logits,
+            hidden_states=pred_hidden,
+            embedding_weight=embed_module.weight,
         )
         if sampling_info is not None and not sampling_info.is_all_greedy:
             # T=1 lossless ancestral sampling. One iid uniform per block slot.
             uniforms = torch.rand(
                 bs, num_pred, device=base_logits.device, dtype=torch.float32
             )
-            tokens, log_q, q_rows = selector.sample_temperature_one(
+            tokens, q_rows = selector.sample_temperature_one(
                 candidate_ids=candidate_ids,
                 unary_logits=unary_logits,
                 transition_scores=transition_scores,
                 uniforms=uniforms,
             )
             self._selector_sample = {
-                "log_q": log_q,
                 "candidate_ids": candidate_ids,
                 "q_rows": q_rows,
             }
             return tokens.view(bs, num_pred)
-        decoder = envs.SGLANG_DFLASH_SELECTOR_DECODER.get()
-        if decoder == "normalized-map":
-            tokens = selector.decode_normalized_map(
-                candidate_ids=candidate_ids, transition_scores=transition_scores
-            )
-        elif decoder == "local":
-            tokens = selector.decode_local(
-                candidate_ids=candidate_ids, transition_scores=transition_scores
-            )
-        else:
-            raise ValueError(
-                f"Unknown SGLANG_DFLASH_SELECTOR_DECODER={decoder!r} "
-                "(expected 'local' or 'normalized-map')."
-            )
+        tokens = selector.decode_local(
+            candidate_ids=candidate_ids, transition_scores=transition_scores
+        )
         return tokens.view(bs, num_pred)
 
     def _selector_sampling_accept(
@@ -897,54 +868,42 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates: torch.Tensor,
         next_token_logits: torch.Tensor,
         sample: dict,
+        sampling_info,
+        draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lossless T=1 verify for the selector.
+        """Lossless non-greedy verify for the selector.
 
-        Accept draft j with prob min(1, p_j/q_j) (prefix); at the first reject, draw
-        the bonus from the residual (p - q)+ over the vocab (q expanded from the
-        selector's K-candidate row). If every draft is accepted, q=0 at the trailing
-        slot so the bonus is a plain target sample. Matches the reference _verify T=1.
+        Reuses the shared chain rejection-sampling path (same one DSpark uses): the
+        selector's K-candidate proposal q is scattered into a target-vocab
+        `draft_probs`, and `accept_sampling` runs the official triton kernel with
+        threshold_single/acc pinned to 1.0 (pure rejection sampling). target_probs is
+        built there from the request's temperature / top-k / top-p.
         """
+        from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
+            accept_sampling,
+        )
+
         bs, block = candidates.shape
-        device = candidates.device
+        gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
-        target_probs = torch.softmax(
-            next_token_logits.view(bs, block, vocab).float(), dim=-1
+        candidate_ids = sample["candidate_ids"]  # [bs, gamma, K]
+        q_rows = sample["q_rows"]  # [bs, gamma, K]
+        # q lives on K candidates; the kernel wants a target-vocab distribution.
+        draft_probs = torch.zeros(
+            (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
         )
-        log_q = sample["log_q"]  # [bs, block-1]
-        candidate_ids = sample["candidate_ids"]  # [bs, block-1, K]
-        q_rows = sample["q_rows"]  # [bs, block-1, K]
-
-        drafts = candidates[:, 1:]  # [bs, block-1]
-        # p_j = target prob of draft j, predicted at block position j.
-        p_all = (
-            target_probs[:, : block - 1].gather(-1, drafts.unsqueeze(-1)).squeeze(-1)
+        draft_probs.scatter_(-1, candidate_ids, q_rows.float())
+        correct_len, bonus, _ = accept_sampling(
+            candidates=candidates,
+            target_logits=next_token_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=block,
+            cutoff_verify_lens=None,
         )
-        q_all = log_q.exp().clamp_min(torch.finfo(torch.float32).tiny)
-        accept_prob = (p_all / q_all).clamp(max=1.0)
-        uniforms = torch.rand(bs, block - 1, device=device, dtype=torch.float32)
-        individually = uniforms < accept_prob
-        prefix = individually.to(torch.int64).cumprod(dim=1)
-        accept_len = prefix.sum(dim=1)  # [bs], in [0, block-1]
-
-        rows = torch.arange(bs, device=device)
-        # Reject block position = accept_len (target prediction after last accepted).
-        p_row = target_probs[rows, accept_len]  # [bs, vocab]
-        # Selector q row at the first-rejected draft (none if all accepted).
-        sel_pos = accept_len.clamp_max(block - 2)
-        has_draft = (accept_len < block - 1).unsqueeze(-1).float()  # [bs,1]
-        q_full = torch.zeros(bs, vocab, device=device, dtype=torch.float32)
-        q_full.scatter_(
-            -1,
-            candidate_ids[rows, sel_pos],
-            q_rows[rows, sel_pos].float() * has_draft,
-        )
-        residual = (p_row - q_full).clamp_min(0.0)
-        residual_sum = residual.sum(dim=-1, keepdim=True)
-        # Degenerate guard: if residual mass vanished, fall back to the target dist.
-        residual = torch.where(residual_sum > 0, residual / residual_sum, p_row)
-        bonus = torch.multinomial(residual, num_samples=1).squeeze(-1)
-        return accept_len.to(torch.int32), bonus.to(torch.int64)
+        return correct_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1912,6 +1871,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sample=self._selector_sample,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
