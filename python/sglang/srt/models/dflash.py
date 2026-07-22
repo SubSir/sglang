@@ -615,12 +615,12 @@ class CandidateSelector(nn.Module):
         self._scan_a: Optional[torch.Tensor] = None
         self._scan_b: Optional[torch.Tensor] = None
 
+    @torch.no_grad()
     def build_projected_token_table(self, embedding_weight: torch.Tensor) -> None:
         """Fold token_projection(rms_norm(embed[token])) into a [vocab, r] table so
         build_lattice just gathers instead of embed+rms_norm+projection. Exact."""
-        with torch.no_grad():
-            normed = F.rms_norm(embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps)
-            self.projected_token_table = self.token_projection(normed).contiguous()
+        normed = F.rms_norm(embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps)
+        self.projected_token_table = self.token_projection(normed).contiguous()
 
     def alloc_decode_buffers(self, max_bs: int, num_pred: int, device) -> None:
         """Ensure the prefix-scan ping-pong buffers hold >= max_bs rows / num_pred-1 edges.
