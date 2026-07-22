@@ -147,6 +147,18 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _selector_lattice(draft_model, selector, pred_hidden, embed_weight):
+    """compute_base_logits -> build_lattice for the draft's prediction hidden states.
+    Shared by the folded (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
+    bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
+    base_logits = draft_model.compute_base_logits(
+        pred_hidden.reshape(-1, pred_hidden.shape[-1])
+    ).view(bs, num_pred, -1)
+    return selector.build_lattice(
+        base_logits=base_logits, hidden_states=pred_hidden, embedding_weight=embed_weight
+    )
+
+
 class _SelectorDraftSampler:
     """Capture-safe greedy selector decode, folded into the draft cuda graph.
 
@@ -176,14 +188,8 @@ class _SelectorDraftSampler:
     def __call__(self, hidden_states, input_ids=None):
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, :-1, :]  # pos 0 = anchor
-        num_pred = hs.shape[1]
-        base_logits = self.draft_model.compute_base_logits(
-            hs.reshape(-1, hs.shape[-1])
-        ).view(bs, num_pred, -1)
-        candidate_ids, unary_logits, transition_scores = self.selector.build_lattice(
-            base_logits=base_logits,
-            hidden_states=hs,
-            embedding_weight=self.embed_weight,
+        candidate_ids, unary_logits, transition_scores = _selector_lattice(
+            self.draft_model, self.selector, hs, self.embed_weight
         )
         tokens = self.selector.decode_local(
             candidate_ids=candidate_ids, transition_scores=transition_scores
@@ -899,13 +905,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"--speculative-num-draft-tokens {selector.block_size + 1}."
             )
 
-        base_logits = draft_model.compute_base_logits(
-            pred_hidden.reshape(-1, pred_hidden.shape[-1])
-        ).view(bs, num_pred, -1)
-        candidate_ids, unary_logits, transition_scores = selector.build_lattice(
-            base_logits=base_logits,
-            hidden_states=pred_hidden,
-            embedding_weight=embed_module.weight,
+        candidate_ids, unary_logits, transition_scores = _selector_lattice(
+            draft_model, selector, pred_hidden, embed_module.weight
         )
         if sampling_info is not None and not sampling_info.is_all_greedy:
             # Non-greedy ancestral sampling; one iid uniform per block slot.
