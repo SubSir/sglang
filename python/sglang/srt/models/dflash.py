@@ -678,9 +678,10 @@ class CandidateSelector(nn.Module):
         ) / math.sqrt(self.state_rank)
         return candidate_ids, unary_logits, unary_logits[:, 1:].unsqueeze(2) + corrections
 
-    def _inclusive_candidate_function_scan(self, maps: torch.Tensor) -> torch.Tensor:
-        """Compose the per-edge K->K maps with a log-depth (Hillis-Steele) scan,
-        ping-ponging two static buffers via gather(out=) so nothing allocates in-graph."""
+    def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
+        # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
+        # scan, ping-ponging two static buffers via gather(out=) so nothing allocates
+        # in-graph; then read the path indices starting from initial_indices.
         bs, edges = int(maps.shape[0]), int(maps.shape[1])
         buf = self._scan_a
         if buf is None or buf.shape[0] < bs or buf.shape[1] < edges:
@@ -693,10 +694,7 @@ class CandidateSelector(nn.Module):
             torch.gather(src[:, offset:], -1, src[:, :-offset], out=dst[:, offset:])
             src, dst = dst, src
             offset *= 2
-        return src
-
-    def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
-        prefix_maps = self._inclusive_candidate_function_scan(maps)
+        prefix_maps = src
         suffix_indices = prefix_maps.gather(
             -1, initial_indices.view(-1, 1, 1).expand(-1, maps.shape[1], -1)
         )[:, :, 0]
