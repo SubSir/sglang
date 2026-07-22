@@ -179,9 +179,7 @@ class _SelectorDraftSampler:
         max_tokens = int(max_bs) * (self.block_size - 1)
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
-        # Prepared before cuda-graph capture so the decode never allocates or recomputes
-        # in-graph: prefix-scan ping-pong buffers, and a [vocab, r] table folding
-        # token_projection(rms_norm(embed)) so build_lattice just gathers.
+        # Prepared before capture so the in-graph decode neither allocates nor recomputes.
         selector.alloc_decode_buffers(int(max_bs), self.block_size - 1, device)
         selector.build_projected_token_table(embed_weight)
 
@@ -874,14 +872,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> torch.Tensor:
         """Decode the draft block with the candidate selector.
 
-        The DFLASH block is [bonus, mask*(block_size-1)]; the selector consumes the
-        block_size-1 prediction slots (draft hidden [:, :-1, :], pos0 = anchor) and
-        returns that many draft tokens, matching the block layout of `draft_next`.
-
-        Greedy (all-greedy sampling_info): decode_local.
-        Non-greedy: lossless ancestral sampling at the request temperature;
-        stashes (candidate_ids,
-        q_rows) on self._selector_sample for the verify-side rejection.
+        The selector consumes the block_size-1 prediction slots (draft hidden
+        [:, :-1, :], pos0 = anchor) and returns that many draft tokens. Greedy rows use
+        decode_local; non-greedy rows use lossless ancestral sampling at the request
+        temperature, stashing (candidate_ids, q_rows) on self._selector_sample for the
+        verify-side rejection.
         """
         self._selector_sample = None
         draft_model = self.draft_model
@@ -914,9 +909,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs, num_pred, device=pred_hidden.device, dtype=torch.float32
             )
             # Per-request temperature (clamped like DSpark so greedy rows don't div-by-0).
-            temperatures = sampling_info.temperatures.view(-1).to(
-                torch.float32
-            ).clamp_min(1e-5)
+            temperatures = sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
             tokens, q_rows = selector.sample_path(
                 candidate_ids=candidate_ids,
                 unary_logits=unary_logits,
@@ -943,14 +936,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lossless non-greedy verify for the selector.
-
-        Reuses the shared chain rejection-sampling path (same one DSpark uses): the
-        selector's K-candidate proposal q is scattered into a target-vocab
-        `draft_probs`, and `accept_sampling` runs the official triton kernel with
-        threshold_single/acc pinned to 1.0 (pure rejection sampling). target_probs is
-        built there from the request's temperature / top-k / top-p.
-        """
+        """Lossless non-greedy verify: scatter the selector's sparse K-candidate q into
+        a target-vocab draft_probs, then reuse DSpark's shared rejection-sampling kernel
+        (which builds target_probs from the request's temperature / top-k / top-p)."""
         from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
             accept_sampling,
         )
@@ -960,7 +948,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         vocab = int(next_token_logits.shape[-1])
         candidate_ids = sample["candidate_ids"]  # [bs, gamma, K]
         q_rows = sample["q_rows"]  # [bs, gamma, K]
-        # q lives on K candidates; the kernel wants a target-vocab distribution.
         draft_probs = torch.zeros(
             (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
         )

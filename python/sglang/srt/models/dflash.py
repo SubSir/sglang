@@ -623,11 +623,10 @@ class CandidateSelector(nn.Module):
         self.projected_token_table = self.token_projection(normed).contiguous()
 
     def alloc_decode_buffers(self, max_bs: int, num_pred: int, device) -> None:
-        """Ensure the prefix-scan ping-pong buffers hold >= max_bs rows / num_pred-1 edges.
-
-        No-op when already large enough; otherwise (re)allocates with cap-doubling, like
-        the dflash worker's _ensure_* buffers. Pre-called before cuda-graph capture so the
-        scan never allocates in-graph; the scan also calls it as a lazy/grow fallback."""
+        """Grow the prefix-scan ping-pong buffers to hold >= max_bs rows / num_pred-1
+        edges (no-op if already large enough; cap-doubling like the dflash worker's
+        _ensure_* buffers). Pre-called before capture so the scan never allocates
+        in-graph; the scan also calls it as a lazy/grow fallback."""
         edges = max(int(num_pred) - 1, 1)
         cur = self._scan_a
         if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
@@ -727,9 +726,8 @@ class CandidateSelector(nn.Module):
         temperatures: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Ancestral sample one path (inverse-CDF, one uniform per block position),
-        each softmax scaled by the per-request temperature so q matches the target
-        (a matched q keeps the rejection-sampling accept rate high). Returns
-        (tokens, q_rows); q_rows is the exact per-position categorical over the K
+        each softmax scaled by the per-request temperature so q matches the target.
+        Returns (tokens, q_rows); q_rows is the per-position categorical over the K
         candidates along the path, consumed by the rejection-sampling verify."""
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
