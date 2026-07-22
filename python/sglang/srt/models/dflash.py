@@ -717,7 +717,6 @@ class CandidateSelector(nn.Module):
         path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
         return candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
 
-    @torch.no_grad()
     def sample_path(
         self,
         *,
