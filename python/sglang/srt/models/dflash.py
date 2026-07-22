@@ -785,15 +785,12 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
 
-    def attach_shared_modules(self, *, lm_head: nn.Module) -> None:
-        self.lm_head = lm_head
-
     def compute_base_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Full (org-vocab-cropped) base logits from draft hidden via target lm_head."""
         if self.lm_head is None:
             raise ValueError(
-                "DFlash selector requires the target lm_head "
-                "(call attach_shared_modules first)."
+                "DFlash selector requires the target lm_head to be set on the draft "
+                "model before capture (draft_model.lm_head = target lm_head)."
             )
         weight = self.lm_head.weight
         if hidden.dtype != weight.dtype:

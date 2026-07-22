@@ -421,7 +421,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # needs the target lm_head attached before capture.
             if not torch.is_floating_point(lm_head.weight):
                 return _eager("selector: quantized lm_head")
-            self.draft_model.attach_shared_modules(lm_head=lm_head)
+            self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH selector greedy decode folded into the draft cuda graph."
@@ -886,7 +886,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_model = self.draft_model
         selector = draft_model.candidate_selector
         if draft_model.lm_head is None:
-            draft_model.attach_shared_modules(lm_head=lm_head)
+            draft_model.lm_head = lm_head
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
