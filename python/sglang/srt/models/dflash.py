@@ -623,10 +623,19 @@ class CandidateSelector(nn.Module):
             self.projected_token_table = self.token_projection(normed).contiguous()
 
     def alloc_decode_buffers(self, max_bs: int, num_pred: int, device) -> None:
-        """Prefix-scan ping-pong buffers, so the scan never allocates in the graph."""
+        """Ensure the prefix-scan ping-pong buffers hold >= max_bs rows / num_pred-1 edges.
+
+        No-op when already large enough; otherwise (re)allocates with cap-doubling, like
+        the dflash worker's _ensure_* buffers. Pre-called before cuda-graph capture so the
+        scan never allocates in-graph; the scan also calls it as a lazy/grow fallback."""
         edges = max(int(num_pred) - 1, 1)
+        cur = self._scan_a
+        if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
+            return
+        bs_cap = max(int(max_bs), cur.shape[0] * 2 if cur is not None else 0)
+        edge_cap = max(edges, cur.shape[1] if cur is not None else 0)
         self._scan_a = torch.empty(
-            (int(max_bs), edges, self.top_k), dtype=torch.long, device=device
+            (bs_cap, edge_cap, self.top_k), dtype=torch.long, device=device
         )
         self._scan_b = torch.empty_like(self._scan_a)
 
@@ -682,9 +691,7 @@ class CandidateSelector(nn.Module):
         # scan, ping-ponging two static buffers via gather(out=) so nothing allocates
         # in-graph; then read the path indices starting from initial_indices.
         bs, edges = int(maps.shape[0]), int(maps.shape[1])
-        buf = self._scan_a
-        if buf is None or buf.shape[0] < bs or buf.shape[1] < edges:
-            self.alloc_decode_buffers(bs, edges + 1, maps.device)
+        self.alloc_decode_buffers(bs, edges + 1, maps.device)  # no-op if big enough; grows otherwise
         src, dst = self._scan_a[:bs, :edges], self._scan_b[:bs, :edges]
         src.copy_(maps)
         offset = 1
