@@ -638,20 +638,6 @@ class CandidateSelector(nn.Module):
         )
         self._scan_b = torch.empty_like(self._scan_a)
 
-    def _candidate_unaries(self, base_logits) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Top-k candidate logits/ids, descending, so slot 0 == the DFlash top-1."""
-        if _flashinfer_top_k is not None:
-            # flashinfer.top_k takes 2D [batch, vocab]; base_logits is [B, L, vocab].
-            batch, length, vocab = base_logits.shape
-            values, ids = _flashinfer_top_k(
-                base_logits.reshape(batch * length, vocab),
-                self.top_k, sorted=True, deterministic=True,
-            )
-            return (values.view(batch, length, self.top_k).float(),
-                    ids.view(batch, length, self.top_k).long())
-        unary_logits, candidate_ids = torch.topk(base_logits, self.top_k, dim=-1)
-        return unary_logits.float(), candidate_ids
-
     def build_lattice(
         self,
         *,
@@ -664,7 +650,19 @@ class CandidateSelector(nn.Module):
         + <state_query(silu(cand_factor[e,p] + hidden_factor[e+1])), cand_factor[e+1,c]>
         / sqrt(r)."""
         eps = self.rms_norm_eps
-        unary_logits, candidate_ids = self._candidate_unaries(base_logits)
+        # Top-k candidate logits/ids, descending, so slot 0 == the DFlash top-1.
+        if _flashinfer_top_k is not None:
+            # flashinfer.top_k takes 2D [batch, vocab]; base_logits is [B, L, vocab].
+            batch, length, vocab = base_logits.shape
+            values, ids = _flashinfer_top_k(
+                base_logits.reshape(batch * length, vocab),
+                self.top_k, sorted=True, deterministic=True,
+            )
+            unary_logits = values.view(batch, length, self.top_k).float()
+            candidate_ids = ids.view(batch, length, self.top_k).long()
+        else:
+            unary_logits, candidate_ids = torch.topk(base_logits, self.top_k, dim=-1)
+            unary_logits = unary_logits.float()
         if self.projected_token_table is not None:
             candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         else:
@@ -753,33 +751,28 @@ class CandidateSelector(nn.Module):
         return tokens, q_rows
 
 
-def _parse_selector_config(config) -> dict:
-    dflash_config = getattr(config, "dflash_config", None) or {}
-    if not isinstance(dflash_config, dict):  # HF may wrap nested config dicts
-        dflash_config = dict(getattr(dflash_config, "__dict__", {}))
-    rank = int(dflash_config.get("candidate_selector_rank", 0))
-    top_k = int(dflash_config.get("candidate_selector_top_k", 0))
-    if rank <= 0 or top_k <= 0:
-        raise ValueError(
-            "DFlash selector draft requires candidate_selector_rank>0 and "
-            f"candidate_selector_top_k>0 in dflash_config; got rank={rank}, top_k={top_k}."
-        )
-    for flag in ("candidate_selector_parallel_scan", "candidate_selector_direct_edge"):
-        if not bool(dflash_config.get(flag, False)):
-            raise ValueError(f"This selector port only supports {flag}=True.")
-    return {"state_rank": rank, "top_k": top_k}
-
-
 class Qwen3DFlashSelectorModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        selector_cfg = _parse_selector_config(config)
+        dflash_config = getattr(config, "dflash_config", None) or {}
+        if not isinstance(dflash_config, dict):  # HF may wrap nested config dicts
+            dflash_config = dict(getattr(dflash_config, "__dict__", {}))
+        rank = int(dflash_config.get("candidate_selector_rank", 0))
+        top_k = int(dflash_config.get("candidate_selector_top_k", 0))
+        if rank <= 0 or top_k <= 0:
+            raise ValueError(
+                "DFlash selector draft requires candidate_selector_rank>0 and "
+                f"candidate_selector_top_k>0 in dflash_config; got rank={rank}, top_k={top_k}."
+            )
+        for flag in ("candidate_selector_parallel_scan", "candidate_selector_direct_edge"):
+            if not bool(dflash_config.get(flag, False)):
+                raise ValueError(f"This selector port only supports {flag}=True.")
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
-            state_rank=selector_cfg["state_rank"],
-            top_k=selector_cfg["top_k"],
+            state_rank=rank,
+            top_k=top_k,
             block_size=self.block_size,
             rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
         )
