@@ -588,21 +588,11 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
 
 
-# -- DFlash candidate selector (P160: direct-edge parallel-scan) ----------------
-# Backbone above + three projections turning the draft hidden states + target
-# lm_head top-K candidates into a K x K transition lattice, decoded greedily
-# (or sampled at T=1, lossless) into a block of draft tokens.
-
-def _rms_normalize(values: torch.Tensor, eps: float) -> torch.Tensor:
-    return F.rms_norm(values, (values.shape[-1],), eps=eps)
-
-
 class CandidateSelector(nn.Module):
-    """Direct-edge parallel-scan candidate selector (P160).
-
-    Three learned bias-free projections: token_projection/hidden_projection
-    (hidden_size -> state_rank) and state_query (state_rank -> state_rank).
-    """
+    """Direct-edge parallel-scan candidate selector (P160): three bias-free
+    projections (token/hidden -> state_rank, state_query state_rank -> state_rank)
+    turning draft hidden states + target lm_head top-K candidates into a K x K
+    transition lattice."""
 
     def __init__(
         self,
@@ -618,7 +608,6 @@ class CandidateSelector(nn.Module):
         self.top_k = int(top_k)
         self.block_size = int(block_size)
         self.rms_norm_eps = float(rms_norm_eps)
-
         self.token_projection = nn.Linear(hidden_size, state_rank, bias=False)
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
         self.state_query = nn.Linear(state_rank, state_rank, bias=False)
@@ -628,11 +617,10 @@ class CandidateSelector(nn.Module):
         self._scan_b: Optional[torch.Tensor] = None
 
     def build_projected_token_table(self, embedding_weight: torch.Tensor) -> None:
-        """Fold token_projection(rms_norm(embed[token])) into a [vocab, r] table:
-        candidate_factors depends only on the token id, so build_lattice just gathers
-        instead of running embed+rms_norm+projection online. Exact."""
+        """Fold token_projection(rms_norm(embed[token])) into a [vocab, r] table so
+        build_lattice just gathers instead of embed+rms_norm+projection. Exact."""
         with torch.no_grad():
-            normed = _rms_normalize(embedding_weight, self.rms_norm_eps)
+            normed = F.rms_norm(embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps)
             self.projected_token_table = self.token_projection(normed).contiguous()
 
     def alloc_decode_buffers(self, max_bs: int, num_pred: int, device) -> None:
@@ -650,14 +638,10 @@ class CandidateSelector(nn.Module):
             batch, length, vocab = base_logits.shape
             values, ids = _flashinfer_top_k(
                 base_logits.reshape(batch * length, vocab),
-                self.top_k,
-                sorted=True,
-                deterministic=True,
+                self.top_k, sorted=True, deterministic=True,
             )
-            return (
-                values.view(batch, length, self.top_k).float(),
-                ids.view(batch, length, self.top_k).long(),
-            )
+            return (values.view(batch, length, self.top_k).float(),
+                    ids.view(batch, length, self.top_k).long())
         unary_logits, candidate_ids = torch.topk(base_logits, self.top_k, dim=-1)
         return unary_logits.float(), candidate_ids
 
@@ -668,25 +652,21 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         embedding_weight: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """-> (candidate_ids, unary_logits, transition_scores).
-
-        candidate_ids/unary_logits are [B, L, K]; transition_scores is the local
-        K x K lattice [B, L-1, K, K]:
-            transition[b, e, p, c] = unary[b, e+1, c]
-                + <state_query(silu(cand_factor[e, p] + hidden_factor[e+1])),
-                   cand_factor[e+1, c]> / sqrt(r)
-        """
+        """-> (candidate_ids, unary_logits, transition_scores). The last is the local
+        K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
+        + <state_query(silu(cand_factor[e,p] + hidden_factor[e+1])), cand_factor[e+1,c]>
+        / sqrt(r)."""
+        eps = self.rms_norm_eps
         unary_logits, candidate_ids = self._candidate_unaries(base_logits)
         if self.projected_token_table is not None:
             candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         else:
+            embed = F.embedding(candidate_ids, embedding_weight)
             candidate_factors = self.token_projection(
-                _rms_normalize(
-                    F.embedding(candidate_ids, embedding_weight), self.rms_norm_eps
-                )
+                F.rms_norm(embed, embed.shape[-1:], eps=eps)
             )
         hidden_factors = self.hidden_projection(
-            _rms_normalize(hidden_states, self.rms_norm_eps)
+            F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=eps)
         )
         edge_inputs = F.silu(
             candidate_factors[:, :-1] + hidden_factors[:, 1:].unsqueeze(2)
@@ -699,11 +679,8 @@ class CandidateSelector(nn.Module):
         return candidate_ids, unary_logits, unary_logits[:, 1:].unsqueeze(2) + corrections
 
     def _inclusive_candidate_function_scan(self, maps: torch.Tensor) -> torch.Tensor:
-        """Compose the per-edge K->K maps with a log-depth (Hillis-Steele) scan.
-
-        Ping-pongs between two static buffers with gather(out=), so no per-round
-        clone and no allocation inside the cuda graph.
-        """
+        """Compose the per-edge K->K maps with a log-depth (Hillis-Steele) scan,
+        ping-ponging two static buffers via gather(out=) so nothing allocates in-graph."""
         bs, edges = int(maps.shape[0]), int(maps.shape[1])
         buf = self._scan_a
         if buf is None or buf.shape[0] < bs or buf.shape[1] < edges:
@@ -746,19 +723,17 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Ancestral sample one path (inverse-CDF, one uniform per block position):
-        position 0 ~ softmax(unary[:, 0]), position i ~ the predecessor-selected row,
-        both scaled by the per-request temperature so q matches the target's shape
-        (a matched q is what keeps the rejection-sampling accept rate high).
-        Returns (tokens, q_rows); q_rows is the exact per-position categorical over
-        the K candidates along the path, consumed by the rejection-sampling verify."""
+        """Ancestral sample one path (inverse-CDF, one uniform per block position),
+        each softmax scaled by the per-request temperature so q matches the target
+        (a matched q keeps the rejection-sampling accept rate high). Returns
+        (tokens, q_rows); q_rows is the exact per-position categorical over the K
+        candidates along the path, consumed by the rejection-sampling verify."""
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
         initial_probs = torch.softmax(unary_logits[:, 0].float() / temps, dim=-1)
         initial_indices = (
             uniforms[:, :1].ge(initial_probs.cumsum(dim=-1)).sum(dim=-1).clamp_max(top_k - 1)
         )
-
         transition_probs = torch.softmax(
             transition_scores.float() / temps[:, :, None, None], dim=-1
         )
@@ -770,7 +745,6 @@ class CandidateSelector(nn.Module):
         )
         path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
         tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
-
         realized_rows = transition_probs.gather(
             2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
         )[:, :, 0]
@@ -780,8 +754,7 @@ class CandidateSelector(nn.Module):
 
 def _parse_selector_config(config) -> dict:
     dflash_config = getattr(config, "dflash_config", None) or {}
-    if not isinstance(dflash_config, dict):
-        # HF may wrap nested config dicts; fall back to attribute access.
+    if not isinstance(dflash_config, dict):  # HF may wrap nested config dicts
         dflash_config = dict(getattr(dflash_config, "__dict__", {}))
     rank = int(dflash_config.get("candidate_selector_rank", 0))
     top_k = int(dflash_config.get("candidate_selector_top_k", 0))
@@ -809,7 +782,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             block_size=self.block_size,
             rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
         )
-        # The target lm_head is attached at load time (embeddings are passed per call).
+        # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
 
     def attach_shared_modules(self, *, lm_head: nn.Module) -> None:
@@ -825,8 +798,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         weight = self.lm_head.weight
         if hidden.dtype != weight.dtype:
             hidden = hidden.to(weight.dtype)
-        local_logits = torch.matmul(hidden, weight.T)
-        full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
+        full_logits = tensor_model_parallel_all_gather(torch.matmul(hidden, weight.T), dim=-1)
         return full_logits[..., : int(self.lm_head.org_vocab_size)]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -834,15 +806,9 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         for name, loaded_weight in weights:
             if name.startswith(("embed_tokens.", "lm_head.")):
                 continue
-            target = (
-                selector_weights
-                if name.startswith("candidate_selector.")
-                else backbone_weights
-            )
-            target.append((name, loaded_weight))
-
+            bucket = selector_weights if name.startswith("candidate_selector.") else backbone_weights
+            bucket.append((name, loaded_weight))
         super().load_weights(backbone_weights)
-
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in selector_weights:
             if name not in params_dict:
@@ -855,5 +821,6 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
                 weight_loader(param, loaded_weight)
             else:
                 param.data.copy_(loaded_weight)
+
 
 EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, Qwen3DFlashSelectorModel]
