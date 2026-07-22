@@ -589,10 +589,9 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
 
 class CandidateSelector(nn.Module):
-    """Direct-edge parallel-scan candidate selector (P160): three bias-free
-    projections (token/hidden -> state_rank, state_query state_rank -> state_rank)
-    turning draft hidden states + target lm_head top-K candidates into a K x K
-    transition lattice."""
+    """Direct-edge parallel-scan candidate selector: three bias-free projections
+    (token/hidden -> state_rank, state_query state_rank -> state_rank) turning draft
+    hidden states + target lm_head top-K candidates into a K x K transition lattice."""
 
     def __init__(
         self,

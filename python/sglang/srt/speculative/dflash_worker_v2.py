@@ -150,12 +150,10 @@ class _DflashDraftSampler:
 class _SelectorDraftSampler:
     """Capture-safe greedy selector decode, folded into the draft cuda graph.
 
-    Runs the P160 lattice decode (base_logits -> lattice -> K x K transition ->
-    greedy path) inside the draft graph; the block_size-1 draft tokens are written
-    to a static buffer read by the worker after replay. Greedy only — matching the
-    dflash/dspark in-graph samplers; T=1 ancestral sampling stays eager.
-
-    Consumes block positions 0..block_size-2 (pos 0 = anchor, shift-style p160),
+    Runs the lattice decode (base_logits -> K x K transition -> greedy path) inside the
+    draft graph; the block_size-1 draft tokens go to a static buffer read after replay.
+    Greedy only (matching the dflash/dspark in-graph samplers); T=1 ancestral sampling
+    stays eager. Consumes block positions 0..block_size-2 (pos 0 = anchor, shift-style),
     mirroring the eager `_propose_selector_block` slice.
     """
 
@@ -169,11 +167,9 @@ class _SelectorDraftSampler:
         max_tokens = int(max_bs) * (self.block_size - 1)
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
-        # Both prepared before cuda-graph capture so the decode neither allocates nor
-        # recomputes inside the graph:
-        #  - prefix-scan ping-pong buffers (num_pred = block_size-1)
-        #  - token_projection(rms_norm(embed)) folded into a [vocab, r] table, so
-        #    build_lattice only gathers instead of embed+rms_norm+projection.
+        # Prepared before cuda-graph capture so the decode never allocates or recomputes
+        # in-graph: prefix-scan ping-pong buffers, and a [vocab, r] table folding
+        # token_projection(rms_norm(embed)) so build_lattice just gathers.
         selector.alloc_decode_buffers(int(max_bs), self.block_size - 1, device)
         selector.build_projected_token_table(embed_weight)
 
@@ -416,9 +412,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         selector = getattr(self.draft_model, "candidate_selector", None)
         if selector is not None:
-            # Fold the greedy selector decode into the draft cuda graph (T=1 sampling
-            # stays eager, same as the dflash/dspark in-graph samplers). compute_base_logits
-            # needs the target lm_head attached before capture.
+            # Fold the greedy selector decode into the draft cuda graph (T=1 stays eager).
+            # compute_base_logits needs the target lm_head attached before capture.
             if not torch.is_floating_point(lm_head.weight):
                 return _eager("selector: quantized lm_head")
             self.draft_model.lm_head = lm_head
@@ -892,10 +887,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        # p160 is shift-style: block position 0 (the anchor/bonus) produces the FIRST
-        # prediction (its base_logits argmax == first new token), positions 1..k-1 the
-        # rest. So the selector consumes positions 0..block_size-2 ([anchor, mask*..]),
-        # NOT 1..block_size-1. Its block_size-1 outputs become draft_tokens[:, 1:].
+        # Shift-style: block position 0 (the anchor) produces the FIRST prediction
+        # (its base_logits argmax == first new token), 1..k-1 the rest, so the selector
+        # consumes positions 0..block_size-2 and its outputs become draft_tokens[:, 1:].
         pred_hidden = draft_hidden[:, :-1, :]  # [bs, block_size-1, H], pos0 = anchor
         num_pred = pred_hidden.shape[1]
         if num_pred != selector.block_size:
@@ -914,12 +908,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             embedding_weight=embed_module.weight,
         )
         if sampling_info is not None and not sampling_info.is_all_greedy:
-            # T=1 lossless ancestral sampling. One iid uniform per block slot.
+            # Non-greedy ancestral sampling; one iid uniform per block slot.
             uniforms = torch.rand(
                 bs, num_pred, device=base_logits.device, dtype=torch.float32
             )
-            # Same temperature prep as DSpark: clamp so greedy rows in a mixed batch
-            # do not divide by zero.
+            # Per-request temperature (clamped like DSpark so greedy rows don't div-by-0).
             temperatures = sampling_info.temperatures.view(-1).to(
                 torch.float32
             ).clamp_min(1e-5)
