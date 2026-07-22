@@ -795,26 +795,6 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         full_logits = tensor_model_parallel_all_gather(torch.matmul(hidden, weight.T), dim=-1)
         return full_logits[..., : int(self.lm_head.org_vocab_size)]
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        selector_weights, backbone_weights = [], []
-        for name, loaded_weight in weights:
-            if name.startswith(("embed_tokens.", "lm_head.")):
-                continue
-            bucket = selector_weights if name.startswith("candidate_selector.") else backbone_weights
-            bucket.append((name, loaded_weight))
-        super().load_weights(backbone_weights)
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in selector_weights:
-            if name not in params_dict:
-                raise ValueError(
-                    f"DFlash selector unexpected weight {name!r} not in model params."
-                )
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", None)
-            if weight_loader is not None:
-                weight_loader(param, loaded_weight)
-            else:
-                param.data.copy_(loaded_weight)
 
 
 EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, Qwen3DFlashSelectorModel]
