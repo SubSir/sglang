@@ -911,7 +911,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampling_info is not None and not sampling_info.is_all_greedy:
             # Non-greedy ancestral sampling; one iid uniform per block slot.
             uniforms = torch.rand(
-                bs, num_pred, device=base_logits.device, dtype=torch.float32
+                bs, num_pred, device=pred_hidden.device, dtype=torch.float32
             )
             # Per-request temperature (clamped like DSpark so greedy rows don't div-by-0).
             temperatures = sampling_info.temperatures.view(-1).to(
@@ -1797,33 +1797,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if getattr(self.draft_model, "candidate_selector", None) is not None:
-            all_greedy = (
-                batch.sampling_info is None or batch.sampling_info.is_all_greedy
-            )
-            if (
-                self._draft_sampler is not None
-                and draft_out.can_run_graph
-                and all_greedy
-            ):
-                # Greedy decode was folded into the draft graph; read its output.
-                self._selector_sample = None
-                draft_next = self._draft_sampler.out[
-                    : bs * (int(self.block_size) - 1)
-                ].view(bs, int(self.block_size) - 1)
-            else:
-                # T=1 sampling, or graph unavailable: eager selector decode.
-                draft_next = self._propose_selector_block(
-                    draft_logits_output=draft_logits_output,
-                    bs=bs,
-                    embed_module=embed_module,
-                    lm_head=lm_head,
-                    sampling_info=batch.sampling_info,
-                )
-        elif self._draft_sampler is not None and draft_out.can_run_graph:
+        selector = getattr(self.draft_model, "candidate_selector", None)
+        folded = self._draft_sampler is not None and draft_out.can_run_graph
+        if selector is not None:
+            self._selector_sample = None
+            # Selector T=1 must go eager to sample q for the lossless rejection verify.
+            if not (batch.sampling_info is None or batch.sampling_info.is_all_greedy):
+                folded = False
+        if folded:
+            # Greedy decode was folded into the draft graph; read its output.
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+        elif selector is not None:
+            draft_next = self._propose_selector_block(
+                draft_logits_output=draft_logits_output,
+                bs=bs,
+                embed_module=embed_module,
+                lm_head=lm_head,
+                sampling_info=batch.sampling_info,
+            )
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
