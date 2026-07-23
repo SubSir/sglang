@@ -51,6 +51,14 @@ except Exception:  # pragma: no cover - falls back to torch.topk
     _flashinfer_top_k = None
 
 
+def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Top-k over the last dim of a 2D [N, vocab] tensor, sorted descending so slot 0
+    is the top-1. flashinfer radix kernel when available, else torch.topk."""
+    if _flashinfer_top_k is not None:
+        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    return torch.topk(scores, k, dim=-1)
+
+
 def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
@@ -648,28 +656,18 @@ class CandidateSelector(nn.Module):
     def build_lattice(
         self,
         *,
-        base_logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
         hidden_states: torch.Tensor,
         embedding_weight: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """-> (candidate_ids, unary_logits, transition_scores). The last is the local
-        K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
+        """candidate_ids/unary_logits are the [B, L, K] top-k from compute_candidates
+        (slot 0 == the DFlash top-1). Returns (candidate_ids, unary_logits,
+        transition_scores); the last is the local K x K lattice [B, L-1, K, K]:
+        transition[b,e,p,c] = unary[b,e+1,c]
         + <state_query(silu(cand_factor[e,p] + hidden_factor[e+1])), cand_factor[e+1,c]>
         / sqrt(r)."""
         eps = self.rms_norm_eps
-        # Top-k candidate logits/ids, descending, so slot 0 == the DFlash top-1.
-        if _flashinfer_top_k is not None:
-            # flashinfer.top_k takes 2D [batch, vocab]; base_logits is [B, L, vocab].
-            batch, length, vocab = base_logits.shape
-            values, ids = _flashinfer_top_k(
-                base_logits.reshape(batch * length, vocab),
-                self.top_k, sorted=True, deterministic=True,
-            )
-            unary_logits = values.view(batch, length, self.top_k).float()
-            candidate_ids = ids.view(batch, length, self.top_k).long()
-        else:
-            unary_logits, candidate_ids = torch.topk(base_logits, self.top_k, dim=-1)
-            unary_logits = unary_logits.float()
         if self.projected_token_table is not None:
             candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         else:
@@ -786,18 +784,39 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
 
-    def compute_base_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Full (org-vocab-cropped) base logits from draft hidden via target lm_head."""
+    def compute_candidates(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-k base candidates (ids, logits) from draft hidden via the target lm_head.
+        hidden is [N, H]; returns global candidate_ids [N, K] and unary_logits [N, K].
+
+        Under TP the lm_head is vocab-sharded: take each rank's local top-k, all-gather
+        the K logits/ids (not the full vocab), then a global top-k. Since the global
+        top-k is a subset of the per-shard top-k unions, this yields the exact same
+        candidates as gathering the full logits first -- at O(tp*K) instead of O(vocab)
+        gather bandwidth."""
         if self.lm_head is None:
             raise ValueError(
                 "DFlash selector requires the target lm_head to be set on the draft "
                 "model before capture (draft_model.lm_head = target lm_head)."
             )
+        k = self.candidate_selector.top_k
         weight = self.lm_head.weight
         if hidden.dtype != weight.dtype:
             hidden = hidden.to(weight.dtype)
-        full_logits = tensor_model_parallel_all_gather(torch.matmul(hidden, weight.T), dim=-1)
-        return full_logits[..., : int(self.lm_head.org_vocab_size)]
+        if get_tensor_model_parallel_world_size() == 1:
+            org = int(self.lm_head.org_vocab_size)
+            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
+            return ids.long(), vals.float()
+        shard = self.lm_head.shard_indices
+        num_org = int(shard.num_org_elements)
+        start = int(shard.org_vocab_start_index)
+        local_vals, local_ids = _radix_topk(torch.matmul(hidden, weight[:num_org].T), k)
+        global_ids = local_ids.long() + start
+        gathered_vals = tensor_model_parallel_all_gather(local_vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+        return torch.gather(gathered_ids, -1, sel).long(), top_vals.float()
 
 
 

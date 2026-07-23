@@ -148,14 +148,17 @@ class _DflashDraftSampler:
 
 
 def _selector_lattice(draft_model, selector, pred_hidden, embed_weight):
-    """compute_base_logits -> build_lattice for the draft's prediction hidden states.
+    """compute_candidates -> build_lattice for the draft's prediction hidden states.
     Shared by the folded (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
-    base_logits = draft_model.compute_base_logits(
+    candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
-    ).view(bs, num_pred, -1)
+    )
     return selector.build_lattice(
-        base_logits=base_logits, hidden_states=pred_hidden, embedding_weight=embed_weight
+        candidate_ids=candidate_ids.view(bs, num_pred, -1),
+        unary_logits=unary_logits.view(bs, num_pred, -1),
+        hidden_states=pred_hidden,
+        embedding_weight=embed_weight,
     )
 
 
@@ -417,7 +420,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         selector = getattr(self.draft_model, "candidate_selector", None)
         if selector is not None:
             # Fold the greedy selector decode into the draft cuda graph (T=1 stays eager).
-            # compute_base_logits needs the target lm_head attached before capture.
+            # compute_candidates needs the target lm_head attached before capture.
             if not torch.is_floating_point(lm_head.weight):
                 return _eager("selector: quantized lm_head")
             self.draft_model.lm_head = lm_head
