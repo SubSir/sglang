@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -618,7 +619,13 @@ class CandidateSelector(nn.Module):
     @torch.no_grad()
     def build_projected_token_table(self, embedding_weight: torch.Tensor) -> None:
         """Fold token_projection(rms_norm(embed[token])) into a [vocab, r] table so
-        build_lattice just gathers instead of embed+rms_norm+projection. Exact."""
+        build_lattice just gathers instead of embed+rms_norm+projection. Exact.
+
+        Under TP the target embedding is vocab-sharded, but candidate_ids are global
+        (top-k of the all-gathered base logits), so gather the shards to the full vocab
+        first -- otherwise a global id would index past the local shard."""
+        if get_tensor_model_parallel_world_size() > 1:
+            embedding_weight = tensor_model_parallel_all_gather(embedding_weight, dim=0)
         normed = F.rms_norm(embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps)
         self.projected_token_table = self.token_projection(normed).contiguous()
 

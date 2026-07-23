@@ -885,6 +885,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         selector = draft_model.candidate_selector
         if draft_model.lm_head is None:
             draft_model.lm_head = lm_head
+        # Eager-only case (no folded sampler built the table): build it once here, so
+        # build_lattice gathers from the full-vocab table instead of the local embedding
+        # shard -- the online embed fallback would index global candidate_ids out of a
+        # sharded embedding under TP.
+        if selector.projected_token_table is None:
+            selector.build_projected_token_table(embed_module.weight)
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
