@@ -311,6 +311,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
+        # T>0 selector verify: persistent zero-between-calls draft_probs buffer.
+        self._selector_draft_probs_buf: Optional[torch.Tensor] = None
         self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
@@ -948,9 +950,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         vocab = int(next_token_logits.shape[-1])
         candidate_ids = sample["candidate_ids"]  # [bs, gamma, K]
         q_rows = sample["q_rows"]  # [bs, gamma, K]
-        draft_probs = torch.zeros(
-            (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
-        )
+        # Reuse a buffer that is zero between calls: scatter the K-candidate q in, run
+        # the kernel, then reset only those K positions back to 0 -- avoids allocating
+        # and zeroing a full-vocab [bs, gamma, vocab] tensor every T>0 decode step.
+        draft_probs = self._ensure_selector_draft_probs(bs, gamma, vocab)
         draft_probs.scatter_(-1, candidate_ids, q_rows.float())
         correct_len, bonus, _ = accept_sampling(
             candidates=candidates,
@@ -962,7 +965,33 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=block,
             cutoff_verify_lens=None,
         )
+        draft_probs.scatter_(-1, candidate_ids, torch.zeros_like(candidate_ids, dtype=torch.float32))
         return correct_len.to(torch.int32), bonus.to(torch.int64)
+
+    def _ensure_selector_draft_probs(
+        self, bs: int, gamma: int, vocab: int
+    ) -> torch.Tensor:
+        """Zero-between-calls draft_probs buffer for the T>0 verify. Cap-doubling on bs
+        (gamma/vocab fixed) so buf[:bs] stays contiguous for the accept kernel; the
+        caller restores the all-zero invariant by scattering its K entries back to 0."""
+        buf = self._selector_draft_probs_buf
+        if (
+            buf is not None
+            and buf.shape[0] >= int(bs)
+            and buf.shape[1] == int(gamma)
+            and buf.shape[2] == int(vocab)
+        ):
+            return buf[: int(bs)]
+        reusable = (
+            buf is not None
+            and buf.shape[1] == int(gamma)
+            and buf.shape[2] == int(vocab)
+        )
+        cap = max(int(bs), buf.shape[0] * 2 if reusable else 0)
+        self._selector_draft_probs_buf = torch.zeros(
+            (cap, int(gamma), int(vocab)), dtype=torch.float32, device=self.device
+        )
+        return self._selector_draft_probs_buf[: int(bs)]
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
