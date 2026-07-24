@@ -653,21 +653,13 @@ class CandidateSelector(nn.Module):
         candidate_ids: torch.Tensor,
         unary_logits: torch.Tensor,
         hidden_states: torch.Tensor,
-        embedding_weight: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns them plus
         the K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
         + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)."""
-        eps = self.rms_norm_eps
-        if self.projected_token_table is not None:
-            candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
-        else:
-            embed = F.embedding(candidate_ids, embedding_weight)
-            candidate_factors = self.token_projection(
-                F.rms_norm(embed, embed.shape[-1:], eps=eps)
-            )
+        candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         hidden_factors = self.hidden_projection(
-            F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=eps)
+            F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=self.rms_norm_eps)
         )
         edge_inputs = F.silu(
             candidate_factors[:, :-1] + hidden_factors[:, 1:].unsqueeze(2)
