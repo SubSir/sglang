@@ -966,6 +966,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         return correct_len.to(torch.int32), bonus.to(torch.int64)
 
+    @staticmethod
+    def _commit_lens_and_out_tokens(
+        *, candidates: torch.Tensor, accept_len: torch.Tensor, bonus: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Shared eager accept tail (the Triton path writes these in-kernel instead):
+        commit_lens = accept_len + 1, and out_tokens = the drafted continuation with
+        the bonus token written at the accept boundary."""
+        bs, block = candidates.shape
+        out_tokens = torch.empty(
+            (bs, block), dtype=torch.int64, device=candidates.device
+        )
+        out_tokens[:, : block - 1].copy_(candidates[:, 1:])
+        out_tokens[:, block - 1].fill_(0)
+        out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+        return accept_len.to(torch.int32) + 1, out_tokens
+
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
@@ -1887,14 +1903,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            commit_lens, out_tokens = self._commit_lens_and_out_tokens(
+                candidates=candidates, accept_len=accept_len, bonus=bonus
             )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -1905,14 +1916,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            commit_lens, out_tokens = self._commit_lens_and_out_tokens(
+                candidates=candidates, accept_len=accept_len, bonus=bonus
             )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
@@ -1946,34 +1952,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         candidates=candidates,
                         target_predict=target_predict,
                     )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    commit_lens, out_tokens = self._commit_lens_and_out_tokens(
+                        candidates=candidates, accept_len=accept_len, bonus=bonus
                     )
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
-                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                out_tokens = torch.empty(
-                    (bs, int(self.block_size)), dtype=torch.int64, device=device
-                )
-                if int(self.block_size) > 1:
-                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-                out_tokens[:, int(self.block_size) - 1].fill_(0)
-                out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                commit_lens, out_tokens = self._commit_lens_and_out_tokens(
+                    candidates=candidates, accept_len=accept_len, bonus=bonus
                 )
 
         if self._need_mamba_verify_commit:
