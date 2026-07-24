@@ -683,8 +683,8 @@ class CandidateSelector(nn.Module):
         )
         corrections = torch.einsum(
             "blpr,blcr->blpc",
-            self.state_query(edge_inputs).float(),
-            candidate_factors[:, 1:].float(),
+            self.state_query(edge_inputs),
+            candidate_factors[:, 1:],
         ) / math.sqrt(self.state_rank)
         return candidate_ids, unary_logits, unary_logits[:, 1:].unsqueeze(2) + corrections
 
