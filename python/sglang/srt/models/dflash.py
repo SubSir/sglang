@@ -596,7 +596,6 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
-
 class CandidateSelector(nn.Module):
     """Direct-edge parallel-scan candidate selector: three bias-free projections turn
     draft hidden + target-lm-head top-K candidates into a K x K transition lattice."""
@@ -627,16 +626,20 @@ class CandidateSelector(nn.Module):
     def build_projected_token_table(self, embedding_weight: torch.Tensor) -> None:
         """Fold token_projection(rms_norm(embed)) into a [vocab, r] table so build_lattice
         just gathers. Under TP the embedding is vocab-sharded but candidate_ids are global,
-        so gather to the full vocab first (else a global id indexes past the local shard)."""
+        so gather to the full vocab first (else a global id indexes past the local shard).
+        """
         if get_tensor_model_parallel_world_size() > 1:
             embedding_weight = tensor_model_parallel_all_gather(embedding_weight, dim=0)
-        normed = F.rms_norm(embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps)
+        normed = F.rms_norm(
+            embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps
+        )
         self.projected_token_table = self.token_projection(normed).contiguous()
 
-    def alloc_decode_buffers(self, max_bs: int, num_pred: int, device) -> None:
+    def alloc_decode_buffers(self, max_bs: int, num_edges: int, device) -> None:
         """Grow the prefix-scan ping-pong buffers (cap-doubling, no-op if big enough) so
-        the scan never allocates in-graph. Pre-called before capture; also a lazy grow."""
-        edges = max(int(num_pred) - 1, 1)
+        the scan never allocates in-graph. Pre-called before capture; also a lazy grow.
+        """
+        edges = max(int(num_edges), 1)
         cur = self._scan_a
         if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
             return
@@ -653,9 +656,9 @@ class CandidateSelector(nn.Module):
         candidate_ids: torch.Tensor,
         unary_logits: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns them plus
-        the K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
+    ) -> torch.Tensor:
+        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns the
+        K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
         + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)."""
         candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         hidden_factors = self.hidden_projection(
@@ -669,13 +672,13 @@ class CandidateSelector(nn.Module):
             self.state_query(edge_inputs),
             candidate_factors[:, 1:],
         ) / math.sqrt(self.state_rank)
-        return candidate_ids, unary_logits, unary_logits[:, 1:].unsqueeze(2) + corrections
+        return unary_logits[:, 1:].unsqueeze(2) + corrections
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
         # scan over two static ping-pong buffers, then read the path from initial_indices.
         bs, edges = int(maps.shape[0]), int(maps.shape[1])
-        self.alloc_decode_buffers(bs, edges + 1, maps.device)  # no-op if big enough; grows otherwise
+        self.alloc_decode_buffers(bs, edges, maps.device)  # no-op if big enough
         src, dst = self._scan_a[:bs, :edges], self._scan_b[:bs, :edges]
         src.copy_(maps)
         offset = 1
@@ -717,7 +720,10 @@ class CandidateSelector(nn.Module):
         temps = temperatures.view(-1, 1)
         initial_probs = torch.softmax(unary_logits[:, 0].float() / temps, dim=-1)
         initial_indices = (
-            uniforms[:, :1].ge(initial_probs.cumsum(dim=-1)).sum(dim=-1).clamp_max(top_k - 1)
+            uniforms[:, :1]
+            .ge(initial_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
         )
         transition_probs = torch.softmax(
             transition_scores.float() / temps[:, :, None, None], dim=-1
@@ -752,7 +758,10 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
                 "DFlash selector draft requires candidate_selector_rank>0 and "
                 f"candidate_selector_top_k>0 in dflash_config; got rank={rank}, top_k={top_k}."
             )
-        for flag in ("candidate_selector_parallel_scan", "candidate_selector_direct_edge"):
+        for flag in (
+            "candidate_selector_parallel_scan",
+            "candidate_selector_direct_edge",
+        ):
             if not bool(dflash_config.get(flag, False)):
                 raise ValueError(f"This selector port only supports {flag}=True.")
         self.candidate_selector = CandidateSelector(
@@ -779,22 +788,20 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             )
         k = self.candidate_selector.top_k
         weight = self.lm_head.weight
-        if hidden.dtype != weight.dtype:
-            hidden = hidden.to(weight.dtype)
+        hidden = hidden.to(weight.dtype)
         if get_tensor_model_parallel_world_size() == 1:
             org = int(self.lm_head.org_vocab_size)
             vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
             return ids.long(), vals.float()
         shard = self.lm_head.shard_indices
-        num_org = int(shard.num_org_elements)
-        start = int(shard.org_vocab_start_index)
-        local_vals, local_ids = _radix_topk(torch.matmul(hidden, weight[:num_org].T), k)
-        global_ids = local_ids.long() + start
-        gathered_vals = tensor_model_parallel_all_gather(local_vals.float(), dim=-1)
+        vals, ids = _radix_topk(
+            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
+        )
+        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
         gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
         top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
         return torch.gather(gathered_ids, -1, sel).long(), top_vals.float()
-
 
 
 EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, Qwen3DFlashSelectorModel]

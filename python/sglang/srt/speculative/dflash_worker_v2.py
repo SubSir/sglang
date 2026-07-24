@@ -147,18 +147,27 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
-def _selector_lattice(draft_model, selector, pred_hidden):
+def _is_all_greedy(sampling_info) -> bool:
+    """No sampling_info means greedy (the selector's T=0 fast path)."""
+    return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _selector_lattice(draft_model, pred_hidden):
     """compute_candidates -> build_lattice for the draft's prediction hidden states.
-    Shared by the folded (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
+    Returns (candidate_ids, unary_logits, transition_scores). Shared by the folded
+    (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
     )
-    return selector.build_lattice(
-        candidate_ids=candidate_ids.view(bs, num_pred, -1),
-        unary_logits=unary_logits.view(bs, num_pred, -1),
+    candidate_ids = candidate_ids.view(bs, num_pred, -1)
+    unary_logits = unary_logits.view(bs, num_pred, -1)
+    transition_scores = draft_model.candidate_selector.build_lattice(
+        candidate_ids=candidate_ids,
+        unary_logits=unary_logits,
         hidden_states=pred_hidden,
     )
+    return candidate_ids, unary_logits, transition_scores
 
 
 class _SelectorDraftSampler:
@@ -177,15 +186,13 @@ class _SelectorDraftSampler:
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         # Prepared before capture so the in-graph decode neither allocates nor recomputes.
-        selector.alloc_decode_buffers(int(max_bs), self.block_size - 1, device)
+        selector.alloc_decode_buffers(int(max_bs), self.block_size - 2, device)
         selector.build_projected_token_table(embed_weight)
 
     def __call__(self, hidden_states, input_ids=None):
         bs = hidden_states.shape[0] // self.block_size
         hs = hidden_states.view(bs, self.block_size, -1)[:, :-1, :]  # pos 0 = anchor
-        candidate_ids, unary_logits, transition_scores = _selector_lattice(
-            self.draft_model, self.selector, hs
-        )
+        candidate_ids, _, transition_scores = _selector_lattice(self.draft_model, hs)
         tokens = self.selector.decode_local(
             candidate_ids=candidate_ids, transition_scores=transition_scores
         )
@@ -294,6 +301,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        # Selector T>0 proposal (candidate_ids, q_rows); None on greedy / non-selector.
+        self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
@@ -897,9 +906,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         candidate_ids, unary_logits, transition_scores = _selector_lattice(
-            draft_model, selector, pred_hidden
+            draft_model, pred_hidden
         )
-        if sampling_info is not None and not sampling_info.is_all_greedy:
+        if not _is_all_greedy(sampling_info):
             # Non-greedy ancestral sampling; one iid uniform per block slot.
             uniforms = torch.rand(
                 bs, num_pred, device=pred_hidden.device, dtype=torch.float32
@@ -913,10 +922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 uniforms=uniforms,
                 temperatures=temperatures,
             )
-            self._selector_sample = {
-                "candidate_ids": candidate_ids,
-                "q_rows": q_rows,
-            }
+            self._selector_sample = (candidate_ids, q_rows)
             return tokens.view(bs, num_pred)
         tokens = selector.decode_local(
             candidate_ids=candidate_ids, transition_scores=transition_scores
@@ -928,13 +934,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         candidates: torch.Tensor,
         next_token_logits: torch.Tensor,
-        sample: dict,
+        candidate_ids: torch.Tensor,
+        q_rows: torch.Tensor,
         sampling_info,
         draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lossless non-greedy verify: scatter the selector's sparse K-candidate q into
-        a target-vocab draft_probs, then reuse DSpark's shared rejection-sampling kernel
-        (which builds target_probs from the request's temperature / top-k / top-p)."""
+        """Lossless non-greedy verify: scatter the selector's sparse K-candidate q
+        ([bs, gamma, K] ids/probs) into a target-vocab draft_probs, then reuse DSpark's
+        shared rejection-sampling kernel (which builds target_probs from the request's
+        temperature / top-k / top-p)."""
         from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
             accept_sampling,
         )
@@ -942,8 +950,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
-        candidate_ids = sample["candidate_ids"]  # [bs, gamma, K]
-        q_rows = sample["q_rows"]  # [bs, gamma, K]
         draft_probs = torch.zeros(
             (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
         )
@@ -1785,7 +1791,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if selector is not None:
             self._selector_sample = None
             # Selector T=1 must go eager to sample q for the lossless rejection verify.
-            if not (batch.sampling_info is None or batch.sampling_info.is_all_greedy):
+            if not _is_all_greedy(batch.sampling_info):
                 folded = False
         if folded:
             # Greedy decode was folded into the draft graph; read its output.
@@ -1870,12 +1876,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        if getattr(self, "_selector_sample", None) is not None:
+        if self._selector_sample is not None:
             # Selector T=1: lossless min(1, p/q) prefix accept + residual (p-q)+ bonus.
+            selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
-                sample=self._selector_sample,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
@@ -1888,9 +1896,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         elif (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
+            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
