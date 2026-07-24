@@ -598,9 +598,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
 
 class CandidateSelector(nn.Module):
-    """Direct-edge parallel-scan candidate selector: three bias-free projections
-    (token/hidden -> state_rank, state_query state_rank -> state_rank) turning draft
-    hidden states + target lm_head top-K candidates into a K x K transition lattice."""
+    """Direct-edge parallel-scan candidate selector: three bias-free projections turn
+    draft hidden + target-lm-head top-K candidates into a K x K transition lattice."""
 
     def __init__(
         self,
@@ -626,22 +625,17 @@ class CandidateSelector(nn.Module):
 
     @torch.no_grad()
     def build_projected_token_table(self, embedding_weight: torch.Tensor) -> None:
-        """Fold token_projection(rms_norm(embed[token])) into a [vocab, r] table so
-        build_lattice just gathers instead of embed+rms_norm+projection. Exact.
-
-        Under TP the target embedding is vocab-sharded, but candidate_ids are global
-        (top-k of the all-gathered base logits), so gather the shards to the full vocab
-        first -- otherwise a global id would index past the local shard."""
+        """Fold token_projection(rms_norm(embed)) into a [vocab, r] table so build_lattice
+        just gathers. Under TP the embedding is vocab-sharded but candidate_ids are global,
+        so gather to the full vocab first (else a global id indexes past the local shard)."""
         if get_tensor_model_parallel_world_size() > 1:
             embedding_weight = tensor_model_parallel_all_gather(embedding_weight, dim=0)
         normed = F.rms_norm(embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps)
         self.projected_token_table = self.token_projection(normed).contiguous()
 
     def alloc_decode_buffers(self, max_bs: int, num_pred: int, device) -> None:
-        """Grow the prefix-scan ping-pong buffers to hold >= max_bs rows / num_pred-1
-        edges (no-op if already large enough; cap-doubling like the dflash worker's
-        _ensure_* buffers). Pre-called before capture so the scan never allocates
-        in-graph; the scan also calls it as a lazy/grow fallback."""
+        """Grow the prefix-scan ping-pong buffers (cap-doubling, no-op if big enough) so
+        the scan never allocates in-graph. Pre-called before capture; also a lazy grow."""
         edges = max(int(num_pred) - 1, 1)
         cur = self._scan_a
         if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
@@ -661,12 +655,9 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         embedding_weight: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """candidate_ids/unary_logits are the [B, L, K] top-k from compute_candidates
-        (slot 0 == the DFlash top-1). Returns (candidate_ids, unary_logits,
-        transition_scores); the last is the local K x K lattice [B, L-1, K, K]:
-        transition[b,e,p,c] = unary[b,e+1,c]
-        + <state_query(silu(cand_factor[e,p] + hidden_factor[e+1])), cand_factor[e+1,c]>
-        / sqrt(r)."""
+        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns them plus
+        the K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
+        + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)."""
         eps = self.rms_norm_eps
         if self.projected_token_table is not None:
             candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
@@ -690,8 +681,7 @@ class CandidateSelector(nn.Module):
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
-        # scan, ping-ponging two static buffers via gather(out=) so nothing allocates
-        # in-graph; then read the path indices starting from initial_indices.
+        # scan over two static ping-pong buffers, then read the path from initial_indices.
         bs, edges = int(maps.shape[0]), int(maps.shape[1])
         self.alloc_decode_buffers(bs, edges + 1, maps.device)  # no-op if big enough; grows otherwise
         src, dst = self._scan_a[:bs, :edges], self._scan_b[:bs, :edges]
@@ -728,10 +718,9 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Ancestral sample one path (inverse-CDF, one uniform per block position),
-        each softmax scaled by the per-request temperature so q matches the target.
-        Returns (tokens, q_rows); q_rows is the per-position categorical over the K
-        candidates along the path, consumed by the rejection-sampling verify."""
+        """Ancestral sample one path (inverse-CDF, one uniform per position; softmax scaled
+        by the per-request temperature so q matches the target). Returns (tokens, q_rows),
+        q_rows the per-position categorical over the K candidates for the verify."""
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
         initial_probs = torch.softmax(unary_logits[:, 0].float() / temps, dim=-1)
@@ -787,14 +776,10 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
     def compute_candidates(
         self, hidden: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Top-k base candidates (ids, logits) from draft hidden via the target lm_head.
-        hidden is [N, H]; returns global candidate_ids [N, K] and unary_logits [N, K].
-
-        Under TP the lm_head is vocab-sharded: take each rank's local top-k, all-gather
-        the K logits/ids (not the full vocab), then a global top-k. Since the global
-        top-k is a subset of the per-shard top-k unions, this yields the exact same
-        candidates as gathering the full logits first -- at O(tp*K) instead of O(vocab)
-        gather bandwidth."""
+        """Top-k base candidates via the target lm_head: hidden [N, H] -> global
+        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
+        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
+        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
         if self.lm_head is None:
             raise ValueError(
                 "DFlash selector requires the target lm_head to be set on the draft "

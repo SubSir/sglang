@@ -163,13 +163,9 @@ def _selector_lattice(draft_model, selector, pred_hidden, embed_weight):
 
 
 class _SelectorDraftSampler:
-    """Capture-safe greedy selector decode, folded into the draft cuda graph.
-
-    Runs the lattice decode (base_logits -> K x K transition -> greedy path) inside the
-    draft graph; the block_size-1 draft tokens go to a static buffer read after replay.
-    Greedy only (matching the dflash/dspark in-graph samplers); T=1 ancestral sampling
-    stays eager. Consumes block positions 0..block_size-2 (pos 0 = anchor, shift-style),
-    mirroring the eager `_propose_selector_block` slice.
+    """Greedy selector decode folded into the draft cuda graph: the block_size-1 draft
+    tokens go to a static buffer read after replay. Greedy only (like the dflash/dspark
+    in-graph samplers); T>0 sampling stays eager in `_propose_selector_block`.
     """
 
     def __init__(
@@ -873,23 +869,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         sampling_info=None,
     ) -> torch.Tensor:
-        """Decode the draft block with the candidate selector.
-
-        The selector consumes the block_size-1 prediction slots (draft hidden
-        [:, :-1, :], pos0 = anchor) and returns that many draft tokens. Greedy rows use
-        decode_local; non-greedy rows use lossless ancestral sampling at the request
-        temperature, stashing (candidate_ids, q_rows) on self._selector_sample for the
-        verify-side rejection.
+        """Decode the block_size-1 prediction slots (draft hidden [:, :-1, :], pos0 =
+        anchor) into draft tokens. Greedy rows use decode_local; non-greedy rows use
+        lossless ancestral sampling, stashing (candidate_ids, q_rows) on
+        self._selector_sample for the verify-side rejection.
         """
         self._selector_sample = None
         draft_model = self.draft_model
         selector = draft_model.candidate_selector
         if draft_model.lm_head is None:
             draft_model.lm_head = lm_head
-        # Eager-only case (no folded sampler built the table): build it once here, so
-        # build_lattice gathers from the full-vocab table instead of the local embedding
-        # shard -- the online embed fallback would index global candidate_ids out of a
-        # sharded embedding under TP.
+        # Eager-only case (folded sampler never built the table): build it once, so
+        # build_lattice gathers from the full-vocab table, not the local embedding shard.
         if selector.projected_token_table is None:
             selector.build_projected_token_table(embed_module.weight)
 
@@ -897,9 +888,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        # Shift-style: block position 0 (the anchor) produces the FIRST prediction
-        # (its base_logits argmax == first new token), 1..k-1 the rest, so the selector
-        # consumes positions 0..block_size-2 and its outputs become draft_tokens[:, 1:].
+        # Shift-style: positions 0..block_size-2 (pos 0 = anchor) predict draft_tokens[:, 1:].
         pred_hidden = draft_hidden[:, :-1, :]  # [bs, block_size-1, H], pos0 = anchor
         num_pred = pred_hidden.shape[1]
         if num_pred != selector.block_size:
