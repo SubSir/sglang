@@ -681,12 +681,12 @@ class CandidateSelector(nn.Module):
 
         The anchor edge scores the block's first slot against the verified anchor
         token with the very same weights, so it costs no parameters.
+        `hidden_states` is already the draft's final RMSNorm output and is not
+        normalized again.
         """
         candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         anchor_factors = F.embedding(anchor_token_ids, self.projected_token_table)
-        hidden_factors = self.hidden_projection(
-            F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=self.rms_norm_eps)
-        )
+        hidden_factors = self.hidden_projection(hidden_states)
         transition_scores = unary_logits[:, 1:].unsqueeze(2) + self._edge_correction(
             candidate_factors[:, :-1],
             hidden_factors[:, 1:].unsqueeze(2),
