@@ -152,22 +152,25 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
-def _selector_lattice(draft_model, pred_hidden):
+def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     """compute_candidates -> build_lattice for the draft's prediction hidden states.
-    Returns (candidate_ids, unary_logits, transition_scores). Shared by the folded
-    (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
+    Returns (candidate_ids, transition_scores, position_zero_scores). Shared by the
+    folded (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
     )
     candidate_ids = candidate_ids.view(bs, num_pred, -1)
     unary_logits = unary_logits.view(bs, num_pred, -1)
-    transition_scores = draft_model.candidate_selector.build_lattice(
-        candidate_ids=candidate_ids,
-        unary_logits=unary_logits,
-        hidden_states=pred_hidden,
+    transition_scores, position_zero_scores = (
+        draft_model.candidate_selector.build_lattice(
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden_states=pred_hidden,
+            anchor_token_ids=anchor_token_ids,
+        )
     )
-    return candidate_ids, unary_logits, transition_scores
+    return candidate_ids, transition_scores, position_zero_scores
 
 
 class _SelectorDraftSampler:
@@ -189,12 +192,17 @@ class _SelectorDraftSampler:
         selector.alloc_decode_buffers(int(max_bs), self.block_size - 2, device)
         selector.build_projected_token_table(embed_weight)
 
-    def __call__(self, hidden_states, input_ids=None):
+    def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
+        block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, :-1, :]  # pos 0 = anchor
-        candidate_ids, _, transition_scores = _selector_lattice(self.draft_model, hs)
+        candidate_ids, transition_scores, position_zero_scores = _selector_lattice(
+            self.draft_model, hs, block_ids[:, 0]
+        )
         tokens = self.selector.decode_local(
-            candidate_ids=candidate_ids, transition_scores=transition_scores
+            candidate_ids=candidate_ids,
+            transition_scores=transition_scores,
+            position_zero_scores=position_zero_scores,
         )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
 
@@ -874,6 +882,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         embed_module,
         lm_head,
+        anchor_token_ids: torch.Tensor,
         sampling_info=None,
     ) -> torch.Tensor:
         """Decode the block_size-1 prediction slots (draft hidden [:, :-1, :], pos0 =
@@ -905,8 +914,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"--speculative-num-draft-tokens {selector.block_size + 1}."
             )
 
-        candidate_ids, unary_logits, transition_scores = _selector_lattice(
-            draft_model, pred_hidden
+        candidate_ids, transition_scores, position_zero_scores = _selector_lattice(
+            draft_model, pred_hidden, anchor_token_ids
         )
         if not _is_all_greedy(sampling_info):
             # Non-greedy ancestral sampling; one iid uniform per block slot.
@@ -917,15 +926,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             temperatures = sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
             tokens, q_rows = selector.sample_path(
                 candidate_ids=candidate_ids,
-                unary_logits=unary_logits,
                 transition_scores=transition_scores,
+                position_zero_scores=position_zero_scores,
                 uniforms=uniforms,
                 temperatures=temperatures,
             )
             self._selector_sample = (candidate_ids, q_rows)
             return tokens.view(bs, num_pred)
         tokens = selector.decode_local(
-            candidate_ids=candidate_ids, transition_scores=transition_scores
+            candidate_ids=candidate_ids,
+            transition_scores=transition_scores,
+            position_zero_scores=position_zero_scores,
         )
         return tokens.view(bs, num_pred)
 
@@ -1820,6 +1831,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs,
                 embed_module=embed_module,
                 lm_head=lm_head,
+                anchor_token_ids=block_ids[:, 0],
                 sampling_info=batch.sampling_info,
             )
         else:

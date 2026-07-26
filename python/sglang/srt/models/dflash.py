@@ -650,29 +650,56 @@ class CandidateSelector(nn.Module):
         )
         self._scan_b = torch.empty_like(self._scan_a)
 
+    def _edge_correction(
+        self,
+        predecessor_factors: torch.Tensor,
+        hidden_factors: torch.Tensor,
+        successor_factors: torch.Tensor,
+        equation: str,
+    ) -> torch.Tensor:
+        """The one edge score, shared by the K x K lattice and the anchor edge."""
+        edge = F.silu(predecessor_factors + hidden_factors)
+        return torch.einsum(
+            equation, self.state_query(edge), successor_factors
+        ) / math.sqrt(self.state_rank)
+
     def build_lattice(
         self,
         *,
         candidate_ids: torch.Tensor,
         unary_logits: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns the
-        K x K lattice [B, L-1, K, K]: transition[b,e,p,c] = unary[b,e+1,c]
-        + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)."""
+        anchor_token_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns
+        (transition_scores, position_zero_scores):
+
+            transition[b,e,p,c] = unary[b,e+1,c]
+                + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)
+            position_zero[b,c]  = unary[b,0,c]
+                + <state_query(silu(anchor[b]  + hidden[0])), cand[0,c]>   / sqrt(r)
+
+        The anchor edge scores the block's first slot against the verified anchor
+        token with the very same weights, so it costs no parameters.
+        """
         candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
+        anchor_factors = F.embedding(anchor_token_ids, self.projected_token_table)
         hidden_factors = self.hidden_projection(
             F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=self.rms_norm_eps)
         )
-        edge_inputs = F.silu(
-            candidate_factors[:, :-1] + hidden_factors[:, 1:].unsqueeze(2)
-        )
-        corrections = torch.einsum(
-            "blpr,blcr->blpc",
-            self.state_query(edge_inputs),
+        transition_scores = unary_logits[:, 1:].unsqueeze(2) + self._edge_correction(
+            candidate_factors[:, :-1],
+            hidden_factors[:, 1:].unsqueeze(2),
             candidate_factors[:, 1:],
-        ) / math.sqrt(self.state_rank)
-        return unary_logits[:, 1:].unsqueeze(2) + corrections
+            "blpr,blcr->blpc",
+        )
+        position_zero_scores = unary_logits[:, 0] + self._edge_correction(
+            anchor_factors,
+            hidden_factors[:, 0],
+            candidate_factors[:, 0],
+            "br,bkr->bk",
+        )
+        return transition_scores, position_zero_scores
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
@@ -694,13 +721,16 @@ class CandidateSelector(nn.Module):
         return torch.cat((initial_indices.unsqueeze(1), suffix_indices), dim=1)
 
     def decode_local(
-        self, *, candidate_ids: torch.Tensor, transition_scores: torch.Tensor
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        transition_scores: torch.Tensor,
+        position_zero_scores: torch.Tensor,
     ) -> torch.Tensor:
-        """Greedy per-edge argmax + prefix-scan compose."""
+        """Greedy per-edge argmax + prefix-scan compose, walked from the slot the
+        anchor edge scores highest."""
         local_maps = transition_scores.argmax(dim=-1)
-        initial_indices = torch.zeros(
-            candidate_ids.shape[0], dtype=torch.long, device=candidate_ids.device
-        )
+        initial_indices = position_zero_scores.argmax(dim=-1)
         path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
         return candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
 
@@ -708,8 +738,8 @@ class CandidateSelector(nn.Module):
         self,
         *,
         candidate_ids: torch.Tensor,
-        unary_logits: torch.Tensor,
         transition_scores: torch.Tensor,
+        position_zero_scores: torch.Tensor,
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -718,7 +748,7 @@ class CandidateSelector(nn.Module):
         q_rows the per-position categorical over the K candidates for the verify."""
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
-        initial_probs = torch.softmax(unary_logits[:, 0].float() / temps, dim=-1)
+        initial_probs = torch.softmax(position_zero_scores.float() / temps, dim=-1)
         initial_indices = (
             uniforms[:, :1]
             .ge(initial_probs.cumsum(dim=-1))
@@ -751,19 +781,33 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         dflash_config = getattr(config, "dflash_config", None) or {}
         if not isinstance(dflash_config, dict):  # HF may wrap nested config dicts
             dflash_config = dict(getattr(dflash_config, "__dict__", {}))
-        rank = int(dflash_config.get("candidate_selector_rank", 0))
-        top_k = int(dflash_config.get("candidate_selector_top_k", 0))
+        # Newer checkpoints nest the selector under "dflashv2_selector"; older ones
+        # spell the same two numbers as flat candidate_selector_* keys.
+        selector_config = dflash_config.get("dflashv2_selector") or {}
+        if not isinstance(selector_config, dict):
+            selector_config = dict(getattr(selector_config, "__dict__", {}))
+        rank = int(
+            selector_config.get("rank")
+            or dflash_config.get("candidate_selector_rank", 0)
+        )
+        top_k = int(
+            selector_config.get("top_k")
+            or dflash_config.get("candidate_selector_top_k", 0)
+        )
         if rank <= 0 or top_k <= 0:
             raise ValueError(
-                "DFlash selector draft requires candidate_selector_rank>0 and "
-                f"candidate_selector_top_k>0 in dflash_config; got rank={rank}, top_k={top_k}."
+                "DFlash selector draft requires a selector rank>0 and top_k>0 in "
+                "dflash_config, either under dflashv2_selector or as "
+                f"candidate_selector_rank/_top_k; got rank={rank}, top_k={top_k}."
             )
-        for flag in (
-            "candidate_selector_parallel_scan",
-            "candidate_selector_direct_edge",
-        ):
-            if not bool(dflash_config.get(flag, False)):
-                raise ValueError(f"This selector port only supports {flag}=True.")
+        if not selector_config:
+            # The flat layout also carried variants this port does not implement.
+            for flag in (
+                "candidate_selector_parallel_scan",
+                "candidate_selector_direct_edge",
+            ):
+                if not bool(dflash_config.get(flag, False)):
+                    raise ValueError(f"This selector port only supports {flag}=True.")
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             state_rank=rank,
