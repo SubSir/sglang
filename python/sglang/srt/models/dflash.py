@@ -597,43 +597,37 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
 
 class CandidateSelector(nn.Module):
-    """Direct-edge parallel-scan candidate selector: three bias-free projections turn
-    draft hidden + target-lm-head top-K candidates into a K x K transition lattice."""
+    """Direct-edge parallel-scan candidate selector: two bias-free projections plus a
+    [vocab, r] token table turn draft hidden + target-lm-head top-K candidates into a
+    K x K transition lattice.
+
+    The token table ships in the checkpoint already folded: it is
+    `token_projection(rms_norm(target_embed))`, constant once both are frozen, so
+    training exports it and this side only ever gathers rows. It is replicated, not
+    vocab-sharded, because candidate_ids are global ids.
+    """
 
     def __init__(
         self,
         *,
         hidden_size: int,
+        vocab_size: int,
         state_rank: int,
         top_k: int,
         block_size: int,
-        rms_norm_eps: float,
     ) -> None:
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
-        self.rms_norm_eps = float(rms_norm_eps)
-        self.token_projection = nn.Linear(hidden_size, state_rank, bias=False)
+        self.projected_token_table = nn.Parameter(
+            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
+        )
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
         self.state_query = nn.Linear(state_rank, state_rank, bias=False)
-        # Filled before cuda-graph capture (see the two setup methods below).
-        self.projected_token_table: Optional[torch.Tensor] = None
+        # Filled before cuda-graph capture (see the setup method below).
         self._scan_a: Optional[torch.Tensor] = None
         self._scan_b: Optional[torch.Tensor] = None
-
-    @torch.no_grad()
-    def build_projected_token_table(self, embedding_weight: torch.Tensor) -> None:
-        """Fold token_projection(rms_norm(embed)) into a [vocab, r] table so build_lattice
-        just gathers. Under TP the embedding is vocab-sharded but candidate_ids are global,
-        so gather to the full vocab first (else a global id indexes past the local shard).
-        """
-        if get_tensor_model_parallel_world_size() > 1:
-            embedding_weight = tensor_model_parallel_all_gather(embedding_weight, dim=0)
-        normed = F.rms_norm(
-            embedding_weight, embedding_weight.shape[-1:], eps=self.rms_norm_eps
-        )
-        self.projected_token_table = self.token_projection(normed).contiguous()
 
     def alloc_decode_buffers(self, max_bs: int, num_edges: int, device) -> None:
         """Grow the prefix-scan ping-pong buffers (cap-doubling, no-op if big enough) so
@@ -810,10 +804,10 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
                     raise ValueError(f"This selector port only supports {flag}=True.")
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
+            vocab_size=int(config.vocab_size),
             state_rank=rank,
             top_k=top_k,
             block_size=self.block_size,
-            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
         )
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None

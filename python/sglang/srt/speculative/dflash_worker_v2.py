@@ -179,9 +179,7 @@ class _SelectorDraftSampler:
     in-graph samplers); T>0 sampling stays eager in `_propose_selector_block`.
     """
 
-    def __init__(
-        self, *, draft_model, selector, embed_weight, block_size, max_bs, device
-    ):
+    def __init__(self, *, draft_model, selector, block_size, max_bs, device):
         self.draft_model = draft_model
         self.selector = selector
         self.block_size = int(block_size)
@@ -190,7 +188,6 @@ class _SelectorDraftSampler:
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         # Prepared before capture so the in-graph decode neither allocates nor recomputes.
         selector.alloc_decode_buffers(int(max_bs), self.block_size - 2, device)
-        selector.build_projected_token_table(embed_weight)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -442,7 +439,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 selector=selector,
-                embed_weight=target_model.get_input_embeddings().weight,
                 block_size=self.block_size,
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
@@ -880,7 +876,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         draft_logits_output,
         bs: int,
-        embed_module,
         lm_head,
         anchor_token_ids: torch.Tensor,
         sampling_info=None,
@@ -895,10 +890,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         selector = draft_model.candidate_selector
         if draft_model.lm_head is None:
             draft_model.lm_head = lm_head
-        # Eager-only case (folded sampler never built the table): build it once, so
-        # build_lattice gathers from the full-vocab table, not the local embedding shard.
-        if selector.projected_token_table is None:
-            selector.build_projected_token_table(embed_module.weight)
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
@@ -1829,7 +1820,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._propose_selector_block(
                 draft_logits_output=draft_logits_output,
                 bs=bs,
-                embed_module=embed_module,
                 lm_head=lm_head,
                 anchor_token_ids=block_ids[:, 0],
                 sampling_info=batch.sampling_info,
