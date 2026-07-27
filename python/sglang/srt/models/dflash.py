@@ -640,19 +640,6 @@ class CandidateSelector(nn.Module):
         )
         self._scan_b = torch.empty_like(self._scan_a)
 
-    def _edge_correction(
-        self,
-        predecessor_factors: torch.Tensor,
-        hidden_factors: torch.Tensor,
-        successor_factors: torch.Tensor,
-        equation: str,
-    ) -> torch.Tensor:
-        """The one edge score, shared by the K x K lattice and the anchor edge."""
-        edge = F.silu(predecessor_factors + hidden_factors)
-        return torch.einsum(
-            equation, self.state_query(edge), successor_factors
-        ) / math.sqrt(self.state_rank)
-
     def build_lattice(
         self,
         *,
@@ -663,31 +650,27 @@ class CandidateSelector(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1).
 
-            transition[b,e,p,c] = unary[b,e+1,c]
-                + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)
-            position_zero[b,c]  = unary[b,0,c]
-                + <state_query(silu(anchor[b]  + hidden[0])), cand[0,c]>   / sqrt(r)
+            score[b,e,p,c] = unary[b,e,c]
+                + <state_query(silu(pred[b,e,p] + hidden[b,e])), cand[b,e,c]> / sqrt(r)
 
-        Slot 0 has a real predecessor -- the verified anchor token -- so it is scored
-        by the same edge, costing no parameters. hidden_states is the draft's final
+        pred is cand[b,e-1], except slot 0's predecessor is the verified anchor token
+        -- broadcast over p, so every slot is the same edge and slot 0 needs neither
+        its own parameters nor its own code path. hidden_states is the draft's final
         RMSNorm output and is deliberately not normalized again.
         """
-        candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
-        anchor_factors = F.embedding(anchor_token_ids, self.projected_token_table)
-        hidden_factors = self.hidden_projection(hidden_states)
-        transition_scores = unary_logits[:, 1:].unsqueeze(2) + self._edge_correction(
-            candidate_factors[:, :-1],
-            hidden_factors[:, 1:].unsqueeze(2),
-            candidate_factors[:, 1:],
-            "blpr,blcr->blpc",
+        candidates = self.projected_token_table[candidate_ids]
+        anchor = self.projected_token_table[anchor_token_ids]
+        hidden = self.hidden_projection(hidden_states)
+        predecessors = torch.cat(
+            [anchor[:, None, None].expand(-1, 1, self.top_k, -1), candidates[:, :-1]],
+            dim=1,
         )
-        position_zero_scores = unary_logits[:, 0] + self._edge_correction(
-            anchor_factors,
-            hidden_factors[:, 0],
-            candidate_factors[:, 0],
-            "br,bkr->bk",
-        )
-        return transition_scores, position_zero_scores
+        edge = self.state_query(F.silu(predecessors + hidden[:, :, None]))
+        scores = unary_logits[:, :, None] + torch.einsum(
+            "blpr,blcr->blpc", edge, candidates
+        ) / math.sqrt(self.state_rank)
+        # Slot 0's K predecessor rows are all the anchor, so row 0 is the whole edge.
+        return scores[:, 1:], scores[:, 0, 0]
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
