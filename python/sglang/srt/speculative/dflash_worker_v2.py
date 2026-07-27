@@ -154,23 +154,20 @@ def _is_all_greedy(sampling_info) -> bool:
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     """compute_candidates -> build_lattice for the draft's prediction hidden states.
-    Returns (candidate_ids, transition_scores, position_zero_scores). Shared by the
-    folded (_SelectorDraftSampler) and eager (_propose_selector_block) paths."""
+    Returns (candidate_ids, scores). Shared by the folded (_SelectorDraftSampler) and
+    eager (_propose_selector_block) paths. compute_candidates takes [N, H] because the
+    flashinfer radix top-k kernel is 2D, hence the flatten and the view back."""
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
     )
     candidate_ids = candidate_ids.view(bs, num_pred, -1)
-    unary_logits = unary_logits.view(bs, num_pred, -1)
-    transition_scores, position_zero_scores = (
-        draft_model.candidate_selector.build_lattice(
-            candidate_ids=candidate_ids,
-            unary_logits=unary_logits,
-            hidden_states=pred_hidden,
-            anchor_token_ids=anchor_token_ids,
-        )
+    return candidate_ids, draft_model.candidate_selector.build_lattice(
+        candidate_ids=candidate_ids,
+        unary_logits=unary_logits.view(bs, num_pred, -1),
+        hidden_states=pred_hidden,
+        anchor_token_ids=anchor_token_ids,
     )
-    return candidate_ids, transition_scores, position_zero_scores
 
 
 class _SelectorDraftSampler:
@@ -193,14 +190,8 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, :-1, :]  # pos 0 = anchor
-        candidate_ids, transition_scores, position_zero_scores = _selector_lattice(
-            self.draft_model, hs, block_ids[:, 0]
-        )
-        tokens = self.selector.decode_local(
-            candidate_ids=candidate_ids,
-            transition_scores=transition_scores,
-            position_zero_scores=position_zero_scores,
-        )
+        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        tokens = self.selector.decode_local(candidate_ids=candidate_ids, scores=scores)
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
 
 
@@ -905,7 +896,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"--speculative-num-draft-tokens {selector.block_size + 1}."
             )
 
-        candidate_ids, transition_scores, position_zero_scores = _selector_lattice(
+        candidate_ids, scores = _selector_lattice(
             draft_model, pred_hidden, anchor_token_ids
         )
         if not _is_all_greedy(sampling_info):
@@ -917,18 +908,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             temperatures = sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
             tokens, q_rows = selector.sample_path(
                 candidate_ids=candidate_ids,
-                transition_scores=transition_scores,
-                position_zero_scores=position_zero_scores,
+                scores=scores,
                 uniforms=uniforms,
                 temperatures=temperatures,
             )
             self._selector_sample = (candidate_ids, q_rows)
             return tokens.view(bs, num_pred)
-        tokens = selector.decode_local(
-            candidate_ids=candidate_ids,
-            transition_scores=transition_scores,
-            position_zero_scores=position_zero_scores,
-        )
+        tokens = selector.decode_local(candidate_ids=candidate_ids, scores=scores)
         return tokens.view(bs, num_pred)
 
     def _selector_sampling_accept(

@@ -647,8 +647,9 @@ class CandidateSelector(nn.Module):
         unary_logits: torch.Tensor,
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1).
+    ) -> torch.Tensor:
+        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns
+        [B, L, previous_K, current_K]: edge 0 is the anchor edge, 1: the transitions.
 
             score[b,e,p,c] = unary[b,e,c]
                 + <state_query(silu(pred[b,e,p] + hidden[b,e])), cand[b,e,c]> / sqrt(r)
@@ -666,11 +667,9 @@ class CandidateSelector(nn.Module):
             dim=1,
         )
         edge = self.state_query(F.silu(predecessors + hidden[:, :, None]))
-        scores = unary_logits[:, :, None] + torch.einsum(
+        return unary_logits[:, :, None] + torch.einsum(
             "blpr,blcr->blpc", edge, candidates
         ) / math.sqrt(self.state_rank)
-        # Slot 0's K predecessor rows are all the anchor, so row 0 is the whole edge.
-        return scores[:, 1:], scores[:, 0, 0]
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
@@ -685,32 +684,26 @@ class CandidateSelector(nn.Module):
             torch.gather(src[:, offset:], -1, src[:, :-offset], out=dst[:, offset:])
             src, dst = dst, src
             offset *= 2
-        prefix_maps = src
-        suffix_indices = prefix_maps.gather(
-            -1, initial_indices.view(-1, 1, 1).expand(-1, maps.shape[1], -1)
+        suffix_indices = src.gather(
+            -1, initial_indices.view(-1, 1, 1).expand(-1, edges, -1)
         )[:, :, 0]
         return torch.cat((initial_indices.unsqueeze(1), suffix_indices), dim=1)
 
     def decode_local(
-        self,
-        *,
-        candidate_ids: torch.Tensor,
-        transition_scores: torch.Tensor,
-        position_zero_scores: torch.Tensor,
+        self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
     ) -> torch.Tensor:
         """Greedy per-edge argmax + prefix-scan compose, walked from the slot the
         anchor edge scores highest."""
-        local_maps = transition_scores.argmax(dim=-1)
-        initial_indices = position_zero_scores.argmax(dim=-1)
-        path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
+        path_indices = self._candidate_indices_from_maps(
+            scores[:, 1:].argmax(dim=-1), scores[:, 0, 0].argmax(dim=-1)
+        )
         return candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
 
     def sample_path(
         self,
         *,
         candidate_ids: torch.Tensor,
-        transition_scores: torch.Tensor,
-        position_zero_scores: torch.Tensor,
+        scores: torch.Tensor,
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -719,7 +712,7 @@ class CandidateSelector(nn.Module):
         q_rows the per-position categorical over the K candidates for the verify."""
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
-        initial_probs = torch.softmax(position_zero_scores.float() / temps, dim=-1)
+        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
         initial_indices = (
             uniforms[:, :1]
             .ge(initial_probs.cumsum(dim=-1))
@@ -727,7 +720,7 @@ class CandidateSelector(nn.Module):
             .clamp_max(top_k - 1)
         )
         transition_probs = torch.softmax(
-            transition_scores.float() / temps[:, :, None, None], dim=-1
+            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
         )
         local_maps = (
             uniforms[:, 1:, None, None]
