@@ -599,12 +599,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 class CandidateSelector(nn.Module):
     """Direct-edge parallel-scan candidate selector: two bias-free projections plus a
     [vocab, r] token table turn draft hidden + target-lm-head top-K candidates into a
-    K x K transition lattice.
-
-    The token table ships in the checkpoint already folded: it is
-    `token_projection(rms_norm(target_embed))`, constant once both are frozen, so
-    training exports it and this side only ever gathers rows. It is replicated, not
-    vocab-sharded, because candidate_ids are global ids.
+    K x K transition lattice. Training ships the table folded, so this side only
+    gathers rows; it is replicated, not vocab-sharded, since candidate_ids are global.
     """
 
     def __init__(
@@ -665,18 +661,16 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns
-        (transition_scores, position_zero_scores):
+        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1).
 
             transition[b,e,p,c] = unary[b,e+1,c]
                 + <state_query(silu(cand[e,p] + hidden[e+1])), cand[e+1,c]> / sqrt(r)
             position_zero[b,c]  = unary[b,0,c]
                 + <state_query(silu(anchor[b]  + hidden[0])), cand[0,c]>   / sqrt(r)
 
-        The anchor edge scores the block's first slot against the verified anchor
-        token with the very same weights, so it costs no parameters.
-        `hidden_states` is already the draft's final RMSNorm output and is not
-        normalized again.
+        Slot 0 has a real predecessor -- the verified anchor token -- so it is scored
+        by the same edge, costing no parameters. hidden_states is the draft's final
+        RMSNorm output and is deliberately not normalized again.
         """
         candidate_factors = F.embedding(candidate_ids, self.projected_token_table)
         anchor_factors = F.embedding(anchor_token_ids, self.projected_token_table)
