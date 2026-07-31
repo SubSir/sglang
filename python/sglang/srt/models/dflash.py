@@ -830,40 +830,14 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         dflash_config = getattr(config, "dflash_config", None) or {}
-        # Newer checkpoints nest the selector under "dflashv2_selector"; older ones
-        # spell the same two numbers as flat candidate_selector_* keys.
         selector_config = dflash_config.get("dflashv2_selector") or {}
-        rank = int(
-            selector_config.get("rank")
-            or dflash_config.get("candidate_selector_rank", 0)
-        )
-        top_k = int(
-            selector_config.get("top_k")
-            or dflash_config.get("candidate_selector_top_k", 0)
-        )
+        rank = int(selector_config.get("rank", 0))
+        top_k = int(selector_config.get("top_k", 0))
         if rank <= 0 or top_k <= 0:
             raise ValueError(
-                "DFlash selector draft requires a selector rank>0 and top_k>0 in "
-                "dflash_config, either under dflashv2_selector or as "
-                f"candidate_selector_rank/_top_k; got rank={rank}, top_k={top_k}."
+                "DFlash selector draft requires dflash_config.dflashv2_selector with "
+                f"rank>0 and top_k>0; got rank={rank}, top_k={top_k}."
             )
-        interaction = selector_config.get("interaction", "trilinear")
-        if interaction != "trilinear":
-            # The earlier `state_query(silu(pred + hidden))` edge scores the same
-            # lattice from the same tensors, so picking wrong costs accept length
-            # and nothing else.
-            raise ValueError(
-                f"Unsupported DFLASH selector interaction={interaction!r}; this port "
-                "implements 'trilinear' only."
-            )
-        if not selector_config:
-            # The flat layout also carried variants this port does not implement.
-            for flag in (
-                "candidate_selector_parallel_scan",
-                "candidate_selector_direct_edge",
-            ):
-                if not bool(dflash_config.get(flag, False)):
-                    raise ValueError(f"This selector port only supports {flag}=True.")
         # The selector spans the *proposal* slots, not the block rows: the anchor holds
         # row 0 as context and proposes nothing. A checkpoint that disagrees is caught
         # by the slot-count check in the worker's `_propose_selector_block`.
