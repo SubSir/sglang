@@ -348,10 +348,9 @@ class DFlashDecoderLayer(nn.Module):
         # Block-local routes, when the checkpoint has them. The output route hangs off
         # the attention whose output it transports, so the parameter names match the
         # trained state dict; the layer, not the attention, applies it.
-        rank = int(get_dflash_config(config).get("block_route_rank", 0))
-        block_size = parse_dflash_draft_config(
-            draft_hf_config=config
-        ).resolve_block_size(default=16)
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        rank = draft_config.block_route_rank
+        block_size = draft_config.resolve_block_size(default=16)
 
         def route(plans: bool):
             if not rank:

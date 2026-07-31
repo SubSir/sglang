@@ -389,6 +389,7 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
+    block_route_rank: int
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -467,6 +468,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    # Rank of the draft's block-local routes; 0 for a checkpoint without them.
+    block_route_rank = _parse_optional_int(
+        dflash_cfg.get("block_route_rank", 0),
+        field_name="DFLASH block_route_rank",
+        min_value=0,
+    )
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -514,6 +522,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
+        block_route_rank=block_route_rank,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
