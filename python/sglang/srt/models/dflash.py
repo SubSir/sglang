@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
+    get_dflash_config,
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
@@ -290,24 +291,6 @@ class DFlashMLP(nn.Module):
         return x
 
 
-def _as_config_dict(value) -> dict:
-    """HF may hand back a nested config object instead of the dict it was written as."""
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    return dict(getattr(value, "__dict__", {}))
-
-
-def _block_route_rank(config) -> int:
-    """Rank of the draft's block-local routes, or 0 for a checkpoint without them."""
-    return int(
-        _as_config_dict(getattr(config, "dflash_config", None)).get(
-            "block_route_rank", 0
-        )
-    )
-
-
 class DFlashBlockRoute(nn.Module):
     """Two-tap block-local route: each row mixes in the row before it inside the same
     DFlash block, gated per channel by a static weight plus a rank-r correction drawn
@@ -365,7 +348,7 @@ class DFlashDecoderLayer(nn.Module):
         # Block-local routes, when the checkpoint has them. The output route hangs off
         # the attention whose output it transports, so the parameter names match the
         # trained state dict; the layer, not the attention, applies it.
-        rank = _block_route_rank(config)
+        rank = int(get_dflash_config(config).get("block_route_rank", 0))
         block_size = parse_dflash_draft_config(
             draft_hf_config=config
         ).resolve_block_size(default=16)
@@ -841,10 +824,10 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        dflash_config = _as_config_dict(getattr(config, "dflash_config", None))
+        dflash_config = get_dflash_config(config)
         # Newer checkpoints nest the selector under "dflashv2_selector"; older ones
         # spell the same two numbers as flat candidate_selector_* keys.
-        selector_config = _as_config_dict(dflash_config.get("dflashv2_selector"))
+        selector_config = dflash_config.get("dflashv2_selector") or {}
         rank = int(
             selector_config.get("rank")
             or dflash_config.get("candidate_selector_rank", 0)
