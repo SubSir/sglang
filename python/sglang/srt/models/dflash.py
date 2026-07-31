@@ -296,13 +296,11 @@ class DFlashBlockRoute(nn.Module):
         row + (w_prev + g_prev) * predecessor + (w_cur + g_cur) * row
 
     with the predecessor taken inside the same DFlash block, zero on row 0. `w` is a
-    static per-channel weight, `g` a rank-r correction from the row's plan -- computed
-    here when `plans`, reused from the sublayer input otherwise.
+    static per-channel weight, `g` a rank-r correction from the row's plan, which the
+    layer computes once per sublayer and feeds to both of that sublayer's routes.
     """
 
-    def __init__(
-        self, hidden_size: int, block_size: int, rank: int, *, plans: bool
-    ) -> None:
+    def __init__(self, hidden_size: int, block_size: int, rank: int) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.block_size = int(block_size)
@@ -313,12 +311,6 @@ class DFlashBlockRoute(nn.Module):
         self.dynamic_output_projection = nn.Parameter(
             torch.empty(2 * self.hidden_size, self.rank)
         )
-        self.dynamic_input_projection = (
-            nn.Linear(self.hidden_size, self.rank, bias=False) if plans else None
-        )
-
-    def plan(self, normalized_states: torch.Tensor) -> torch.Tensor:
-        return self.dynamic_input_projection(normalized_states)
 
     def forward(self, hidden_states: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
         blocks = hidden_states.view(-1, self.block_size, self.hidden_size)
@@ -355,15 +347,22 @@ class DFlashDecoderLayer(nn.Module):
         rank = draft_config.block_route_rank
         block_size = draft_config.resolve_block_size(default=16)
 
-        def route(plans: bool):
+        def sublayer_routes():
+            """A sublayer's plan projection, its input route, and its output route."""
             if not rank:
-                return None
-            return DFlashBlockRoute(hidden_size, block_size, rank, plans=plans)
+                return None, None, None
+            return (
+                nn.Linear(hidden_size, rank, bias=False),
+                DFlashBlockRoute(hidden_size, block_size, rank),
+                DFlashBlockRoute(hidden_size, block_size, rank),
+            )
 
-        self.canon_attention = route(plans=True)
-        self.canon_mlp = route(plans=True)
-        self.self_attn.canon_output = route(plans=False)
-        self.canon_mlp_down = route(plans=False)
+        (
+            self.canon_attention_plan,
+            self.canon_attention,
+            self.self_attn.canon_output,
+        ) = sublayer_routes()
+        self.canon_mlp_plan, self.canon_mlp, self.canon_mlp_down = sublayer_routes()
 
     def forward(
         self,
@@ -387,7 +386,7 @@ class DFlashDecoderLayer(nn.Module):
 
         attention_plan = None
         if self.canon_attention is not None:
-            attention_plan = self.canon_attention.plan(hidden_states)
+            attention_plan = self.canon_attention_plan(hidden_states)
             hidden_states = self.canon_attention(hidden_states, attention_plan)
 
         attn_out = self.self_attn(
@@ -402,7 +401,7 @@ class DFlashDecoderLayer(nn.Module):
 
         mlp_plan = None
         if self.canon_mlp is not None:
-            mlp_plan = self.canon_mlp.plan(hidden_states)
+            mlp_plan = self.canon_mlp_plan(hidden_states)
             hidden_states = self.canon_mlp(hidden_states, mlp_plan)
 
         hidden_states = self.mlp(hidden_states)
