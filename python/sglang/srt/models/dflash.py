@@ -291,10 +291,13 @@ class DFlashMLP(nn.Module):
 
 
 class DFlashBlockRoute(nn.Module):
-    """Two-tap block-local route: each row mixes in the row before it inside the same
-    DFlash block, gated per channel by a static weight plus a rank-r correction drawn
-    from the sublayer's plan. Tap 0 is the predecessor (zero on row 0, so blocks stay
-    independent), tap 1 the row itself.
+    """Two-tap block-local route. Each row becomes
+
+        row + (w_prev + g_prev) * predecessor + (w_cur + g_cur) * row
+
+    where the predecessor is the row before it inside the same DFlash block (zero on
+    row 0, so blocks stay independent), `w` is a static per-channel weight and `g` a
+    rank-r correction the sublayer's plan supplies for that row.
 
     A route on a sublayer *input* computes the plan (`plans=True`); the one transporting
     that sublayer's projected output reuses it rather than planning again.
@@ -308,8 +311,10 @@ class DFlashBlockRoute(nn.Module):
         self.block_size = int(block_size)
         self.rank = int(rank)
         self.weight = nn.Parameter(torch.empty(2, self.hidden_size))
+        # Stored as one [2 * hidden, rank] projection, predecessor block first, so the
+        # per-row correction for both taps is a single GEMM against the plan.
         self.dynamic_output_projection = nn.Parameter(
-            torch.empty(self.rank, 2, self.hidden_size)
+            torch.empty(2 * self.hidden_size, self.rank)
         )
         self.dynamic_input_projection = (
             nn.Linear(self.hidden_size, self.rank, bias=False) if plans else None
@@ -320,13 +325,15 @@ class DFlashBlockRoute(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
         blocks = hidden_states.view(-1, self.block_size, self.hidden_size)
-        gate = self.weight + F.linear(
-            plan.view(-1, self.block_size, self.rank),
-            self.dynamic_output_projection.reshape(self.rank, -1).transpose(0, 1),
-        ).view(-1, self.block_size, 2, self.hidden_size)
         predecessor = F.pad(blocks[:, :-1], (0, 0, 1, 0))
-        taps = torch.stack((predecessor, blocks), dim=2)
-        return (blocks + (gate * taps).sum(2)).view_as(hidden_states)
+        previous_gate, current_gate = F.linear(
+            plan.view(-1, self.block_size, self.rank), self.dynamic_output_projection
+        ).chunk(2, dim=-1)
+        return (
+            blocks
+            + (self.weight[0] + previous_gate) * predecessor
+            + (self.weight[1] + current_gate) * blocks
+        ).view_as(hidden_states)
 
 
 class DFlashDecoderLayer(nn.Module):
