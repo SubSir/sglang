@@ -295,12 +295,9 @@ class DFlashBlockRoute(nn.Module):
 
         row + (w_prev + g_prev) * predecessor + (w_cur + g_cur) * row
 
-    where the predecessor is the row before it inside the same DFlash block (zero on
-    row 0, so blocks stay independent), `w` is a static per-channel weight and `g` a
-    rank-r correction the sublayer's plan supplies for that row.
-
-    A route on a sublayer *input* computes the plan (`plans=True`); the one transporting
-    that sublayer's projected output reuses it rather than planning again.
+    with the predecessor taken inside the same DFlash block, zero on row 0. `w` is a
+    static per-channel weight, `g` a rank-r correction from the row's plan -- computed
+    here when `plans`, reused from the sublayer input otherwise.
     """
 
     def __init__(
@@ -729,19 +726,14 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """candidate_ids/unary_logits: [B, L, K] top-k (slot 0 == top-1). Returns
-        [B, L, previous_K, current_K]: edge 0 is the anchor edge, 1: the transitions.
+        """candidate_ids/unary_logits: [B, L, K] -> [B, L, previous_K, current_K]:
 
             score[b,e,p,c] = unary[b,e,c]
                 + <pred[b,e,p] * hidden[b,e], state_query(cand[b,e,c])> / sqrt(r)
 
-        The trilinear interaction: the predecessor and the position's hidden state meet
-        as an elementwise product (the query), and only the candidate side is projected.
-
-        pred is cand[b,e-1], except slot 0's predecessor is the verified anchor token
-        -- broadcast over p, so every slot is the same edge and slot 0 needs neither
-        its own parameters nor its own code path. hidden_states is the draft's final
-        RMSNorm output; the selector normalizes it once more, weightlessly.
+        pred is cand[b,e-1]; slot 0's is the verified anchor, broadcast over p so it
+        needs no code path of its own. hidden_states is the draft's final RMSNorm
+        output, normalized once more here, weightlessly.
         """
         candidates = self.projected_token_table[candidate_ids]
         anchor = self.projected_token_table[anchor_token_ids]
