@@ -290,6 +290,63 @@ class DFlashMLP(nn.Module):
         return x
 
 
+def _as_config_dict(value) -> dict:
+    """HF may hand back a nested config object instead of the dict it was written as."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    return dict(getattr(value, "__dict__", {}))
+
+
+def _block_route_rank(config) -> int:
+    """Rank of the draft's block-local routes, or 0 for a checkpoint without them."""
+    return int(
+        _as_config_dict(getattr(config, "dflash_config", None)).get(
+            "block_route_rank", 0
+        )
+    )
+
+
+class DFlashBlockRoute(nn.Module):
+    """Two-tap block-local route: each row mixes in the row before it inside the same
+    DFlash block, gated per channel by a static weight plus a rank-r correction drawn
+    from the sublayer's plan. Tap 0 is the predecessor (zero on row 0, so blocks stay
+    independent), tap 1 the row itself.
+
+    A route on a sublayer *input* computes the plan (`plans=True`); the one transporting
+    that sublayer's projected output reuses it rather than planning again.
+    """
+
+    def __init__(
+        self, hidden_size: int, block_size: int, rank: int, *, plans: bool
+    ) -> None:
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.rank = int(rank)
+        self.weight = nn.Parameter(torch.empty(2, self.hidden_size))
+        self.dynamic_output_projection = nn.Parameter(
+            torch.empty(self.rank, 2, self.hidden_size)
+        )
+        self.dynamic_input_projection = (
+            nn.Linear(self.hidden_size, self.rank, bias=False) if plans else None
+        )
+
+    def plan(self, normalized_states: torch.Tensor) -> torch.Tensor:
+        return self.dynamic_input_projection(normalized_states)
+
+    def forward(self, hidden_states: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
+        blocks = hidden_states.view(-1, self.block_size, self.hidden_size)
+        gate = self.weight + F.linear(
+            plan.view(-1, self.block_size, self.rank),
+            self.dynamic_output_projection.reshape(self.rank, -1).transpose(0, 1),
+        ).view(-1, self.block_size, 2, self.hidden_size)
+        predecessor = F.pad(blocks[:, :-1], (0, 0, 1, 0))
+        taps = torch.stack((predecessor, blocks), dim=2)
+        return (blocks + (gate * taps).sum(2)).view_as(hidden_states)
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
@@ -304,6 +361,24 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+
+        # Block-local routes, when the checkpoint has them. The output route hangs off
+        # the attention whose output it transports, so the parameter names match the
+        # trained state dict; the layer, not the attention, applies it.
+        rank = _block_route_rank(config)
+        block_size = parse_dflash_draft_config(
+            draft_hf_config=config
+        ).resolve_block_size(default=16)
+
+        def route(plans: bool):
+            if not rank:
+                return None
+            return DFlashBlockRoute(hidden_size, block_size, rank, plans=plans)
+
+        self.canon_attention = route(plans=True)
+        self.canon_mlp = route(plans=True)
+        self.self_attn.canon_output = route(plans=False)
+        self.canon_mlp_down = route(plans=False)
 
     def forward(
         self,
@@ -325,13 +400,29 @@ class DFlashDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        attention_plan = None
+        if self.canon_attention is not None:
+            attention_plan = self.canon_attention.plan(hidden_states)
+            hidden_states = self.canon_attention(hidden_states, attention_plan)
+
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if attention_plan is not None:
+            attn_out = self.self_attn.canon_output(attn_out, attention_plan)
+
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+
+        mlp_plan = None
+        if self.canon_mlp is not None:
+            mlp_plan = self.canon_mlp.plan(hidden_states)
+            hidden_states = self.canon_mlp(hidden_states, mlp_plan)
+
         hidden_states = self.mlp(hidden_states)
+        if mlp_plan is not None:
+            hidden_states = self.canon_mlp_down(hidden_states, mlp_plan)
         return hidden_states, residual
 
 
@@ -611,11 +702,13 @@ class CandidateSelector(nn.Module):
         state_rank: int,
         top_k: int,
         block_size: int,
+        rms_norm_eps: float,
     ) -> None:
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
+        self.rms_norm_eps = float(rms_norm_eps)
         self.projected_token_table = nn.Parameter(
             torch.empty(int(vocab_size), self.state_rank), requires_grad=False
         )
@@ -652,23 +745,29 @@ class CandidateSelector(nn.Module):
         [B, L, previous_K, current_K]: edge 0 is the anchor edge, 1: the transitions.
 
             score[b,e,p,c] = unary[b,e,c]
-                + <state_query(silu(pred[b,e,p] + hidden[b,e])), cand[b,e,c]> / sqrt(r)
+                + <pred[b,e,p] * hidden[b,e], state_query(cand[b,e,c])> / sqrt(r)
+
+        The trilinear interaction: the predecessor and the position's hidden state meet
+        as an elementwise product (the query), and only the candidate side is projected.
 
         pred is cand[b,e-1], except slot 0's predecessor is the verified anchor token
         -- broadcast over p, so every slot is the same edge and slot 0 needs neither
         its own parameters nor its own code path. hidden_states is the draft's final
-        RMSNorm output and is deliberately not normalized again.
+        RMSNorm output; the selector normalizes it once more, weightlessly.
         """
         candidates = self.projected_token_table[candidate_ids]
         anchor = self.projected_token_table[anchor_token_ids]
-        hidden = self.hidden_projection(hidden_states)
+        hidden = self.hidden_projection(
+            F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=self.rms_norm_eps)
+        )
         predecessors = torch.cat(
             [anchor[:, None, None].expand(-1, 1, self.top_k, -1), candidates[:, :-1]],
             dim=1,
         )
-        edge = self.state_query(F.silu(predecessors + hidden[:, :, None]))
         return unary_logits[:, :, None] + torch.einsum(
-            "blpr,blcr->blpc", edge, candidates
+            "blpr,blcr->blpc",
+            predecessors * hidden[:, :, None],
+            self.state_query(candidates),
         ) / math.sqrt(self.state_rank)
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
@@ -742,14 +841,10 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        dflash_config = getattr(config, "dflash_config", None) or {}
-        if not isinstance(dflash_config, dict):  # HF may wrap nested config dicts
-            dflash_config = dict(getattr(dflash_config, "__dict__", {}))
+        dflash_config = _as_config_dict(getattr(config, "dflash_config", None))
         # Newer checkpoints nest the selector under "dflashv2_selector"; older ones
         # spell the same two numbers as flat candidate_selector_* keys.
-        selector_config = dflash_config.get("dflashv2_selector") or {}
-        if not isinstance(selector_config, dict):
-            selector_config = dict(getattr(selector_config, "__dict__", {}))
+        selector_config = _as_config_dict(dflash_config.get("dflashv2_selector"))
         rank = int(
             selector_config.get("rank")
             or dflash_config.get("candidate_selector_rank", 0)
@@ -764,6 +859,15 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
                 "dflash_config, either under dflashv2_selector or as "
                 f"candidate_selector_rank/_top_k; got rank={rank}, top_k={top_k}."
             )
+        interaction = selector_config.get("interaction", "trilinear")
+        if interaction != "trilinear":
+            # The earlier `state_query(silu(pred + hidden))` edge scores the same
+            # lattice from the same tensors, so picking wrong costs accept length
+            # and nothing else.
+            raise ValueError(
+                f"Unsupported DFLASH selector interaction={interaction!r}; this port "
+                "implements 'trilinear' only."
+            )
         if not selector_config:
             # The flat layout also carried variants this port does not implement.
             for flag in (
@@ -772,12 +876,18 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             ):
                 if not bool(dflash_config.get(flag, False)):
                     raise ValueError(f"This selector port only supports {flag}=True.")
+        # The selector spans the *proposal* slots, not the block rows: the anchor holds
+        # row 0 as context and proposes nothing. A checkpoint that disagrees is caught
+        # by the slot-count check in the worker's `_propose_selector_block`.
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
             state_rank=rank,
             top_k=top_k,
-            block_size=self.block_size,
+            block_size=int(
+                dflash_config.get("proposal_block_size", self.block_size - 1)
+            ),
+            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
         )
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None

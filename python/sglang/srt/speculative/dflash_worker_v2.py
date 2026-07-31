@@ -189,7 +189,7 @@ class _SelectorDraftSampler:
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
-        hs = hidden_states.view(bs, self.block_size, -1)[:, :-1, :]  # pos 0 = anchor
+        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         tokens = self.selector.decode_local(candidate_ids=candidate_ids, scores=scores)
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
@@ -886,8 +886,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        # Shift-style: positions 0..block_size-2 (pos 0 = anchor) predict draft_tokens[:, 1:].
-        pred_hidden = draft_hidden[:, :-1, :]  # [bs, block_size-1, H], pos0 = anchor
+        # Block row 0 holds the verified anchor as context and proposes nothing; the
+        # block_size-1 MASK rows each propose the token at their own position.
+        pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
         num_pred = pred_hidden.shape[1]
         if num_pred != selector.block_size:
             raise ValueError(
