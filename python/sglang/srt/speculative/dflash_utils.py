@@ -350,7 +350,7 @@ def _get_text_config(config: Any) -> Any:
     return config
 
 
-def get_dflash_config(config: Any) -> dict:
+def _get_dflash_config(config: Any) -> dict:
     if isinstance(config, dict):
         cfg = config.get("dflash_config", None)
     else:
@@ -439,7 +439,7 @@ class DFlashDraftConfig:
 
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
-    dflash_cfg = get_dflash_config(draft_hf_config)
+    dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
 
     num_hidden_layers = _parse_optional_int(

@@ -34,7 +34,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
-    get_dflash_config,
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
@@ -823,7 +822,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        dflash_config = get_dflash_config(config)
+        dflash_config = getattr(config, "dflash_config", None) or {}
         # Newer checkpoints nest the selector under "dflashv2_selector"; older ones
         # spell the same two numbers as flat candidate_selector_* keys.
         selector_config = dflash_config.get("dflashv2_selector") or {}
