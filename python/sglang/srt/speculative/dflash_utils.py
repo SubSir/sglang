@@ -390,6 +390,7 @@ class DFlashDraftConfig:
     num_target_layers: Optional[int]
     block_size: Optional[int]
     block_route_rank: int
+    block_route_repeats: int
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -475,6 +476,15 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=0,
     )
 
+    # How many two-tap convs each of the four route sites stacks. 1 is the release; a
+    # conv-stacked draft records its own count because the extra routes are separate
+    # tensors and a loader that ignored this would silently drop them.
+    block_route_repeats = _parse_optional_int(
+        dflash_cfg.get("block_route_repeats", 1),
+        field_name="DFLASH block_route_repeats",
+        min_value=1,
+    )
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -523,6 +533,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_target_layers=num_target_layers,
         block_size=block_size,
         block_route_rank=block_route_rank,
+        block_route_repeats=block_route_repeats,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,

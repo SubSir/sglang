@@ -347,8 +347,14 @@ class DFlashDecoderLayer(nn.Module):
         rank = draft_config.block_route_rank
         block_size = draft_config.resolve_block_size(default=16)
 
+        # A conv-stacked draft applies the two-tap route `repeats` times at each of the
+        # four sites, every application under the one plan its sublayer computed. The
+        # release uses 1; anything else is recorded in the checkpoint's config because
+        # it cannot be recovered from tensor shapes.
+        repeats = int(draft_config.block_route_repeats)
+
         def sublayer_routes():
-            """A sublayer's plan projection, its input route, and its output route."""
+            """A sublayer's plan projection, its input routes, and its output routes."""
             if not rank:
                 return None, None, None
             return (
@@ -363,6 +369,20 @@ class DFlashDecoderLayer(nn.Module):
             self.self_attn.canon_output,
         ) = sublayer_routes()
         self.canon_mlp_plan, self.canon_mlp, self.canon_mlp_down = sublayer_routes()
+
+        def extra_routes():
+            """The 2nd..Nth conv at a site, named as the training export names them."""
+            if not rank or repeats <= 1:
+                return nn.ModuleList()
+            return nn.ModuleList(
+                DFlashBlockRoute(hidden_size, block_size, rank)
+                for _ in range(repeats - 1)
+            )
+
+        self.canon_attention_extra = extra_routes()
+        self.self_attn.canon_output_extra = extra_routes()
+        self.canon_mlp_extra = extra_routes()
+        self.canon_mlp_down_extra = extra_routes()
 
     def forward(
         self,
@@ -388,6 +408,8 @@ class DFlashDecoderLayer(nn.Module):
         if self.canon_attention is not None:
             attention_plan = self.canon_attention_plan(hidden_states)
             hidden_states = self.canon_attention(hidden_states, attention_plan)
+            for route in self.canon_attention_extra:
+                hidden_states = route(hidden_states, attention_plan)
 
         attn_out = self.self_attn(
             positions=positions,
@@ -396,6 +418,8 @@ class DFlashDecoderLayer(nn.Module):
         )
         if attention_plan is not None:
             attn_out = self.self_attn.canon_output(attn_out, attention_plan)
+            for route in self.self_attn.canon_output_extra:
+                attn_out = route(attn_out, attention_plan)
 
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
@@ -403,10 +427,14 @@ class DFlashDecoderLayer(nn.Module):
         if self.canon_mlp is not None:
             mlp_plan = self.canon_mlp_plan(hidden_states)
             hidden_states = self.canon_mlp(hidden_states, mlp_plan)
+            for route in self.canon_mlp_extra:
+                hidden_states = route(hidden_states, mlp_plan)
 
         hidden_states = self.mlp(hidden_states)
         if mlp_plan is not None:
             hidden_states = self.canon_mlp_down(hidden_states, mlp_plan)
+            for route in self.canon_mlp_down_extra:
+                hidden_states = route(hidden_states, mlp_plan)
         return hidden_states, residual
 
 
@@ -687,17 +715,41 @@ class CandidateSelector(nn.Module):
         top_k: int,
         block_size: int,
         rms_norm_eps: float,
+        parameterization: str = "released",
     ) -> None:
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
         self.rms_norm_eps = float(rms_norm_eps)
-        self.projected_token_table = nn.Parameter(
-            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
-        )
+        # Two parameterizations, chosen by the checkpoint, never by shape:
+        #
+        #   "released"  edge(p->c) = <T(p) . rms_norm_then_project(h), W_q T(c)> / sqrt(r)
+        #   "direct_ab" edge(p->c) = <A(p) . project(h), B(c)>
+        #
+        # direct_ab unties the two directions, folds W_q and the 1/sqrt(r) scale into B,
+        # and does not rms_norm the hidden. Both start as the draft's own logits.
+        self.parameterization = str(parameterization)
+        if self.parameterization not in ("released", "direct_ab"):
+            raise ValueError(
+                f"DFlash selector: unknown parameterization {self.parameterization!r}"
+            )
+        self.direct_ab = self.parameterization == "direct_ab"
+        if self.direct_ab:
+            self.predecessor_token_table = nn.Parameter(
+                torch.empty(int(vocab_size), self.state_rank), requires_grad=False
+            )
+            self.successor_token_table = nn.Parameter(
+                torch.empty(int(vocab_size), self.state_rank), requires_grad=False
+            )
+            self.projected_token_table = None
+            self.state_query = None
+        else:
+            self.projected_token_table = nn.Parameter(
+                torch.empty(int(vocab_size), self.state_rank), requires_grad=False
+            )
+            self.state_query = nn.Linear(state_rank, state_rank, bias=False)
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
-        self.state_query = nn.Linear(state_rank, state_rank, bias=False)
         # Filled before cuda-graph capture (see the setup method below).
         self._scan_a: Optional[torch.Tensor] = None
         self._scan_b: Optional[torch.Tensor] = None
@@ -734,11 +786,24 @@ class CandidateSelector(nn.Module):
         needs no code path of its own. hidden_states is the draft's final RMSNorm
         output, normalized once more here, weightlessly.
         """
-        candidates = self.projected_token_table[candidate_ids]
-        anchor = self.projected_token_table[anchor_token_ids]
-        hidden = self.hidden_projection(
-            F.rms_norm(hidden_states, hidden_states.shape[-1:], eps=self.rms_norm_eps)
-        )
+        if self.direct_ab:
+            # A on the predecessor side, B on the candidate side, no rms_norm on the
+            # hidden and no 1/sqrt(r): the scale is already folded into B.
+            predecessor_table = self.predecessor_token_table
+            keys = self.successor_token_table[candidate_ids]
+            hidden = self.hidden_projection(hidden_states)
+            scale = 1.0
+        else:
+            predecessor_table = self.projected_token_table
+            keys = self.state_query(self.projected_token_table[candidate_ids])
+            hidden = self.hidden_projection(
+                F.rms_norm(
+                    hidden_states, hidden_states.shape[-1:], eps=self.rms_norm_eps
+                )
+            )
+            scale = 1.0 / math.sqrt(self.state_rank)
+        candidates = predecessor_table[candidate_ids]
+        anchor = predecessor_table[anchor_token_ids]
         predecessors = torch.cat(
             [anchor[:, None, None].expand(-1, 1, self.top_k, -1), candidates[:, :-1]],
             dim=1,
@@ -746,8 +811,8 @@ class CandidateSelector(nn.Module):
         return unary_logits[:, :, None] + torch.einsum(
             "blpr,blcr->blpc",
             predecessors * hidden[:, :, None],
-            self.state_query(candidates),
-        ) / math.sqrt(self.state_rank)
+            keys,
+        ) * scale
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
@@ -841,6 +906,9 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
                 dflash_config.get("proposal_block_size", self.block_size - 1)
             ),
             rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
+            parameterization=str(
+                selector_config.get("parameterization", "released")
+            ),
         )
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
