@@ -399,6 +399,9 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
+    conv_type: str
+    conv_kernel_size: int
+    conv_group_size: int
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -477,6 +480,29 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    # A DFlash2 draft wraps each sublayer in a grouped dynamic depthwise convolution
+    # along the block. Absent from a DFlash checkpoint, which is served unchanged.
+    conv_type = str(dflash_cfg.get("conv_type", "") or "")
+    if conv_type not in ("", "grouped_dynamic_depthwise"):
+        raise ValueError(
+            "DFLASH conv_type must be grouped_dynamic_depthwise or absent. "
+            f"Got {conv_type!r}."
+        )
+    conv_kernel_size = _parse_optional_int(
+        dflash_cfg.get("conv_kernel_size", 2),
+        field_name="DFLASH conv_kernel_size",
+        min_value=1,
+    )
+    conv_group_size = _parse_optional_int(
+        dflash_cfg.get("conv_group_size", 0),
+        field_name="DFLASH conv_group_size",
+        min_value=0,
+    )
+    if conv_type and not conv_group_size:
+        raise ValueError(
+            "DFLASH grouped convolution requires conv_group_size in the draft config."
+        )
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -524,6 +550,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
+        conv_type=conv_type,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,

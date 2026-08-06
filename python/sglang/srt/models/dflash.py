@@ -280,6 +280,74 @@ class DFlashMLP(nn.Module):
         return x
 
 
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise K-tap convolution across one DFlash block.
+
+        row_i <- sum_t (base[t] + delta_i[t]) * row_{i-t}
+
+    `base` is a static per-channel kernel and `delta` is predicted for the row by one
+    projection, shared by every channel of a group: a hidden of H with group size g
+    carries H/g coefficients per tap instead of H. The same projection produces the
+    kernel for the sublayer's input and the one for its output, which is why `prepare`
+    hands the second half to `finish` rather than projecting twice.
+
+    Taps read backwards within the block and are zero across its boundary, so a row
+    never sees a position the draft has not proposed yet.
+    """
+
+    def __init__(
+        self, hidden_size: int, block_size: int, taps: int, group_size: int
+    ) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
+        self.hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = self.hidden_size // self.group_size
+        # [input/output, tap, channel], the layout training exports.
+        self.base_kernel = nn.Parameter(torch.empty(2, self.taps, self.hidden_size))
+        self.kernel_projection = nn.Linear(
+            self.hidden_size, 2 * self.taps * self.num_groups, bias=False
+        )
+
+    def _convolve(
+        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
+    ) -> torch.Tensor:
+        blocks = hidden_states.view(
+            -1, self.block_size, self.num_groups, self.group_size
+        )
+        delta = delta.reshape(-1, self.block_size, self.taps, self.num_groups, 1)
+        base = self.base_kernel[side].view(
+            1, 1, self.taps, self.num_groups, self.group_size
+        )
+        coefficients = base + delta
+        out = coefficients[:, :, 0] * blocks
+        for tap in range(1, self.taps):
+            shifted = F.pad(blocks[:, :-tap], (0, 0, 0, 0, tap, 0))
+            out = out + coefficients[:, :, tap] * shifted
+        return out.view_as(hidden_states)
+
+    def prepare(self, hidden_states: torch.Tensor):
+        """Convolve a sublayer's input; return it with the kernel for its output."""
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(
+        self, hidden_states: torch.Tensor, coefficients: torch.Tensor
+    ) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
@@ -294,6 +362,26 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+
+        # DFlash2 wraps each sublayer in a grouped convolution along the block. The
+        # module names match what training exports, so no weight remapping is needed,
+        # and a DFlash checkpoint leaves both None and takes the path it always took.
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        self.attention_conv = None
+        self.mlp_conv = None
+        if draft_config.conv_type == "grouped_dynamic_depthwise":
+            block_size = draft_config.resolve_block_size(default=16)
+
+            def grouped_conv():
+                return DFlashGroupedConv(
+                    hidden_size,
+                    block_size,
+                    draft_config.conv_kernel_size,
+                    draft_config.conv_group_size,
+                )
+
+            self.attention_conv = grouped_conv()
+            self.mlp_conv = grouped_conv()
 
     def forward(
         self,
@@ -315,13 +403,26 @@ class DFlashDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if attention_kernel is not None:
+            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
