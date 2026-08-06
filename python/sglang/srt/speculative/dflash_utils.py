@@ -394,6 +394,7 @@ class DFlashDraftConfig:
     conv_type: str
     conv_kernel_size: int
     conv_group_size: int
+    conv_layers: Optional[List[int]]
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -510,6 +511,27 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     )
     if conv_type and not conv_group_size:
         raise ValueError("DFLASH grouped convolution requires conv_group_size.")
+    # Which layers carry convolutions. Absent means every layer, which is what the
+    # released draft records; an ablation that moves them writes the list, and a loader
+    # that ignored it would build convolutions the checkpoint has no weights for.
+    raw_conv_layers = dflash_cfg.get("conv_layers", None)
+    conv_layers: Optional[List[int]] = None
+    if raw_conv_layers is not None:
+        if not isinstance(raw_conv_layers, (list, tuple)):
+            raise ValueError(
+                f"DFLASH conv_layers must be a list of layer indices, got {raw_conv_layers!r}."
+            )
+        conv_layers = [
+            _parse_optional_int(v, field_name="DFLASH conv_layers entry", min_value=0)
+            for v in raw_conv_layers
+        ]
+        if num_hidden_layers is not None:
+            outside = [v for v in conv_layers if v >= num_hidden_layers]
+            if outside:
+                raise ValueError(
+                    f"DFLASH conv_layers names layers outside 0..{num_hidden_layers - 1}: {outside}."
+                )
+
     if conv_type and block_route_rank:
         raise ValueError(
             "DFLASH checkpoint declares both a grouped convolution and a block route "
@@ -568,6 +590,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         conv_type=conv_type,
         conv_kernel_size=conv_kernel_size,
         conv_group_size=conv_group_size,
+        conv_layers=conv_layers,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,

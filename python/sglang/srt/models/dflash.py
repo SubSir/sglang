@@ -446,7 +446,10 @@ class DFlashDecoderLayer(nn.Module):
         # Named as the training export names them, so the loader needs no remapping.
         self.attention_conv = None
         self.mlp_conv = None
-        if draft_config.conv_type == "grouped_dynamic_depthwise":
+        carries_conv = draft_config.conv_type == "grouped_dynamic_depthwise" and (
+            draft_config.conv_layers is None or layer_id in draft_config.conv_layers
+        )
+        if carries_conv:
             self.attention_conv = DFlashGroupedConv(
                 hidden_size, block_size,
                 draft_config.conv_kernel_size, draft_config.conv_group_size,
