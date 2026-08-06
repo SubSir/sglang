@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -41,6 +43,20 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+try:  # radix top-k: ~2x torch.topk on a 150k vocab, one kernel, graph-capturable
+    from flashinfer import top_k as _flashinfer_top_k
+except Exception:  # pragma: no cover - falls back to torch.topk
+    _flashinfer_top_k = None
+
+
+def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Top-k over the last dim of a 2D [N, vocab] tensor, sorted descending so slot 0
+    is the top-1. flashinfer radix kernel when available, else torch.topk."""
+    if _flashinfer_top_k is not None:
+        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    return torch.topk(scores, k, dim=-1)
+
 
 
 def _get_dflash_layer_attention_params(
@@ -687,4 +703,225 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]
+class CandidateSelector(nn.Module):
+    """Direct-edge parallel-scan candidate selector: two bias-free projections plus a
+    [vocab, r] token table turn draft hidden + target-lm-head top-K candidates into a
+    K x K transition lattice. Training ships the table folded, so this side only
+    gathers rows; it is replicated, not vocab-sharded, since candidate_ids are global.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        vocab_size: int,
+        state_rank: int,
+        top_k: int,
+        block_size: int,
+        rms_norm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.state_rank = int(state_rank)
+        self.top_k = int(top_k)
+        self.block_size = int(block_size)
+        self.rms_norm_eps = float(rms_norm_eps)
+        # An edge is scored directly in the two token directions:
+        #
+        #   edge(p -> c) = <A[p] * project(h), B[c]>
+        #
+        # A and B are separate [vocab, r] tables, so the predecessor and the successor
+        # are untied; training folds the 1/sqrt(r) scale into B and ships both tables
+        # materialized, so this side only gathers rows. They are replicated rather than
+        # vocab-sharded because candidate ids are global.
+        self.predecessor_token_table = nn.Parameter(
+            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
+        )
+        self.successor_token_table = nn.Parameter(
+            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
+        )
+        self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
+        # Filled before cuda-graph capture (see the setup method below).
+        self._scan_a: Optional[torch.Tensor] = None
+        self._scan_b: Optional[torch.Tensor] = None
+
+    def alloc_decode_buffers(self, max_bs: int, num_edges: int, device) -> None:
+        """Grow the prefix-scan ping-pong buffers (cap-doubling, no-op if big enough) so
+        the scan never allocates in-graph. Pre-called before capture; also a lazy grow.
+        """
+        edges = max(int(num_edges), 1)
+        cur = self._scan_a
+        if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
+            return
+        bs_cap = max(int(max_bs), cur.shape[0] * 2 if cur is not None else 0)
+        edge_cap = max(edges, cur.shape[1] if cur is not None else 0)
+        self._scan_a = torch.empty(
+            (bs_cap, edge_cap, self.top_k), dtype=torch.long, device=device
+        )
+        self._scan_b = torch.empty_like(self._scan_a)
+
+    def build_lattice(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """candidate_ids/unary_logits: [B, L, K] -> [B, L, previous_K, current_K]:
+
+            score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
+
+        pred is cand[b,e-1]; slot 0's is the verified anchor, broadcast over p so it
+        needs no code path of its own. The 1/sqrt(r) scale is folded into B by the
+        training export, and the hidden is projected without a further rms_norm.
+        """
+        predecessor_table = self.predecessor_token_table
+        keys = self.successor_token_table[candidate_ids]
+        hidden = self.hidden_projection(hidden_states)
+        candidates = predecessor_table[candidate_ids]
+        anchor = predecessor_table[anchor_token_ids]
+        predecessors = torch.cat(
+            [anchor[:, None, None].expand(-1, 1, self.top_k, -1), candidates[:, :-1]],
+            dim=1,
+        )
+        return unary_logits[:, :, None] + torch.einsum(
+            "blpr,blcr->blpc",
+            predecessors * hidden[:, :, None],
+            keys,
+        )
+
+    def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
+        # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
+        # scan over two static ping-pong buffers, then read the path from initial_indices.
+        bs, edges = int(maps.shape[0]), int(maps.shape[1])
+        self.alloc_decode_buffers(bs, edges, maps.device)  # no-op if big enough
+        src, dst = self._scan_a[:bs, :edges], self._scan_b[:bs, :edges]
+        src.copy_(maps)
+        offset = 1
+        while offset < edges:
+            dst.copy_(src)
+            torch.gather(src[:, offset:], -1, src[:, :-offset], out=dst[:, offset:])
+            src, dst = dst, src
+            offset *= 2
+        suffix_indices = src.gather(
+            -1, initial_indices.view(-1, 1, 1).expand(-1, edges, -1)
+        )[:, :, 0]
+        return torch.cat((initial_indices.unsqueeze(1), suffix_indices), dim=1)
+
+    def decode_local(
+        self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
+    ) -> torch.Tensor:
+        """Greedy per-edge argmax + prefix-scan compose, walked from the slot the
+        anchor edge scores highest."""
+        path_indices = self._candidate_indices_from_maps(
+            scores[:, 1:].argmax(dim=-1), scores[:, 0, 0].argmax(dim=-1)
+        )
+        return candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+
+    def sample_path(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Ancestral sample one path (inverse-CDF, one uniform per position; softmax scaled
+        by the per-request temperature so q matches the target). Returns (tokens, q_rows),
+        q_rows the per-position categorical over the K candidates for the verify."""
+        top_k = self.top_k
+        temps = temperatures.view(-1, 1)
+        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
+        initial_indices = (
+            uniforms[:, :1]
+            .ge(initial_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        transition_probs = torch.softmax(
+            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
+        )
+        local_maps = (
+            uniforms[:, 1:, None, None]
+            .ge(transition_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
+        tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+        realized_rows = transition_probs.gather(
+            2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
+        )[:, :, 0]
+        q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
+        return tokens, q_rows
+
+
+
+
+class Qwen3DFlashSelectorModel(DFlashDraftModel):
+    """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        dflash_config = getattr(config, "dflash_config", None) or {}
+        selector_config = dflash_config.get("dflashv2_selector") or {}
+        rank = int(selector_config.get("rank", 0))
+        top_k = int(selector_config.get("top_k", 0))
+        parameterization = str(selector_config.get("parameterization", ""))
+        if parameterization != "direct_ab":
+            raise ValueError(
+                "DFlash selector draft requires dflashv2_selector.parameterization "
+                f"'direct_ab'; got {parameterization!r}."
+            )
+        if rank <= 0 or top_k <= 0:
+            raise ValueError(
+                "DFlash selector draft requires dflash_config.dflashv2_selector with "
+                f"rank>0 and top_k>0; got rank={rank}, top_k={top_k}."
+            )
+        # The selector spans the *proposal* slots, not the block rows: the anchor holds
+        # row 0 as context and proposes nothing. A checkpoint that disagrees is caught
+        # by the slot-count check in the worker's `_propose_selector_block`.
+        self.candidate_selector = CandidateSelector(
+            hidden_size=int(config.hidden_size),
+            vocab_size=int(config.vocab_size),
+            state_rank=rank,
+            top_k=top_k,
+            block_size=int(
+                dflash_config.get("proposal_block_size", self.block_size - 1)
+            ),
+            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
+        )
+        # The target lm_head is attached at load time (embeddings passed per call).
+        self.lm_head: Optional[nn.Module] = None
+
+    def compute_candidates(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-k base candidates via the target lm_head: hidden [N, H] -> global
+        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
+        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
+        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
+        if self.lm_head is None:
+            raise ValueError(
+                "DFlash selector requires the target lm_head to be set on the draft "
+                "model before capture (draft_model.lm_head = target lm_head)."
+            )
+        k = self.candidate_selector.top_k
+        weight = self.lm_head.weight
+        hidden = hidden.to(weight.dtype)
+        if get_tensor_model_parallel_world_size() == 1:
+            org = int(self.lm_head.org_vocab_size)
+            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
+            return ids.long(), vals.float()
+        shard = self.lm_head.shard_indices
+        vals, ids = _radix_topk(
+            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
+        )
+        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+        return torch.gather(gathered_ids, -1, sel).long(), top_vals.float()
+
+
+EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, Qwen3DFlashSelectorModel]
