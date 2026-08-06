@@ -391,6 +391,9 @@ class DFlashDraftConfig:
     block_size: Optional[int]
     block_route_rank: int
     block_route_repeats: int
+    conv_type: str
+    conv_kernel_size: int
+    conv_group_size: int
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -485,6 +488,34 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    # A dflash2 draft replaces the rank-r route with a grouped dynamic depthwise
+    # convolution: one coefficient per channel group per tap, straight from a
+    # projection of the row, rather than a low-rank correction shared by every channel.
+    # The two are alternatives, so a checkpoint carrying one carries no rank for the
+    # other and the loader picks by name rather than by which tensors happen to exist.
+    conv_type = str(dflash_cfg.get("conv_type", "") or "")
+    if conv_type not in ("", "grouped_dynamic_depthwise"):
+        raise ValueError(
+            f"DFLASH conv_type must be grouped_dynamic_depthwise or absent, got {conv_type!r}."
+        )
+    conv_kernel_size = _parse_optional_int(
+        dflash_cfg.get("conv_kernel_size", 2),
+        field_name="DFLASH conv_kernel_size",
+        min_value=1,
+    )
+    conv_group_size = _parse_optional_int(
+        dflash_cfg.get("conv_group_size", 0),
+        field_name="DFLASH conv_group_size",
+        min_value=0,
+    )
+    if conv_type and not conv_group_size:
+        raise ValueError("DFLASH grouped convolution requires conv_group_size.")
+    if conv_type and block_route_rank:
+        raise ValueError(
+            "DFLASH checkpoint declares both a grouped convolution and a block route "
+            f"rank ({block_route_rank}); they are alternatives."
+        )
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -534,6 +565,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         block_size=block_size,
         block_route_rank=block_route_rank,
         block_route_repeats=block_route_repeats,
+        conv_type=conv_type,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,

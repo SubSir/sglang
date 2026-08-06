@@ -325,6 +325,64 @@ class DFlashBlockRoute(nn.Module):
         ).view_as(hidden_states)
 
 
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise K-tap convolution across one DFlash block.
+
+        row_i <- sum_t (base[t] + delta_i[t]) * row_{i-t}
+
+    `base` is a static per-channel kernel; `delta` is predicted for the row by one
+    projection and is shared by every channel of a group, so a hidden of H with group
+    size g carries H/g coefficients per tap instead of H. Both the pre-sublayer and
+    post-sublayer kernels come out of that one projection, which is why `prepare`
+    returns the output half for `finish` to use rather than projecting twice.
+
+    Identity at initialization: the training side sets base[:, 0] to one and zeroes the
+    projection, so an untrained conv passes its input through.
+    """
+
+    def __init__(self, hidden_size: int, block_size: int, taps: int, group_size: int) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide hidden_size={hidden_size}."
+            )
+        self.hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = self.hidden_size // self.group_size
+        # [pre/post, tap, channel], the layout the training export writes.
+        self.base_kernel = nn.Parameter(torch.empty(2, self.taps, self.hidden_size))
+        self.kernel_projection = nn.Linear(
+            self.hidden_size, 2 * self.taps * self.num_groups, bias=False
+        )
+
+    def _convolve(self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int):
+        blocks = hidden_states.view(-1, self.block_size, self.num_groups, self.group_size)
+        delta = delta.reshape(-1, self.block_size, self.taps, self.num_groups, 1)
+        base = self.base_kernel[side].view(1, 1, self.taps, self.num_groups, self.group_size)
+        coefficients = base + delta
+        out = coefficients[:, :, 0] * blocks
+        for tap in range(1, self.taps):
+            # Tap t reads t rows back, zero across the block boundary.
+            shifted = F.pad(blocks[:, :-tap], (0, 0, 0, 0, tap, 0))
+            out = out + coefficients[:, :, tap] * shifted
+        return out.view_as(hidden_states)
+
+    def prepare(self, hidden_states: torch.Tensor):
+        """Convolve a sublayer's input and hand back the kernel for its output."""
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(self, hidden_states: torch.Tensor, coefficients: torch.Tensor):
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
@@ -384,6 +442,20 @@ class DFlashDecoderLayer(nn.Module):
         self.canon_mlp_extra = extra_routes()
         self.canon_mlp_down_extra = extra_routes()
 
+        # A dflash2 draft carries grouped convolutions instead of the rank-r routes.
+        # Named as the training export names them, so the loader needs no remapping.
+        self.attention_conv = None
+        self.mlp_conv = None
+        if draft_config.conv_type == "grouped_dynamic_depthwise":
+            self.attention_conv = DFlashGroupedConv(
+                hidden_size, block_size,
+                draft_config.conv_kernel_size, draft_config.conv_group_size,
+            )
+            self.mlp_conv = DFlashGroupedConv(
+                hidden_size, block_size,
+                draft_config.conv_kernel_size, draft_config.conv_group_size,
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -405,7 +477,10 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         attention_plan = None
-        if self.canon_attention is not None:
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+        elif self.canon_attention is not None:
             attention_plan = self.canon_attention_plan(hidden_states)
             hidden_states = self.canon_attention(hidden_states, attention_plan)
             for route in self.canon_attention_extra:
@@ -416,7 +491,9 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        if attention_plan is not None:
+        if attention_kernel is not None:
+            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+        elif attention_plan is not None:
             attn_out = self.self_attn.canon_output(attn_out, attention_plan)
             for route in self.self_attn.canon_output_extra:
                 attn_out = route(attn_out, attention_plan)
@@ -424,14 +501,19 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_plan = None
-        if self.canon_mlp is not None:
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
+        elif self.canon_mlp is not None:
             mlp_plan = self.canon_mlp_plan(hidden_states)
             hidden_states = self.canon_mlp(hidden_states, mlp_plan)
             for route in self.canon_mlp_extra:
                 hidden_states = route(hidden_states, mlp_plan)
 
         hidden_states = self.mlp(hidden_states)
-        if mlp_plan is not None:
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
+        elif mlp_plan is not None:
             hidden_states = self.canon_mlp_down(hidden_states, mlp_plan)
             for route in self.canon_mlp_down_extra:
                 hidden_states = route(hidden_states, mlp_plan)
