@@ -203,6 +203,8 @@ class _SelectorDraftSampler:
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         tokens = self.selector.decode_local(candidate_ids=candidate_ids, scores=scores)
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -965,21 +967,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         return correct_len.to(torch.int32), bonus.to(torch.int64)
 
-    @staticmethod
-    def _commit_lens_and_out_tokens(
-        *, candidates: torch.Tensor, accept_len: torch.Tensor, bonus: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Shared eager accept tail (the Triton path writes these in-kernel instead):
-        commit_lens = accept_len + 1, and out_tokens = the drafted continuation with
-        the bonus token written at the accept boundary."""
-        bs, block = candidates.shape
-        out_tokens = torch.empty(
-            (bs, block), dtype=torch.int64, device=candidates.device
-        )
-        out_tokens[:, : block - 1].copy_(candidates[:, 1:])
-        out_tokens[:, block - 1].fill_(0)
-        out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
-        return accept_len.to(torch.int32) + 1, out_tokens
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
@@ -1920,9 +1907,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            commit_lens, out_tokens = self._commit_lens_and_out_tokens(
-                candidates=candidates, accept_len=accept_len, bonus=bonus
-            )
+            # Eager accept tail (the Triton path writes these in-kernel instead): the
+            # drafted continuation with the bonus token at the accept boundary.
+            out_tokens = torch.empty_like(candidates, dtype=torch.int64)
+            out_tokens[:, :-1].copy_(candidates[:, 1:])
+            out_tokens[:, -1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            commit_lens = accept_len.to(torch.int32) + 1
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):

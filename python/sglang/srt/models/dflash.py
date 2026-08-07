@@ -58,7 +58,6 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     return torch.topk(scores, k, dim=-1)
 
 
-
 def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
@@ -718,13 +717,11 @@ class CandidateSelector(nn.Module):
         state_rank: int,
         top_k: int,
         block_size: int,
-        rms_norm_eps: float,
     ) -> None:
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
-        self.rms_norm_eps = float(rms_norm_eps)
         # An edge is scored directly in the two token directions:
         #
         #   edge(p -> c) = <A[p] * project(h), B[c]>
@@ -745,14 +742,14 @@ class CandidateSelector(nn.Module):
         self._scan_b: Optional[torch.Tensor] = None
 
     def alloc_decode_buffers(self, max_bs: int, num_edges: int, device) -> None:
-        """Grow the prefix-scan ping-pong buffers (cap-doubling, no-op if big enough) so
-        the scan never allocates in-graph. Pre-called before capture; also a lazy grow.
+        """Grow the prefix-scan ping-pong buffers (no-op if already big enough) so the
+        scan never allocates in-graph. Pre-called before capture; also a lazy grow.
         """
         edges = max(int(num_edges), 1)
         cur = self._scan_a
         if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
             return
-        bs_cap = max(int(max_bs), cur.shape[0] * 2 if cur is not None else 0)
+        bs_cap = max(int(max_bs), cur.shape[0] if cur is not None else 0)
         edge_cap = max(edges, cur.shape[1] if cur is not None else 0)
         self._scan_a = torch.empty(
             (bs_cap, edge_cap, self.top_k), dtype=torch.long, device=device
@@ -856,8 +853,6 @@ class CandidateSelector(nn.Module):
         return tokens, q_rows
 
 
-
-
 class Qwen3DFlashSelectorModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
@@ -889,7 +884,6 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             block_size=int(
                 dflash_config.get("proposal_block_size", self.block_size - 1)
             ),
-            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
         )
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
