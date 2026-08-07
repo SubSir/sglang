@@ -40,6 +40,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
@@ -968,6 +969,35 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _score_edges(
+    *,
+    predecessor_table: torch.Tensor,
+    successor_table: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Two codebook gathers, a scale by the projected hidden, and the K x K contraction.
+
+    Compiled because it is a dozen kernels on tensors small enough that the cost is
+    the kernel count rather than the bytes: at batch 1 the whole edge-scoring step is
+    ~0.02 ms of dispatch. dynamic=True keeps it to one compilation for every batch
+    size, the way the rest of the tree compiles small elementwise chains.
+    """
+    keys = successor_table[candidate_ids]
+    candidates = predecessor_table[candidate_ids]
+    anchor = predecessor_table[anchor_token_ids]
+    predecessors = torch.cat(
+        [anchor[:, None, None].expand(-1, 1, top_k, -1), candidates[:, :-1]], dim=1
+    )
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], keys
+    )
+
+
 class CandidateSelector(nn.Module):
     """Direct-edge parallel-scan candidate selector: two bias-free projections plus a
     [vocab, r] token table turn draft hidden + target-lm-head top-K candidates into a
@@ -1038,19 +1068,14 @@ class CandidateSelector(nn.Module):
         needs no code path of its own. The 1/sqrt(r) scale is folded into B by the
         training export, and the hidden is projected without a further rms_norm.
         """
-        predecessor_table = self.predecessor_token_table
-        keys = self.successor_token_table[candidate_ids]
-        hidden = self.hidden_projection(hidden_states)
-        candidates = predecessor_table[candidate_ids]
-        anchor = predecessor_table[anchor_token_ids]
-        predecessors = torch.cat(
-            [anchor[:, None, None].expand(-1, 1, self.top_k, -1), candidates[:, :-1]],
-            dim=1,
-        )
-        return unary_logits[:, :, None] + torch.einsum(
-            "blpr,blcr->blpc",
-            predecessors * hidden[:, :, None],
-            keys,
+        return _score_edges(
+            predecessor_table=self.predecessor_token_table,
+            successor_table=self.successor_token_table,
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden=self.hidden_projection(hidden_states),
+            anchor_token_ids=anchor_token_ids,
+            top_k=self.top_k,
         )
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
