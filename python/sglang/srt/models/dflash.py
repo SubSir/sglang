@@ -10,6 +10,8 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
@@ -295,6 +297,64 @@ class DFlashMLP(nn.Module):
         return x
 
 
+# Channel tile. 512 divides the 2560 and 4096 hidden sizes DFlash drafts use, and is
+# a multiple of every plausible conv_group_size, so a tile never straddles a group.
+_CONV_BLOCK_H = 512
+
+
+@triton.jit
+def _grouped_conv_kernel(
+    x_ptr,
+    delta_ptr,
+    base_ptr,
+    out_ptr,
+    hidden_size,
+    x_row_stride,
+    delta_row_stride,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    TAPS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """out[r, c] = sum_t (base[t, c] + delta[r, t, c // GROUP_SIZE]) * x[r - t, c]
+
+    One program per (row, channel tile). The taps read backwards inside the row's
+    DFlash block and are zero across its boundary, so a row never sees a position the
+    draft has not proposed. Everything between the load of x and the store of out
+    stays in registers -- the point of the kernel is that the coefficient sum, the
+    shifted operand and the per-tap products never reach HBM.
+    """
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < hidden_size
+    position = row % BLOCK_ROWS  # position inside this row's block
+    groups = offs // GROUP_SIZE
+
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for tap in tl.static_range(TAPS):
+        # position >= tap keeps the tap inside the block; the clamp only keeps the
+        # masked-off address in range.
+        source = tl.maximum(row - tap, 0)
+        x = tl.load(
+            x_ptr + source * x_row_stride + offs,
+            mask=mask & (position >= tap),
+            other=0.0,
+        ).to(tl.float32)
+        base = tl.load(base_ptr + tap * hidden_size + offs, mask=mask, other=0.0)
+        delta = tl.load(
+            delta_ptr + row * delta_row_stride + tap * NUM_GROUPS + groups,
+            mask=mask,
+            other=0.0,
+        )
+        acc += (base.to(tl.float32) + delta.to(tl.float32)) * x
+    tl.store(
+        out_ptr + row * hidden_size + offs,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
@@ -333,19 +393,27 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
-        blocks = hidden_states.view(
-            -1, self.block_size, self.num_groups, self.group_size
+        # The kernel indexes both operands by hand; a layout it does not expect would
+        # read the wrong elements and still return a plausible tensor.
+        assert hidden_states.stride(-1) == 1 and hidden_states.is_contiguous()
+        assert delta.stride(-1) == 1 and delta.stride(-2) == self.num_groups
+        rows = hidden_states.numel() // self.hidden_size
+        out = torch.empty_like(hidden_states)
+        _grouped_conv_kernel[(rows, triton.cdiv(self.hidden_size, _CONV_BLOCK_H))](
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            out,
+            self.hidden_size,
+            hidden_states.stride(-2),
+            delta.stride(-3),
+            GROUP_SIZE=self.group_size,
+            NUM_GROUPS=self.num_groups,
+            BLOCK_ROWS=self.block_size,
+            TAPS=self.taps,
+            BLOCK_H=_CONV_BLOCK_H,
         )
-        delta = delta.reshape(-1, self.block_size, self.taps, self.num_groups, 1)
-        base = self.base_kernel[side].view(
-            1, 1, self.taps, self.num_groups, self.group_size
-        )
-        coefficients = base + delta
-        out = coefficients[:, :, 0] * blocks
-        for tap in range(1, self.taps):
-            shifted = F.pad(blocks[:, :-tap], (0, 0, 0, 0, tap, 0))
-            out = out + coefficients[:, :, tap] * shifted
-        return out.view_as(hidden_states)
+        return out
 
     def prepare(self, hidden_states: torch.Tensor):
         """Convolve a sublayer's input; return it with the kernel for its output."""
