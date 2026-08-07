@@ -502,6 +502,22 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         raise ValueError(
             "DFLASH grouped convolution requires conv_group_size in the draft config."
         )
+    # Training records which layers carry convolutions. This loader wraps every layer
+    # or none; an ablation checkpoint that convolves a subset declares it here, and
+    # without this it would be served with convolutions the checkpoint has no weights
+    # for -- which loads silently and answers with uninitialized memory.
+    conv_layers = dflash_cfg.get("conv_layers")
+    if conv_type and conv_layers is not None:
+        covered = sorted(int(i) for i in conv_layers)
+        if not covered:
+            conv_type = ""
+        elif covered != list(range(len(covered))) or len(covered) != int(
+            getattr(draft_hf_config, "num_hidden_layers", len(covered))
+        ):
+            raise ValueError(
+                "DFLASH serves convolutions on every draft layer or none. This "
+                f"checkpoint declares conv_layers={covered}."
+            )
 
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
