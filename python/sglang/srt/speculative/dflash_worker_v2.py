@@ -5,6 +5,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    accept_sampling,
+)
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -181,28 +184,68 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
 
 
 class _SelectorDraftSampler:
-    """Greedy selector decode folded into the draft cuda graph: the block_size-1 draft
-    tokens go to a static buffer read after replay. Greedy only (like the dflash/dspark
-    in-graph samplers); T>0 sampling stays eager in `_propose_selector_block`.
+    """Selector decode folded into the draft cuda graph, greedy and T>0 alike: the
+    block_size-1 draft tokens go to a static buffer read after replay, and so do the
+    (candidate_ids, q_rows) the lossless T>0 verify needs.
+
+    One captured graph serves both, as in DSpark: it always walks the sampling path and
+    a static greedy_mask selects the argmax per row, so greedy output is unchanged.
+    Unlike DSpark's, the sampling buffers here are K-wide, not vocab-wide (~340 KB at
+    max_bs=256), so there is nothing to gate on free memory.
     """
 
     def __init__(self, *, draft_model, selector, block_size, max_bs, device):
         self.draft_model = draft_model
         self.selector = selector
         self.block_size = int(block_size)
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, selector.top_k
         # Proposed draft tokens: written in-graph, read by the worker after replay.
-        self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        # Sampling inputs staged by the host before replay, outputs read after it.
+        self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
+        self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+        self.uniforms = torch.empty(
+            (max_bs, gamma), dtype=torch.float32, device=device
+        )
+        self.candidate_out = torch.empty(
+            (max_bs, gamma, top_k), dtype=torch.int64, device=device
+        )
+        self.q_out = torch.empty(
+            (max_bs, gamma, top_k), dtype=torch.float32, device=device
+        )
         # Prepared before capture so the in-graph decode neither allocates nor recomputes.
-        selector.alloc_decode_buffers(int(max_bs), self.block_size - 2, device)
+        selector.alloc_decode_buffers(max_bs, self.block_size - 2, device)
+
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+        """Host-side refresh of the static sampling params; must run before the draft
+        graph replay that consumes them."""
+        if sampling_info is None:
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
+            return
+        torch.clamp(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            min=1e-5,
+            out=self.temperatures[:bs],
+        )
+        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
-        tokens = self.selector.decode_local(candidate_ids=candidate_ids, scores=scores)
+        # In-graph philox draw: each replay advances the generator and redraws.
+        tokens, q_rows = self.selector.sample_path(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            uniforms=self.uniforms[:bs].uniform_(),
+            temperatures=self.temperatures[:bs],
+            greedy_mask=self.greedy_mask[:bs],
+        )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+        self.candidate_out[:bs].copy_(candidate_ids)
+        self.q_out[:bs].copy_(q_rows)
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -430,14 +473,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         selector = getattr(self.draft_model, "candidate_selector", None)
         if selector is not None:
-            # Fold the greedy selector decode into the draft cuda graph (T=1 stays eager).
+            # Fold the selector decode into the draft cuda graph, greedy and T>0 alike.
             # compute_candidates needs the target lm_head attached before capture.
             if not torch.is_floating_point(lm_head.weight):
                 return _eager("selector: quantized lm_head")
             self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
                 logger.info(
-                    "DFLASH selector greedy decode folded into the draft cuda graph."
+                    "DFLASH selector decode (greedy + sampling) folded into the "
+                    "draft cuda graph."
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
@@ -944,10 +988,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         ([bs, gamma, K] ids/probs) into a target-vocab draft_probs, then reuse DSpark's
         shared rejection-sampling kernel (which builds target_probs from the request's
         temperature / top-k / top-p)."""
-        from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
-            accept_sampling,
-        )
-
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
@@ -1783,22 +1823,30 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+        selector = getattr(self.draft_model, "candidate_selector", None)
+        if selector is not None:
+            self._selector_sample = None
+            if self._draft_sampler is not None:
+                # Consumed by the in-graph sample; must be staged before the replay.
+                self._draft_sampler.stage_sampling_params(
+                    bs=bs, sampling_info=batch.sampling_info
+                )
+
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        selector = getattr(self.draft_model, "candidate_selector", None)
         folded = self._draft_sampler is not None and draft_out.can_run_graph
-        if selector is not None:
-            self._selector_sample = None
-            # Selector T=1 must go eager to sample q for the lossless rejection verify.
-            if not _is_all_greedy(batch.sampling_info):
-                folded = False
         if folded:
-            # Greedy decode was folded into the draft graph; read its output.
+            # Decode was folded into the draft graph; read its output.
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            if selector is not None and not _is_all_greedy(batch.sampling_info):
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
         elif selector is not None:
             draft_next = self._propose_selector_block(
                 draft_logits_output=draft_logits_output,

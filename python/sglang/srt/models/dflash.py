@@ -1113,10 +1113,15 @@ class CandidateSelector(nn.Module):
         scores: torch.Tensor,
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
+        greedy_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Ancestral sample one path (inverse-CDF, one uniform per position; softmax scaled
         by the per-request temperature so q matches the target). Returns (tokens, q_rows),
-        q_rows the per-position categorical over the K candidates for the verify."""
+        q_rows the per-position categorical over the K candidates for the verify.
+
+        greedy_mask rows take the argmax instead, bit-identical to decode_local: the
+        captured graph is shared by greedy and sampling batches, so the choice has to be
+        a tensor select rather than a Python branch."""
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
         initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
@@ -1135,6 +1140,13 @@ class CandidateSelector(nn.Module):
             .sum(dim=-1)
             .clamp_max(top_k - 1)
         )
+        if greedy_mask is not None:
+            initial_indices = torch.where(
+                greedy_mask, scores[:, 0, 0].argmax(dim=-1), initial_indices
+            )
+            local_maps = torch.where(
+                greedy_mask[:, None, None], scores[:, 1:].argmax(dim=-1), local_maps
+            )
         path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
         tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
         realized_rows = transition_probs.gather(
