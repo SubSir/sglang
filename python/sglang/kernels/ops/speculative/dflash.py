@@ -2,6 +2,86 @@ import torch
 import triton
 import triton.language as tl
 
+CONV_BLOCK_H = 512  # divides every DFlash hidden size and conv_group_size
+
+
+@triton.jit
+def grouped_conv_kernel(
+    x_ptr,
+    delta_ptr,
+    base_ptr,
+    out_ptr,
+    hidden_size,
+    delta_row_stride,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    TAPS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """out[r, c] = sum_t (base[t, c] + delta[r, t, c // GROUP_SIZE]) * x[r - t, c]
+
+    One program per (row, channel tile). `position >= tap` keeps a tap inside the
+    row's DFlash block, so a row never reads a position the draft has not proposed
+    (the clamp only holds the masked-off address in range). Coefficients, shifted
+    operands and per-tap products stay in registers; not spilling them is the point.
+    """
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < hidden_size
+    position = row % BLOCK_ROWS
+    groups = offs // GROUP_SIZE
+
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for tap in tl.static_range(TAPS):
+        x = tl.load(
+            x_ptr + tl.maximum(row - tap, 0) * hidden_size + offs,
+            mask=mask & (position >= tap),
+            other=0.0,
+        )
+        base = tl.load(base_ptr + tap * hidden_size + offs, mask=mask, other=0.0)
+        delta = tl.load(
+            delta_ptr + row * delta_row_stride + tap * NUM_GROUPS + groups,
+            mask=mask,
+            other=0.0,
+        )
+        acc += (base.to(tl.float32) + delta.to(tl.float32)) * x.to(tl.float32)
+    tl.store(out_ptr + row * hidden_size + offs, acc.to(out_ptr.dtype.element_ty),
+             mask=mask)
+
+
+def grouped_conv(
+    *,
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    hidden_size: int,
+    group_size: int,
+    num_groups: int,
+    block_size: int,
+    taps: int,
+) -> torch.Tensor:
+    """Launch grouped_conv_kernel over [rows, hidden_size]."""
+    # The kernel indexes both operands by hand; an unexpected layout reads the wrong
+    # elements and still returns a plausible tensor.
+    assert hidden_states.is_contiguous() and delta.stride(-1) == 1
+    assert delta.stride(-2) == num_groups
+    out = torch.empty_like(hidden_states)
+    rows = hidden_states.numel() // hidden_size
+    grouped_conv_kernel[(rows, triton.cdiv(hidden_size, CONV_BLOCK_H))](
+        hidden_states,
+        delta,
+        base,
+        out,
+        hidden_size,
+        delta.stride(-3),
+        GROUP_SIZE=group_size,
+        NUM_GROUPS=num_groups,
+        BLOCK_ROWS=block_size,
+        TAPS=taps,
+        BLOCK_H=CONV_BLOCK_H,
+    )
+    return out
 
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(
