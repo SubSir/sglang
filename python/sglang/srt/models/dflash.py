@@ -765,14 +765,8 @@ class CandidateSelector(nn.Module):
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
-        # An edge is scored directly in the two token directions:
-        #
-        #   edge(p -> c) = <A[p] * project(h), B[c]>
-        #
-        # A and B are separate [vocab, r] tables, so the predecessor and the successor
-        # are untied; training folds the 1/sqrt(r) scale into B and ships both tables
-        # materialized, so this side only gathers rows. They are replicated rather than
-        # vocab-sharded because candidate ids are global.
+        # Separate tables, so predecessor and successor are untied; training folds
+        # the 1/sqrt(r) scale into B, so this side only gathers rows.
         self.predecessor_token_table = nn.Parameter(
             torch.empty(int(vocab_size), self.state_rank), requires_grad=False
         )
@@ -788,18 +782,13 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """candidate_ids/unary_logits: [B, L, K] -> [B, L, previous_K, current_K]:
+        """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
 
-            score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
-
-        pred is cand[b,e-1]; slot 0's is the verified anchor, broadcast over p so it
-        needs no code path of its own. The 1/sqrt(r) scale is folded into B by the
-        training export, and the hidden is projected without a further rms_norm.
+        pred is cand[b,e-1]; slot 0's is the anchor, broadcast over p so it needs no
+        code path of its own.
         """
-        # Only the batch varies in serving; the block length, the candidate count and
-        # the rank are model constants. Left symbolic, inductor recovers indices with
-        # an integer div and mod per element instead of folding them -- worth 15% of
-        # this step at low concurrency, where the acceptance ceiling is furthest away.
+        # Everything but the batch is a model constant; left symbolic, the index
+        # arithmetic is not folded.
         hidden = self.hidden_projection(hidden_states)
         for tensor in (candidate_ids, unary_logits, hidden):
             torch._dynamo.mark_static(tensor, 1)
