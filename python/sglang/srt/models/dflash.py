@@ -370,7 +370,13 @@ class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
     def __init__(
-        self, config, layer_id: int, draft_config, block_size: int, quant_config=None
+        self,
+        config,
+        layer_id: int,
+        block_size: int,
+        conv_taps: int,
+        conv_group_size: int,
+        quant_config=None,
     ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -385,14 +391,11 @@ class DFlashDecoderLayer(nn.Module):
 
         self.attention_conv = None
         self.mlp_conv = None
-        if draft_config.conv_type:
+        if conv_taps:
 
             def grouped_conv():
                 return DFlashGroupedConv(
-                    hidden_size,
-                    block_size,
-                    draft_config.conv_kernel_size,
-                    draft_config.conv_group_size,
+                    hidden_size, block_size, conv_taps, conv_group_size
                 )
 
             self.attention_conv = grouped_conv()
@@ -462,15 +465,19 @@ class DFlashDraftModel(nn.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
         self.block_size = draft_config.resolve_block_size(default=16)
+        # Zero taps is how a layer is told it carries no convolution; a DFlash
+        # checkpoint declares no conv_type and takes the path it always took.
+        conv_taps = draft_config.conv_kernel_size if draft_config.conv_type else 0
 
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
-                    quant_config=quant_config,
-                    draft_config=draft_config,
                     block_size=self.block_size,
+                    conv_taps=conv_taps,
+                    conv_group_size=draft_config.conv_group_size,
+                    quant_config=quant_config,
                 )
                 for i in range(num_layers)
             ]
