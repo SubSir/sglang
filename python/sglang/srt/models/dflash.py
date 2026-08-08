@@ -823,13 +823,13 @@ class CandidateSelector(nn.Module):
         temperatures: torch.Tensor,
         greedy_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Ancestral sample one path (inverse-CDF, one uniform per position; softmax scaled
-        by the per-request temperature so q matches the target). Returns (tokens, q_rows),
-        q_rows the per-position categorical over the K candidates for the verify.
+        """Ancestral sample one path; returns it with q over the K candidates, which
+        the verify needs.
 
-        greedy_mask rows take the argmax instead, bit-identical to decode_local: the
-        captured graph is shared by greedy and sampling batches, so the choice has to be
-        a tensor select rather than a Python branch."""
+        greedy_mask rows take the argmax instead, as a select rather than a branch:
+        one captured graph serves greedy and sampling batches alike. The mask and
+        the clamped temperature follow DSpark's draft sampler.
+        """
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
         initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
