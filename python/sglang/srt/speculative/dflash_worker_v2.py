@@ -161,15 +161,11 @@ class _DflashDraftSampler:
 
 
 def _is_all_greedy(sampling_info) -> bool:
-    """No sampling_info means greedy (the selector's T=0 fast path)."""
     return sampling_info is None or sampling_info.is_all_greedy
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
-    """compute_candidates -> build_lattice for the draft's prediction hidden states.
-    Returns (candidate_ids, scores). Shared by the folded (_SelectorDraftSampler) and
-    eager (_propose_selector_block) paths. compute_candidates takes [N, H] because the
-    flashinfer radix top-k kernel is 2D, hence the flatten and the view back."""
+    # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
@@ -926,11 +922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         anchor_token_ids: torch.Tensor,
         sampling_info=None,
     ) -> torch.Tensor:
-        """Decode the block_size-1 prediction slots (draft hidden [:, :-1, :], pos0 =
-        anchor) into draft tokens. Greedy rows use decode_local; non-greedy rows use
-        lossless ancestral sampling, stashing (candidate_ids, q_rows) on
-        self._selector_sample for the verify-side rejection.
-        """
+        """The eager fallback for batches the draft graph cannot take."""
         self._selector_sample = None
         draft_model = self.draft_model
         selector = draft_model.candidate_selector
@@ -983,10 +975,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lossless non-greedy verify: scatter the selector's sparse K-candidate q
-        ([bs, gamma, K] ids/probs) into a target-vocab draft_probs, then reuse DSpark's
-        shared rejection-sampling kernel (which builds target_probs from the request's
-        temperature / top-k / top-p)."""
+        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])

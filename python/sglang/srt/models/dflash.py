@@ -52,9 +52,7 @@ except Exception:
 
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Top-k over the last dim of a 2D [N, vocab] tensor, sorted descending so slot 0
-    is the top-1. This is the selector's largest single cost -- it reads the whole
-    logits tensor -- so it takes flashinfer's radix kernel over torch.topk."""
+    # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
     return torch.topk(scores, k, dim=-1)
@@ -300,11 +298,8 @@ class DFlashMLP(nn.Module):
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
                   group_size, taps):
-    """out[r] = sum_t (base[t] + delta[r, t]) * out-of-block-zeroed x[r - t].
-
-    The token axis stays flat: splitting it into (blocks, block_size) puts a symbolic
-    size in the reshape, and the block boundary is a mask over positions instead.
-    """
+    # The token axis stays flat: splitting it into (blocks, block_size) puts a
+    # symbolic size in the reshape. The block boundary is a mask over positions.
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks
@@ -360,7 +355,6 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        """Convolve a sublayer's input; return it with the kernel for its output."""
         coefficients = self.kernel_projection(hidden_states).reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
@@ -723,13 +717,7 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    """Two codebook gathers, a scale by the projected hidden, and the K x K contraction.
-
-    Compiled because it is a dozen kernels on tensors small enough that the cost is
-    the kernel count rather than the bytes: at batch 1 the whole edge-scoring step is
-    ~0.02 ms of dispatch. dynamic=True keeps it to one compilation for every batch
-    size, the way the rest of the tree compiles small elementwise chains.
-    """
+    # A dozen kernels on tensors small enough that the cost is dispatch, not bytes.
     keys = successor_table[candidate_ids]
     candidates = predecessor_table[candidate_ids]
     anchor = predecessor_table[anchor_token_ids]
@@ -743,12 +731,8 @@ def _score_edges(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _compose_maps(maps, initial_indices, edges: int):
-    """Hillis-Steele scan over the edge maps: log-depth composition, then the walk.
-
-    `edges` is the proposal block length, a model constant, so the loop unrolls at
-    trace time and inductor keeps the intermediates itself -- the ping-pong buffers
-    this replaced existed only to keep the eager version from allocating in-graph.
-    """
+    # Hillis-Steele: `edges` is a model constant, so the loop unrolls at trace time
+    # and inductor keeps the intermediates -- nine kernels on 49 KB fold into one.
     src = maps
     offset = 1
     while offset < edges:
@@ -831,9 +815,6 @@ class CandidateSelector(nn.Module):
         )
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
-        """Compose the per-edge K->K maps into prefixes, then read the path from
-        initial_indices. Compiled: the composition is nine kernels on 49 KB, so the
-        cost is dispatch rather than bytes, and folding them is worth ~75% of it."""
         torch._dynamo.mark_static(maps, 1)
         torch._dynamo.mark_static(maps, 2)
         return _compose_maps(maps, initial_indices, int(maps.shape[1]))
@@ -841,8 +822,6 @@ class CandidateSelector(nn.Module):
     def decode_local(
         self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
     ) -> torch.Tensor:
-        """Greedy per-edge argmax + prefix-scan compose, walked from the slot the
-        anchor edge scores highest."""
         path_indices = self._candidate_indices_from_maps(
             scores[:, 1:].argmax(dim=-1), scores[:, 0, 0].argmax(dim=-1)
         )
