@@ -748,8 +748,8 @@ def _compose_maps(maps, initial_indices, edges: int):
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
-    The tables are replicated rather than vocab-sharded because candidate_ids are
-    global.
+    The [vocab, r] tables are replicated on every TP rank rather than sharded like
+    the LM head: candidate ids are gathered globally, so any rank can need any row.
     """
 
     def __init__(
