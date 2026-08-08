@@ -315,11 +315,8 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
-    Each sublayer is wrapped: `prepare` convolves its input, `finish` its output.
-    Both kernels come from one projection of the input, so `prepare` returns the
-    output half for `finish` rather than projecting again. `base` is static per
-    channel; `delta` is shared across a group, so H channels carry H/group_size
-    coefficients per tap.
+    Each sublayer is wrapped: `prepare` convolves its input and returns the kernel
+    for `finish` to convolve its output, both from one projection of the input.
     """
 
     def __init__(
