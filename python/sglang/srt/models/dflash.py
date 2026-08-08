@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -12,7 +13,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import grouped_conv
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -298,6 +298,41 @@ class DFlashMLP(nn.Module):
         return x
 
 
+@functools.lru_cache(maxsize=None)
+def _make_compiled_convolve(block_size, num_groups, group_size, taps):
+    """Build the compiled convolution with its shape constants closed over.
+
+    Passing them as arguments under dynamic=True makes dynamo treat the ints as
+    symbolic too, and inductor then emits a real integer div and mod per element for
+    `arange % block_size` and the group index -- the hand kernel gets both folded to a
+    shift and a mask because they are tl.constexpr. Closing over them keeps the token
+    axis dynamic while these stay compile-time constants.
+    """
+
+    # DFlash blocks are powers of two, so the position within a block is a mask
+    # rather than a remainder. It matters: inductor cannot prove a symbolic divisor
+    # is positive, so `% block_size` becomes nine instructions of sign-corrected
+    # floor-mod per element, against one AND here.
+    assert block_size & (block_size - 1) == 0, f"block_size={block_size} not 2^k"
+    position_mask = block_size - 1
+
+    @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+    def convolve(hidden_states, delta, base):
+        blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+        coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+        out = coefficients[:, 0] * blocks
+        position = (
+            torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            & position_mask
+        )
+        for tap in range(1, taps):
+            shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+            out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+        return out.flatten(-2)
+
+    return convolve
+
+
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
@@ -328,16 +363,16 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
-        return grouped_conv(
-            hidden_states=hidden_states,
-            delta=delta,
-            base=self.base_kernel[side],
-            hidden_size=self.hidden_size,
-            group_size=self.group_size,
-            num_groups=self.num_groups,
-            block_size=self.block_size,
-            taps=self.taps,
+        convolve = _make_compiled_convolve(
+            self.block_size, self.num_groups, self.group_size, self.taps
         )
+        # Before the call, not inside it: once the compiled function is tracing, the
+        # hidden dim is already symbolic, and the group index then costs an integer
+        # div and mod per element -- 3.5% of end-to-end throughput at concurrency 8.
+        torch._dynamo.mark_static(hidden_states, 1)
+        torch._dynamo.mark_static(delta, 1)
+        torch._dynamo.mark_static(delta, 2)
+        return convolve(hidden_states, delta, self.base_kernel[side])
 
     def prepare(self, hidden_states: torch.Tensor):
         """Convolve a sublayer's input; return it with the kernel for its output."""
@@ -791,12 +826,20 @@ class CandidateSelector(nn.Module):
         needs no code path of its own. The 1/sqrt(r) scale is folded into B by the
         training export, and the hidden is projected without a further rms_norm.
         """
+        # Only the batch varies in serving; the block length, the candidate count and
+        # the rank are model constants. Left symbolic, inductor recovers indices with
+        # an integer div and mod per element instead of folding them -- worth 15% of
+        # this step at low concurrency, where the acceptance ceiling is furthest away.
+        hidden = self.hidden_projection(hidden_states)
+        for tensor in (candidate_ids, unary_logits, hidden):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
         return _score_edges(
             predecessor_table=self.predecessor_token_table,
             successor_table=self.successor_token_table,
             candidate_ids=candidate_ids,
             unary_logits=unary_logits,
-            hidden=self.hidden_projection(hidden_states),
+            hidden=hidden,
             anchor_token_ids=anchor_token_ids,
             top_k=self.top_k,
         )
