@@ -315,10 +315,11 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
-    `base` is a static per-channel kernel; `delta` is projected from the row and
-    shared across a group, so H channels carry H/group_size coefficients per tap.
-    One projection yields both the sublayer's input and output kernels, which is why
-    `prepare` hands the second half to `finish` instead of projecting twice.
+    Each sublayer is wrapped: `prepare` convolves its input, `finish` its output.
+    Both kernels come from one projection of the input, so `prepare` returns the
+    output half for `finish` rather than projecting again. `base` is static per
+    channel; `delta` is shared across a group, so H channels carry H/group_size
+    coefficients per tap.
     """
 
     def __init__(
@@ -380,9 +381,6 @@ class DFlashDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
-        # DFlash2 wraps each sublayer in a grouped convolution along the block. The
-        # module names match what training exports, so no weight remapping is needed,
-        # and a DFlash checkpoint leaves both None and takes the path it always took.
         self.attention_conv = None
         self.mlp_conv = None
         if draft_config.conv_type:
