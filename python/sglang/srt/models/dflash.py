@@ -731,8 +731,8 @@ def _score_edges(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _compose_maps(maps, initial_indices, edges: int):
-    # Hillis-Steele: `edges` is a model constant, so the loop unrolls at trace time
-    # and inductor keeps the intermediates -- nine kernels on 49 KB fold into one.
+    # Hillis-Steele. `edges` is a model constant, so the loop unrolls at trace time
+    # and the composition's nine launches fold into one.
     src = maps
     offset = 1
     while offset < edges:
