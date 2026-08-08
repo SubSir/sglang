@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(
     candidates_ptr,
