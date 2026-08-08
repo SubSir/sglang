@@ -369,7 +369,9 @@ class DFlashGroupedConv(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, draft_config, quant_config=None) -> None:
+    def __init__(
+        self, config, layer_id: int, draft_config, block_size: int, quant_config=None
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -388,7 +390,7 @@ class DFlashDecoderLayer(nn.Module):
             def grouped_conv():
                 return DFlashGroupedConv(
                     hidden_size,
-                    draft_config.resolve_block_size(default=16),
+                    block_size,
                     draft_config.conv_kernel_size,
                     draft_config.conv_group_size,
                 )
@@ -459,6 +461,7 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        self.block_size = draft_config.resolve_block_size(default=16)
 
         self.layers = nn.ModuleList(
             [
@@ -467,6 +470,7 @@ class DFlashDraftModel(nn.Module):
                     layer_id=i,
                     quant_config=quant_config,
                     draft_config=draft_config,
+                    block_size=self.block_size,
                 )
                 for i in range(num_layers)
             ]
@@ -491,8 +495,6 @@ class DFlashDraftModel(nn.Module):
             self.num_context_features * hidden_size, hidden_size, bias=False
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-
-        self.block_size = draft_config.resolve_block_size(default=16)
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
