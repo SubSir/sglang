@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -298,39 +297,26 @@ class DFlashMLP(nn.Module):
         return x
 
 
-@functools.lru_cache(maxsize=None)
-def _make_compiled_convolve(block_size, num_groups, group_size, taps):
-    """Build the compiled convolution with its shape constants closed over.
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
+                  group_size, taps):
+    """out[r] = sum_t (base[t] + delta[r, t]) * out-of-block-zeroed x[r - t].
 
-    Passing them as arguments under dynamic=True makes dynamo treat the ints as
-    symbolic too, and inductor then emits a real integer div and mod per element for
-    `arange % block_size` and the group index -- the hand kernel gets both folded to a
-    shift and a mask because they are tl.constexpr. Closing over them keeps the token
-    axis dynamic while these stay compile-time constants.
+    The token axis stays flat: splitting it into (blocks, block_size) puts a symbolic
+    size in the reshape, and the block boundary is a mask over positions instead.
     """
-
-    # DFlash blocks are powers of two, so the position within a block is a mask
-    # rather than a remainder. It matters: inductor cannot prove a symbolic divisor
-    # is positive, so `% block_size` becomes nine instructions of sign-corrected
-    # floor-mod per element, against one AND here.
-    assert block_size & (block_size - 1) == 0, f"block_size={block_size} not 2^k"
-    position_mask = block_size - 1
-
-    @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-    def convolve(hidden_states, delta, base):
-        blocks = hidden_states.unflatten(-1, (num_groups, group_size))
-        coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
-        out = coefficients[:, 0] * blocks
-        position = (
-            torch.arange(hidden_states.shape[0], device=hidden_states.device)
-            & position_mask
-        )
-        for tap in range(1, taps):
-            shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
-            out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
-        return out.flatten(-2)
-
-    return convolve
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    out = coefficients[:, 0] * blocks
+    # & rather than %: inductor cannot prove a symbolic divisor is positive, and
+    # expands the remainder into nine instructions of sign-corrected floor-mod.
+    position = torch.arange(
+        hidden_states.shape[0], device=hidden_states.device
+    ) & (block_size - 1)
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return out.flatten(-2)
 
 
 class DFlashGroupedConv(nn.Module):
@@ -349,6 +335,8 @@ class DFlashGroupedConv(nn.Module):
         if hidden_size % group_size:
             raise ValueError(f"DFLASH conv_group_size={group_size} must divide "
                              f"hidden_size={hidden_size}.")
+        if block_size & (block_size - 1):
+            raise ValueError(f"DFLASH block_size={block_size} must be a power of two.")
         self.hidden_size = int(hidden_size)
         self.block_size = int(block_size)
         self.taps = int(taps)
@@ -360,19 +348,16 @@ class DFlashGroupedConv(nn.Module):
             self.hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
 
-    def _convolve(
-        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
-    ) -> torch.Tensor:
-        convolve = _make_compiled_convolve(
-            self.block_size, self.num_groups, self.group_size, self.taps
-        )
-        # Before the call, not inside it: once the compiled function is tracing, the
-        # hidden dim is already symbolic, and the group index then costs an integer
-        # div and mod per element -- 3.5% of end-to-end throughput at concurrency 8.
+    def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        # Marked here, not inside: by the time the compiled function traces, the dim
+        # is symbolic and the group index costs an integer div and mod per element.
         torch._dynamo.mark_static(hidden_states, 1)
         torch._dynamo.mark_static(delta, 1)
         torch._dynamo.mark_static(delta, 2)
-        return convolve(hidden_states, delta, self.base_kernel[side])
+        return _grouped_conv(
+            hidden_states, delta, self.base_kernel[side],
+            self.block_size, self.num_groups, self.group_size, self.taps,
+        )
 
     def prepare(self, hidden_states: torch.Tensor):
         """Convolve a sublayer's input; return it with the kernel for its output."""
