@@ -772,6 +772,7 @@ class CandidateSelector(nn.Module):
             torch.empty(int(vocab_size), self.state_rank), requires_grad=False
         )
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
+
     def build_lattice(
         self,
         *,
@@ -782,11 +783,10 @@ class CandidateSelector(nn.Module):
     ) -> torch.Tensor:
         """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
 
-        pred is cand[b,e-1]; slot 0's is the anchor, broadcast over p so it needs no
-        code path of its own.
+        pred is cand[b,e-1], and the verified anchor for slot 0.
         """
-        # Everything but the batch is a model constant; left symbolic, the index
-        # arithmetic is not folded.
+        # Everything but the batch is a model constant. Left symbolic, inductor
+        # recovers indices with an integer division per element instead of folding.
         hidden = self.hidden_projection(hidden_states)
         for tensor in (candidate_ids, unary_logits, hidden):
             torch._dynamo.mark_static(tensor, 1)
