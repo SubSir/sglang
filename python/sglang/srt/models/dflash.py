@@ -765,8 +765,8 @@ class CandidateSelector(nn.Module):
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
-        # Separate tables, so predecessor and successor are untied; training folds
-        # the 1/sqrt(r) scale into B, so this side only gathers rows.
+        # Training folds the 1/sqrt(r) scale into B; applying it again here would
+        # scale twice.
         self.predecessor_token_table = nn.Parameter(
             torch.empty(int(vocab_size), self.state_rank), requires_grad=False
         )
