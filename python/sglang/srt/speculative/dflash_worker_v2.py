@@ -213,8 +213,6 @@ class _SelectorDraftSampler:
         self.q_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.float32, device=device
         )
-        # Prepared before capture so the in-graph decode neither allocates nor recomputes.
-        selector.alloc_decode_buffers(max_bs, self.block_size - 2, device)
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
@@ -281,6 +279,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
+        self._draft_probs_buf = None
         self._logged_first_verify = False
 
         bundle = build_draft_tp_worker(
@@ -991,9 +990,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
-        draft_probs = torch.zeros(
-            (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
-        )
+        # The kernel wants a dense q, but the selector's has top_k non-zeros per row:
+        # at bs 64 a fresh [bs, gamma, vocab] float32 is 260 MB zeroed every step to
+        # carry 7168 values. Keep the buffer instead and clear it by writing zeros
+        # back over the same positions once the kernel has read it, which costs
+        # top_k per row rather than the whole vocabulary.
+        buffer = self._draft_probs_buf
+        if (
+            buffer is None
+            or buffer.shape[0] < bs
+            or buffer.shape[1:] != (gamma, vocab)
+        ):
+            buffer = torch.zeros(
+                (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
+            )
+            self._draft_probs_buf = buffer
+        draft_probs = buffer[:bs]
         draft_probs.scatter_(-1, candidate_ids, q_rows.float())
         correct_len, bonus, _ = accept_sampling(
             candidates=candidates,
@@ -1005,6 +1017,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=block,
             cutoff_verify_lens=None,
         )
+        # Clear here, not before the next write: candidate_ids may be a view of a
+        # static buffer the next draft step overwrites, and clearing by then would
+        # zero this step's positions while leaving the previous step's set.
+        draft_probs.scatter_(-1, candidate_ids, torch.zeros_like(q_rows, dtype=torch.float32))
         return correct_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_vocab_parallel_head(

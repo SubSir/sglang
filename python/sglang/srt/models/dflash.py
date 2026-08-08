@@ -756,6 +756,26 @@ def _score_edges(
     )
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _compose_maps(maps, initial_indices, edges: int):
+    """Hillis-Steele scan over the edge maps: log-depth composition, then the walk.
+
+    `edges` is the proposal block length, a model constant, so the loop unrolls at
+    trace time and inductor keeps the intermediates itself -- the ping-pong buffers
+    this replaced existed only to keep the eager version from allocating in-graph.
+    """
+    src = maps
+    offset = 1
+    while offset < edges:
+        src = torch.cat(
+            (src[:, :offset], torch.gather(src[:, offset:], -1, src[:, :-offset])),
+            dim=1,
+        )
+        offset *= 2
+    suffix = src.gather(-1, initial_indices.view(-1, 1, 1).expand(-1, edges, -1))
+    return torch.cat((initial_indices.unsqueeze(1), suffix[:, :, 0]), dim=1)
+
+
 class CandidateSelector(nn.Module):
     """Direct-edge parallel-scan candidate selector: two bias-free projections plus a
     [vocab, r] token table turn draft hidden + target-lm-head top-K candidates into a
@@ -791,25 +811,6 @@ class CandidateSelector(nn.Module):
             torch.empty(int(vocab_size), self.state_rank), requires_grad=False
         )
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
-        # Filled before cuda-graph capture (see the setup method below).
-        self._scan_a: Optional[torch.Tensor] = None
-        self._scan_b: Optional[torch.Tensor] = None
-
-    def alloc_decode_buffers(self, max_bs: int, num_edges: int, device) -> None:
-        """Grow the prefix-scan ping-pong buffers (no-op if already big enough) so the
-        scan never allocates in-graph. Pre-called before capture; also a lazy grow.
-        """
-        edges = max(int(num_edges), 1)
-        cur = self._scan_a
-        if cur is not None and cur.shape[0] >= int(max_bs) and cur.shape[1] >= edges:
-            return
-        bs_cap = max(int(max_bs), cur.shape[0] if cur is not None else 0)
-        edge_cap = max(edges, cur.shape[1] if cur is not None else 0)
-        self._scan_a = torch.empty(
-            (bs_cap, edge_cap, self.top_k), dtype=torch.long, device=device
-        )
-        self._scan_b = torch.empty_like(self._scan_a)
-
     def build_lattice(
         self,
         *,
@@ -845,22 +846,12 @@ class CandidateSelector(nn.Module):
         )
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
-        # Compose the per-edge K->K maps into prefixes with a log-depth (Hillis-Steele)
-        # scan over two static ping-pong buffers, then read the path from initial_indices.
-        bs, edges = int(maps.shape[0]), int(maps.shape[1])
-        self.alloc_decode_buffers(bs, edges, maps.device)  # no-op if big enough
-        src, dst = self._scan_a[:bs, :edges], self._scan_b[:bs, :edges]
-        src.copy_(maps)
-        offset = 1
-        while offset < edges:
-            dst.copy_(src)
-            torch.gather(src[:, offset:], -1, src[:, :-offset], out=dst[:, offset:])
-            src, dst = dst, src
-            offset *= 2
-        suffix_indices = src.gather(
-            -1, initial_indices.view(-1, 1, 1).expand(-1, edges, -1)
-        )[:, :, 0]
-        return torch.cat((initial_indices.unsqueeze(1), suffix_indices), dim=1)
+        """Compose the per-edge K->K maps into prefixes, then read the path from
+        initial_indices. Compiled: the composition is nine kernels on 49 KB, so the
+        cost is dispatch rather than bytes, and folding them is worth ~75% of it."""
+        torch._dynamo.mark_static(maps, 1)
+        torch._dynamo.mark_static(maps, 2)
+        return _compose_maps(maps, initial_indices, int(maps.shape[1]))
 
     def decode_local(
         self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
