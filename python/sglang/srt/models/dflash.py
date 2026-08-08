@@ -462,9 +462,6 @@ class DFlashDraftModel(nn.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
         self.block_size = draft_config.resolve_block_size(default=16)
-        # Zero taps is how a layer is told it carries no convolution; a DFlash
-        # checkpoint declares no conv_type and takes the path it always took.
-        conv_taps = draft_config.conv_kernel_size if draft_config.conv_type else 0
 
         self.layers = nn.ModuleList(
             [
@@ -472,7 +469,7 @@ class DFlashDraftModel(nn.Module):
                     config=config,
                     layer_id=i,
                     block_size=self.block_size,
-                    conv_taps=conv_taps,
+                    conv_taps=draft_config.conv_kernel_size,
                     conv_group_size=draft_config.conv_group_size,
                     quant_config=quant_config,
                 )

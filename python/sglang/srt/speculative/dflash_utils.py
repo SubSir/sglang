@@ -399,7 +399,6 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
-    conv_type: str
     conv_kernel_size: int
     conv_group_size: int
     target_layer_ids: Optional[List[int]]
@@ -481,36 +480,34 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     )
 
     # A DFlash2 draft wraps each sublayer in a grouped dynamic depthwise convolution
-    # along the block. Absent from a DFlash checkpoint, which is served unchanged.
-    conv_type = str(dflash_cfg.get("conv_type", "") or "")
-    if conv_type not in ("", "grouped_dynamic_depthwise"):
-        raise ValueError(
-            "DFLASH conv_type must be grouped_dynamic_depthwise or absent. "
-            f"Got {conv_type!r}."
-        )
+    # along the block; a DFlash checkpoint declares neither field and is served
+    # unchanged. Both or neither, so a checkpoint that declares one and forgets the
+    # other is refused rather than served without the convolution it was trained with.
     conv_kernel_size = _parse_optional_int(
-        dflash_cfg.get("conv_kernel_size", 2),
+        dflash_cfg.get("conv_kernel_size", 0),
         field_name="DFLASH conv_kernel_size",
-        min_value=1,
+        min_value=0,
     )
     conv_group_size = _parse_optional_int(
         dflash_cfg.get("conv_group_size", 0),
         field_name="DFLASH conv_group_size",
         min_value=0,
     )
-    if conv_type and not conv_group_size:
+    if bool(conv_kernel_size) != bool(conv_group_size):
         raise ValueError(
-            "DFLASH grouped convolution requires conv_group_size in the draft config."
+            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size "
+            f"together. Got conv_kernel_size={conv_kernel_size}, "
+            f"conv_group_size={conv_group_size}."
         )
     # Training records which layers carry convolutions. This loader wraps every layer
     # or none; an ablation checkpoint that convolves a subset declares it here, and
     # without this it would be served with convolutions the checkpoint has no weights
     # for -- which loads silently and answers with uninitialized memory.
     conv_layers = dflash_cfg.get("conv_layers")
-    if conv_type and conv_layers is not None:
+    if conv_kernel_size and conv_layers is not None:
         covered = sorted(int(i) for i in conv_layers)
         if not covered:
-            conv_type = ""
+            conv_kernel_size = 0
         elif covered != list(range(len(covered))) or len(covered) != int(
             getattr(draft_hf_config, "num_hidden_layers", len(covered))
         ):
@@ -566,7 +563,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
-        conv_type=conv_type,
         conv_kernel_size=conv_kernel_size,
         conv_group_size=conv_group_size,
         target_layer_ids=parsed_target_layer_ids,
