@@ -368,7 +368,7 @@ class DFlashGroupedConv(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(self, config, layer_id: int, draft_config, quant_config=None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -383,16 +383,14 @@ class DFlashDecoderLayer(nn.Module):
         # DFlash2 wraps each sublayer in a grouped convolution along the block. The
         # module names match what training exports, so no weight remapping is needed,
         # and a DFlash checkpoint leaves both None and takes the path it always took.
-        draft_config = parse_dflash_draft_config(draft_hf_config=config)
         self.attention_conv = None
         self.mlp_conv = None
-        if draft_config.conv_type == "grouped_dynamic_depthwise":
-            block_size = draft_config.resolve_block_size(default=16)
+        if draft_config.conv_type:
 
             def grouped_conv():
                 return DFlashGroupedConv(
                     hidden_size,
-                    block_size,
+                    draft_config.resolve_block_size(default=16),
                     draft_config.conv_kernel_size,
                     draft_config.conv_group_size,
                 )
@@ -462,11 +460,15 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
 
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    draft_config=draft_config,
                 )
                 for i in range(num_layers)
             ]
@@ -476,7 +478,6 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        draft_config = parse_dflash_draft_config(draft_hf_config=config)
         target_num_layers = (
             int(draft_config.num_target_layers)
             if draft_config.num_target_layers is not None
