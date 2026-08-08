@@ -979,11 +979,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
-        # The kernel wants a dense q, but the selector's has top_k non-zeros per row:
-        # at bs 64 a fresh [bs, gamma, vocab] float32 is 260 MB zeroed every step to
-        # carry 7168 values. Keep the buffer instead and clear it by writing zeros
-        # back over the same positions once the kernel has read it, which costs
-        # top_k per row rather than the whole vocabulary.
+        # The kernel wants a dense q; the selector's has top_k non-zeros per row, so
+        # the buffer is kept and cleared by writing zeros back over those positions.
         buffer = self._draft_probs_buf
         if (
             buffer is None
@@ -1006,9 +1003,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=block,
             cutoff_verify_lens=None,
         )
-        # Clear here, not before the next write: candidate_ids may be a view of a
-        # static buffer the next draft step overwrites, and clearing by then would
-        # zero this step's positions while leaving the previous step's set.
+        # Here, not before the next write: candidate_ids may be a view of a buffer
+        # the next draft step overwrites.
         draft_probs.scatter_(-1, candidate_ids, torch.zeros_like(q_rows, dtype=torch.float32))
         return correct_len.to(torch.int32), bonus.to(torch.int64)
 

@@ -303,8 +303,6 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks
-    # & rather than %: inductor cannot prove a symbolic divisor is positive, and
-    # expands the remainder into nine instructions of sign-corrected floor-mod.
     position = torch.arange(
         hidden_states.shape[0], device=hidden_states.device
     ) & (block_size - 1)
