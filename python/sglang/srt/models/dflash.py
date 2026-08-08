@@ -746,10 +746,10 @@ def _compose_maps(maps, initial_indices, edges: int):
 
 
 class CandidateSelector(nn.Module):
-    """Direct-edge parallel-scan candidate selector: two bias-free projections plus a
-    [vocab, r] token table turn draft hidden + target-lm-head top-K candidates into a
-    K x K transition lattice. Training ships the table folded, so this side only
-    gathers rows; it is replicated, not vocab-sharded, since candidate_ids are global.
+    """Scores the K x K transitions between adjacent proposal slots, then walks them.
+
+    The tables are replicated rather than vocab-sharded because candidate_ids are
+    global.
     """
 
     def __init__(
