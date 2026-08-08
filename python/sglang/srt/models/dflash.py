@@ -706,6 +706,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
+# Compiled: a dozen small elementwise steps, so the launches cost more than the reads.
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _score_edges(
     *,
@@ -717,7 +718,6 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    # A dozen kernels on tensors small enough that the cost is dispatch, not bytes.
     keys = successor_table[candidate_ids]
     candidates = predecessor_table[candidate_ids]
     anchor = predecessor_table[anchor_token_ids]
