@@ -388,7 +388,7 @@ class DFlashDecoderLayer(nn.Module):
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
         def grouped_conv(sublayer):
-            if not conv_taps or sublayer not in conv_sublayers:
+            if sublayer not in conv_sublayers:
                 return None
             return DFlashGroupedConv(
                 hidden_size, block_size, conv_taps, conv_group_size

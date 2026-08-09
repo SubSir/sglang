@@ -521,19 +521,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"Got rank={selector_rank}, top_k={selector_top_k}."
         )
 
-    # One module convolves a sublayer on the way in and on the way out, so a site
-    # names its sublayer; "attention_input" and "attention" are the same entry.
-    conv_sites = dflash_cfg.get("conv_sites")
-    if conv_sites is None:
-        conv_sublayers = _CONV_SUBLAYERS
-    else:
-        conv_sublayers = frozenset(str(site).split("_")[0] for site in conv_sites)
-        if not conv_sublayers <= _CONV_SUBLAYERS:
-            raise ValueError(
-                f"DFLASH convolves {sorted(_CONV_SUBLAYERS)}. This checkpoint "
-                f"declares conv_sites={sorted(conv_sites)}."
-            )
-
     conv_layers = dflash_cfg.get("conv_layers")
     if conv_kernel_size and conv_layers is not None:
         covered = sorted(int(i) for i in conv_layers)
@@ -543,6 +530,21 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             raise ValueError(
                 "DFLASH serves convolutions on every draft layer or none. This "
                 f"checkpoint declares conv_layers={covered}."
+            )
+
+    # One module convolves a sublayer on the way in and on the way out, so a site
+    # names its sublayer; "attention_input" and "attention" are the same entry.
+    conv_sites = dflash_cfg.get("conv_sites")
+    if not conv_kernel_size:
+        conv_sublayers = frozenset()
+    elif conv_sites is None:
+        conv_sublayers = _CONV_SUBLAYERS
+    else:
+        conv_sublayers = frozenset(str(site).split("_")[0] for site in conv_sites)
+        if not conv_sublayers <= _CONV_SUBLAYERS:
+            raise ValueError(
+                f"DFLASH convolves {sorted(_CONV_SUBLAYERS)}. This checkpoint "
+                f"declares conv_sites={sorted(conv_sites)}."
             )
 
     layer_ids = dflash_cfg.get(
