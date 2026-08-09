@@ -895,11 +895,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
         per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
         identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
-        if self.lm_head is None:
-            raise ValueError(
-                "DFlash selector requires the target lm_head to be set on the draft "
-                "model before capture (draft_model.lm_head = target lm_head)."
-            )
+        assert self.lm_head is not None, "draft_model.lm_head unset before capture"
         k = self.candidate_selector.top_k
         weight = self.lm_head.weight
         hidden = hidden.to(weight.dtype)
