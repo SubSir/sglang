@@ -403,7 +403,6 @@ class DFlashDraftConfig:
     conv_group_size: int
     selector_rank: int
     selector_top_k: int
-    proposal_block_size: Optional[int]
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -506,16 +505,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     # or none; an ablation checkpoint that convolves a subset declares it here, and
     # without this it would be served with convolutions the checkpoint has no weights
     # for -- which loads silently and answers with uninitialized memory.
-    # A DFlash2 draft also carries the candidate selector. The parameterization names
-    # the edge scoring the tables were trained for, so a checkpoint with another one is
-    # refused rather than scored with this one's math.
+    # A DFlash2 draft also carries the candidate selector.
     selector_cfg = dflash_cfg.get("dflashv2_selector") or {}
-    parameterization = str(selector_cfg.get("parameterization", ""))
-    if selector_cfg and parameterization != "direct_ab":
-        raise ValueError(
-            "DFLASH selector parameterization must be direct_ab. "
-            f"Got {parameterization!r}."
-        )
     selector_rank = _parse_optional_int(
         selector_cfg.get("rank", 0), field_name="DFLASH selector rank", min_value=0
     )
@@ -527,11 +518,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             "DFLASH selector needs rank>0 and top_k>0. "
             f"Got rank={selector_rank}, top_k={selector_top_k}."
         )
-    proposal_block_size = _parse_optional_int(
-        dflash_cfg.get("proposal_block_size"),
-        field_name="DFLASH proposal_block_size",
-        min_value=1,
-    )
 
     conv_layers = dflash_cfg.get("conv_layers")
     if conv_kernel_size and conv_layers is not None:
@@ -597,7 +583,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         conv_group_size=conv_group_size,
         selector_rank=selector_rank,
         selector_top_k=selector_top_k,
-        proposal_block_size=proposal_block_size,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,

@@ -883,7 +883,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             vocab_size=int(config.vocab_size),
             state_rank=draft_config.selector_rank,
             top_k=draft_config.selector_top_k,
-            block_size=draft_config.proposal_block_size or self.block_size - 1,
+            block_size=self.block_size - 1,
         )
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
