@@ -450,6 +450,9 @@ class DFlashDraftConfig:
         return resolved
 
 
+_CONV_SUBLAYERS = {"attention", "ffn"}
+
+
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
@@ -499,18 +502,33 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         )
     # Every layer or none. A checkpoint that convolves a subset would otherwise be
     # served with convolutions it has no weights for, on uninitialized memory.
+    # The trainer exports these flat; the sglang conversion nests them.
     selector_cfg = dflash_cfg.get("dflashv2_selector") or {}
     selector_rank = _parse_optional_int(
-        selector_cfg.get("rank", 0), field_name="DFLASH selector rank", min_value=0
+        selector_cfg.get("rank", dflash_cfg.get("selector_rank", 0)),
+        field_name="DFLASH selector rank",
+        min_value=0,
     )
     selector_top_k = _parse_optional_int(
-        selector_cfg.get("top_k", 0), field_name="DFLASH selector top_k", min_value=0
+        selector_cfg.get("top_k", dflash_cfg.get("selector_top_k", 0)),
+        field_name="DFLASH selector top_k",
+        min_value=0,
     )
-    if selector_cfg and not (selector_rank and selector_top_k):
+    if bool(selector_rank) != bool(selector_top_k):
         raise ValueError(
-            "DFLASH selector needs rank>0 and top_k>0. "
+            "DFLASH selector needs rank and top_k together. "
             f"Got rank={selector_rank}, top_k={selector_top_k}."
         )
+
+    # One module convolves a sublayer on the way in and on the way out, so only the
+    # sublayer matters here; "attention_input" and "attention" both name it.
+    conv_sites = dflash_cfg.get("conv_sites")
+    if conv_kernel_size and conv_sites is not None:
+        if {str(site).split("_")[0] for site in conv_sites} != _CONV_SUBLAYERS:
+            raise ValueError(
+                "DFLASH convolves both the attention and the FFN sublayer. This "
+                f"checkpoint declares conv_sites={sorted(conv_sites)}."
+            )
 
     conv_layers = dflash_cfg.get("conv_layers")
     if conv_kernel_size and conv_layers is not None:
