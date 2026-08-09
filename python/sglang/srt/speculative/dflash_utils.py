@@ -401,6 +401,7 @@ class DFlashDraftConfig:
     block_size: Optional[int]
     conv_kernel_size: int
     conv_group_size: int
+    conv_layers: frozenset
     conv_sublayers: frozenset
     selector_rank: int
     selector_top_k: int
@@ -521,16 +522,21 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"Got rank={selector_rank}, top_k={selector_top_k}."
         )
 
-    conv_layers = dflash_cfg.get("conv_layers")
-    if conv_kernel_size and conv_layers is not None:
-        covered = sorted(int(i) for i in conv_layers)
-        if not covered:
-            conv_kernel_size = 0
-        elif covered != list(range(num_hidden_layers or 0)):
+    # Which layers were convolved; absent means every one of them.
+    raw_conv_layers = dflash_cfg.get("conv_layers")
+    if not conv_kernel_size:
+        conv_layers = frozenset()
+    elif raw_conv_layers is None:
+        conv_layers = frozenset(range(num_hidden_layers or 0))
+    else:
+        conv_layers = frozenset(int(i) for i in raw_conv_layers)
+        if not conv_layers <= frozenset(range(num_hidden_layers or 0)):
             raise ValueError(
-                "DFLASH serves convolutions on every draft layer or none. This "
-                f"checkpoint declares conv_layers={covered}."
+                f"DFLASH draft has {num_hidden_layers} layers. This checkpoint "
+                f"declares conv_layers={sorted(conv_layers)}."
             )
+    if not conv_layers:
+        conv_kernel_size = 0
 
     # One module convolves a sublayer on the way in and on the way out, so a site
     # names its sublayer; "attention_input" and "attention" are the same entry.
@@ -596,6 +602,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         block_size=block_size,
         conv_kernel_size=conv_kernel_size,
         conv_group_size=conv_group_size,
+        conv_layers=conv_layers,
         conv_sublayers=conv_sublayers,
         selector_rank=selector_rank,
         selector_top_k=selector_top_k,

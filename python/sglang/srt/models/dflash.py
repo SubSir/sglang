@@ -373,6 +373,7 @@ class DFlashDecoderLayer(nn.Module):
         block_size: int,
         conv_taps: int,
         conv_group_size: int,
+        conv_layers: frozenset,
         conv_sublayers: frozenset,
         quant_config=None,
     ) -> None:
@@ -388,7 +389,7 @@ class DFlashDecoderLayer(nn.Module):
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
         def grouped_conv(sublayer):
-            if sublayer not in conv_sublayers:
+            if layer_id not in conv_layers or sublayer not in conv_sublayers:
                 return None
             return DFlashGroupedConv(
                 hidden_size, block_size, conv_taps, conv_group_size
@@ -472,6 +473,7 @@ class DFlashDraftModel(nn.Module):
                     block_size=self.block_size,
                     conv_taps=draft_config.conv_kernel_size,
                     conv_group_size=draft_config.conv_group_size,
+                    conv_layers=draft_config.conv_layers,
                     conv_sublayers=draft_config.conv_sublayers,
                     quant_config=quant_config,
                 )
