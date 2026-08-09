@@ -370,11 +370,8 @@ class DFlashDecoderLayer(nn.Module):
         self,
         config,
         layer_id: int,
-        block_size: int,
-        conv_taps: int,
-        conv_group_size: int,
-        conv_layers: frozenset,
-        conv_sublayers: frozenset,
+        attention_conv: Optional[DFlashGroupedConv] = None,
+        mlp_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
     ) -> None:
         super().__init__()
@@ -388,15 +385,8 @@ class DFlashDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
-        def grouped_conv(sublayer):
-            if layer_id not in conv_layers or sublayer not in conv_sublayers:
-                return None
-            return DFlashGroupedConv(
-                hidden_size, block_size, conv_taps, conv_group_size
-            )
-
-        self.attention_conv = grouped_conv("attention")
-        self.mlp_conv = grouped_conv("ffn")
+        self.attention_conv = attention_conv
+        self.mlp_conv = mlp_conv
 
     def forward(
         self,
@@ -465,16 +455,26 @@ class DFlashDraftModel(nn.Module):
         )
         self.block_size = draft_config.resolve_block_size(default=16)
 
+        def grouped_conv(layer_id: int, sublayer: str):
+            if (
+                layer_id not in draft_config.conv_layers
+                or sublayer not in draft_config.conv_sublayers
+            ):
+                return None
+            return DFlashGroupedConv(
+                hidden_size,
+                self.block_size,
+                draft_config.conv_kernel_size,
+                draft_config.conv_group_size,
+            )
+
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
-                    block_size=self.block_size,
-                    conv_taps=draft_config.conv_kernel_size,
-                    conv_group_size=draft_config.conv_group_size,
-                    conv_layers=draft_config.conv_layers,
-                    conv_sublayers=draft_config.conv_sublayers,
+                    attention_conv=grouped_conv(i, "attention"),
+                    mlp_conv=grouped_conv(i, "ffn"),
                     quant_config=quant_config,
                 )
                 for i in range(num_layers)

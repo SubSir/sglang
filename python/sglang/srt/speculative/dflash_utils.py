@@ -520,13 +520,14 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 
     # Which layers were convolved; absent means every one of them.
     raw_conv_layers = dflash_cfg.get("conv_layers")
+    every_layer = frozenset(range(num_hidden_layers or 0))
     if not conv_kernel_size:
         conv_layers = frozenset()
     elif raw_conv_layers is None:
-        conv_layers = frozenset(range(num_hidden_layers or 0))
+        conv_layers = every_layer
     else:
         conv_layers = frozenset(int(i) for i in raw_conv_layers)
-        if not conv_layers <= frozenset(range(num_hidden_layers or 0)):
+        if not conv_layers <= every_layer:
             raise ValueError(
                 f"DFLASH draft has {num_hidden_layers} layers. This checkpoint "
                 f"declares conv_layers={sorted(conv_layers)}."

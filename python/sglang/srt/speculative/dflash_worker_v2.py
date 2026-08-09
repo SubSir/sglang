@@ -195,12 +195,11 @@ class _SelectorDraftSampler:
     greedy_mask selects the argmax per row.
     """
 
-    def __init__(self, *, draft_model, selector, block_size, max_bs, device):
+    def __init__(self, *, draft_model, block_size, max_bs, device):
         self.draft_model = draft_model
-        self.selector = selector
+        self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
-        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, selector.top_k
-        # Proposed draft tokens: written in-graph, read by the worker after replay.
+        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -485,7 +484,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
-                selector=self.selector,
                 block_size=self.block_size,
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
