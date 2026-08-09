@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -227,7 +228,11 @@ class _SelectorDraftSampler:
             min=1e-5,
             out=self.temperatures[:bs],
         )
-        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
+        self.greedy_mask[:bs].copy_(
+            resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+            )[:bs]
+        )
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
