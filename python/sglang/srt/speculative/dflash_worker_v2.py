@@ -461,13 +461,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
             return _eager("no target lm_head")
+        if not torch.is_floating_point(lm_head.weight):
+            # Quantized lm_head (FP8/INT) would break the static matmul.
+            return _eager("quantized lm_head")
 
         selector = getattr(self.draft_model, "candidate_selector", None)
         if selector is not None:
-            # Fold the selector decode into the draft cuda graph, greedy and T>0 alike.
             # compute_candidates needs the target lm_head attached before capture.
-            if not torch.is_floating_point(lm_head.weight):
-                return _eager("selector: quantized lm_head")
             self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
                 logger.info(
@@ -481,9 +481,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
             )
-        if not torch.is_floating_point(lm_head.weight):
-            # Quantized lm_head (FP8/INT) would break the static matmul.
-            return _eager("quantized lm_head")
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
