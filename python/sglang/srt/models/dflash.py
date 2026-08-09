@@ -460,7 +460,9 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
-        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        draft_config = self.draft_config = parse_dflash_draft_config(
+            draft_hf_config=config
+        )
         self.block_size = draft_config.resolve_block_size(default=16)
 
         self.layers = nn.ModuleList(
@@ -869,32 +871,19 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        dflash_config = getattr(config, "dflash_config", None) or {}
-        selector_config = dflash_config.get("dflashv2_selector") or {}
-        rank = int(selector_config.get("rank", 0))
-        top_k = int(selector_config.get("top_k", 0))
-        parameterization = str(selector_config.get("parameterization", ""))
-        if parameterization != "direct_ab":
+        draft_config = self.draft_config
+        if not draft_config.selector_rank:
             raise ValueError(
-                "DFlash selector draft requires dflashv2_selector.parameterization "
-                f"'direct_ab'; got {parameterization!r}."
-            )
-        if rank <= 0 or top_k <= 0:
-            raise ValueError(
-                "DFlash selector draft requires dflash_config.dflashv2_selector with "
-                f"rank>0 and top_k>0; got rank={rank}, top_k={top_k}."
+                "DFlash selector draft requires dflash_config.dflashv2_selector."
             )
         # The selector spans the *proposal* slots, not the block rows: the anchor holds
-        # row 0 as context and proposes nothing. A checkpoint that disagrees is caught
-        # by the slot-count check in the worker's `_propose_selector_block`.
+        # row 0 as context and proposes nothing.
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
-            state_rank=rank,
-            top_k=top_k,
-            block_size=int(
-                dflash_config.get("proposal_block_size", self.block_size - 1)
-            ),
+            state_rank=draft_config.selector_rank,
+            top_k=draft_config.selector_top_k,
+            block_size=draft_config.proposal_block_size or self.block_size - 1,
         )
         # The target lm_head is attached at load time (embeddings passed per call).
         self.lm_head: Optional[nn.Module] = None
