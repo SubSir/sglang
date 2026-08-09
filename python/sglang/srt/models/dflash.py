@@ -769,12 +769,12 @@ class CandidateSelector(nn.Module):
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.block_size = int(block_size)
-        self.predecessor_token_table = nn.Parameter(
-            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
-        )
-        self.successor_token_table = nn.Parameter(
-            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
-        )
+        # nn.Embedding for the names training exports, and because the use is a
+        # lookup by token id.
+        self.predecessor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
+        self.successor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
+        self.predecessor_codebook.weight.requires_grad_(False)
+        self.successor_codebook.weight.requires_grad_(False)
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
 
     def build_lattice(
@@ -796,8 +796,8 @@ class CandidateSelector(nn.Module):
             torch._dynamo.mark_static(tensor, 1)
             torch._dynamo.mark_static(tensor, 2)
         return _score_edges(
-            predecessor_table=self.predecessor_token_table,
-            successor_table=self.successor_token_table,
+            predecessor_table=self.predecessor_codebook.weight,
+            successor_table=self.successor_codebook.weight,
             candidate_ids=candidate_ids,
             unary_logits=unary_logits,
             hidden=hidden,
@@ -868,7 +868,7 @@ class CandidateSelector(nn.Module):
         return tokens, q_rows
 
 
-class Qwen3DFlashSelectorModel(DFlashDraftModel):
+class DFlashV2DraftModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
@@ -916,4 +916,4 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         return torch.gather(gathered_ids, -1, sel).long(), top_vals.float()
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, Qwen3DFlashSelectorModel]
+EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, DFlashV2DraftModel]
