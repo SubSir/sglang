@@ -298,8 +298,6 @@ class DFlashMLP(nn.Module):
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
                   group_size, taps):
-    # The token axis stays flat: splitting it into (blocks, block_size) puts a
-    # symbolic size in the reshape. The block boundary is a mask over positions.
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks
@@ -767,8 +765,6 @@ class CandidateSelector(nn.Module):
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
-        # nn.Embedding for the names training exports, and because the use is a
-        # lookup by token id.
         self.predecessor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
         self.successor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
         self.predecessor_codebook.weight.requires_grad_(False)
