@@ -180,14 +180,10 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
 
 
 class _SelectorDraftSampler:
-    """Selector decode folded into the draft cuda graph, greedy and T>0 alike: the
-    block_size-1 draft tokens go to a static buffer read after replay, and so do the
-    (candidate_ids, q_rows) the lossless T>0 verify needs.
+    """Selector decode folded into the draft cuda graph, greedy and T>0 alike.
 
-    One captured graph serves both, as in DSpark: it always walks the sampling path and
-    a static greedy_mask selects the argmax per row, so greedy output is unchanged.
-    Unlike DSpark's, the sampling buffers here are K-wide, not vocab-wide (~340 KB at
-    max_bs=256), so there is nothing to gate on free memory.
+    One captured graph serves both: it always walks the sampling path, and a static
+    greedy_mask selects the argmax per row.
     """
 
     def __init__(self, *, draft_model, selector, block_size, max_bs, device):
