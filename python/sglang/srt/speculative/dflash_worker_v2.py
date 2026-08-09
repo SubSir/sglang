@@ -286,6 +286,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        self.selector = getattr(self.draft_model, "candidate_selector", None)
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -465,8 +466,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
 
-        selector = getattr(self.draft_model, "candidate_selector", None)
-        if selector is not None:
+        if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
             self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
@@ -476,7 +476,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
-                selector=selector,
+                selector=self.selector,
                 block_size=self.block_size,
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
@@ -926,8 +926,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        # Block row 0 holds the verified anchor as context and proposes nothing; the
-        # block_size-1 MASK rows each propose the token at their own position.
         pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
         num_pred = pred_hidden.shape[1]
         if num_pred != selector.block_size:
@@ -1817,8 +1815,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        selector = getattr(self.draft_model, "candidate_selector", None)
-        if selector is not None:
+        if self.selector is not None:
             self._selector_sample = None
             if self._draft_sampler is not None:
                 # Consumed by the in-graph sample; must be staged before the replay.
@@ -1836,12 +1833,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
-            if selector is not None and not _is_all_greedy(batch.sampling_info):
+            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
                 )
-        elif selector is not None:
+        elif self.selector is not None:
             draft_next = self._propose_selector_block(
                 draft_logits_output=draft_logits_output,
                 bs=bs,
