@@ -490,7 +490,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 block_size=self.block_size,
-                max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
             )
         tp_group = get_tp_group()
@@ -982,8 +982,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             or buffer.shape[0] < bs
             or buffer.shape[1:] != (gamma, vocab)
         ):
+            cap = bs if buffer is None else max(bs, buffer.shape[0] * 2)
             buffer = torch.zeros(
-                (bs, gamma, vocab), dtype=torch.float32, device=candidates.device
+                (cap, gamma, vocab), dtype=torch.float32, device=candidates.device
             )
             self._draft_probs_buf = buffer
         draft_probs = buffer[:bs]
@@ -1000,7 +1001,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Here, not before the next write: candidate_ids may be a view of a buffer
         # the next draft step overwrites.
-        draft_probs.scatter_(-1, candidate_ids, torch.zeros_like(q_rows, dtype=torch.float32))
+        draft_probs.scatter_(-1, candidate_ids, 0.0)
         return correct_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_vocab_parallel_head(
@@ -1938,6 +1939,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        target_predict = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
