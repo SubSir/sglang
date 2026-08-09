@@ -401,6 +401,7 @@ class DFlashDraftConfig:
     block_size: Optional[int]
     conv_kernel_size: int
     conv_group_size: int
+    conv_sublayers: frozenset
     selector_rank: int
     selector_top_k: int
     target_layer_ids: Optional[List[int]]
@@ -450,7 +451,7 @@ class DFlashDraftConfig:
         return resolved
 
 
-_CONV_SUBLAYERS = {"attention", "ffn"}
+_CONV_SUBLAYERS = frozenset({"attention", "ffn"})
 
 
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
@@ -520,14 +521,17 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"Got rank={selector_rank}, top_k={selector_top_k}."
         )
 
-    # One module convolves a sublayer on the way in and on the way out, so only the
-    # sublayer matters here; "attention_input" and "attention" both name it.
+    # One module convolves a sublayer on the way in and on the way out, so a site
+    # names its sublayer; "attention_input" and "attention" are the same entry.
     conv_sites = dflash_cfg.get("conv_sites")
-    if conv_kernel_size and conv_sites is not None:
-        if {str(site).split("_")[0] for site in conv_sites} != _CONV_SUBLAYERS:
+    if conv_sites is None:
+        conv_sublayers = _CONV_SUBLAYERS
+    else:
+        conv_sublayers = frozenset(str(site).split("_")[0] for site in conv_sites)
+        if not conv_sublayers <= _CONV_SUBLAYERS:
             raise ValueError(
-                "DFLASH convolves both the attention and the FFN sublayer. This "
-                f"checkpoint declares conv_sites={sorted(conv_sites)}."
+                f"DFLASH convolves {sorted(_CONV_SUBLAYERS)}. This checkpoint "
+                f"declares conv_sites={sorted(conv_sites)}."
             )
 
     conv_layers = dflash_cfg.get("conv_layers")
@@ -590,6 +594,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         block_size=block_size,
         conv_kernel_size=conv_kernel_size,
         conv_group_size=conv_group_size,
+        conv_sublayers=conv_sublayers,
         selector_rank=selector_rank,
         selector_top_k=selector_top_k,
         target_layer_ids=parsed_target_layer_ids,

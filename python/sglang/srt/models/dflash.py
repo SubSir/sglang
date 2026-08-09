@@ -373,6 +373,7 @@ class DFlashDecoderLayer(nn.Module):
         block_size: int,
         conv_taps: int,
         conv_group_size: int,
+        conv_sublayers: frozenset,
         quant_config=None,
     ) -> None:
         super().__init__()
@@ -386,17 +387,15 @@ class DFlashDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
-        self.attention_conv = None
-        self.mlp_conv = None
-        if conv_taps:
+        def grouped_conv(sublayer):
+            if not conv_taps or sublayer not in conv_sublayers:
+                return None
+            return DFlashGroupedConv(
+                hidden_size, block_size, conv_taps, conv_group_size
+            )
 
-            def grouped_conv():
-                return DFlashGroupedConv(
-                    hidden_size, block_size, conv_taps, conv_group_size
-                )
-
-            self.attention_conv = grouped_conv()
-            self.mlp_conv = grouped_conv()
+        self.attention_conv = grouped_conv("attention")
+        self.mlp_conv = grouped_conv("ffn")
 
     def forward(
         self,
@@ -473,6 +472,7 @@ class DFlashDraftModel(nn.Module):
                     block_size=self.block_size,
                     conv_taps=draft_config.conv_kernel_size,
                     conv_group_size=draft_config.conv_group_size,
+                    conv_sublayers=draft_config.conv_sublayers,
                     quant_config=quant_config,
                 )
                 for i in range(num_layers)
