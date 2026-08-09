@@ -105,7 +105,6 @@ class _DflashDraftSampler:
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
-        # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
@@ -193,7 +192,8 @@ class _SelectorDraftSampler:
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, selector.top_k
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
-        # Sampling inputs staged by the host before replay, outputs read after it.
+        # Written by the host before replay, or read after it; the addresses are
+        # baked into the captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.empty(
@@ -344,7 +344,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
-        # Selector T>0 proposal (candidate_ids, q_rows); None on greedy / non-selector.
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -939,7 +938,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_model, pred_hidden, anchor_token_ids
         )
         if not _is_all_greedy(sampling_info):
-            # Non-greedy ancestral sampling; one iid uniform per block slot.
             uniforms = torch.rand(
                 bs, num_pred, device=pred_hidden.device, dtype=torch.float32
             )
@@ -970,8 +968,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
-        # The kernel wants a dense q; the selector's has top_k non-zeros per row, so
-        # the buffer is kept and cleared by writing zeros back over those positions.
+        # A fresh dense q would zero the whole vocabulary to carry top_k per row.
         buffer = self._draft_probs_buf
         if (
             buffer is None
@@ -1829,7 +1826,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         folded = self._draft_sampler is not None and draft_out.can_run_graph
         if folded:
-            # Decode was folded into the draft graph; read its output.
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1936,7 +1932,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates = draft_tokens
         new_seq_lens = None
         if self._selector_sample is not None:
-            # Selector T=1: lossless min(1, p/q) prefix accept + residual (p-q)+ bonus.
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
@@ -1946,8 +1941,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            # Eager accept tail (the Triton path writes these in-kernel instead): the
-            # drafted continuation with the bonus token at the accept boundary.
             out_tokens = torch.empty_like(candidates, dtype=torch.int64)
             out_tokens[:, :-1].copy_(candidates[:, 1:])
             out_tokens[:, -1].fill_(0)
