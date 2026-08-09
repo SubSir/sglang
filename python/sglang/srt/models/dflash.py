@@ -876,8 +876,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             raise ValueError(
                 "DFlash selector draft requires dflash_config.dflashv2_selector."
             )
-        # The selector spans the *proposal* slots, not the block rows: the anchor holds
-        # row 0 as context and proposes nothing.
+        # block_size - 1: row 0 holds the anchor, which proposes nothing.
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -885,7 +884,8 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
             top_k=draft_config.selector_top_k,
             block_size=self.block_size - 1,
         )
-        # The target lm_head is attached at load time (embeddings passed per call).
+        # The draft has no head of its own; the worker points this at the target's
+        # before capture.
         self.lm_head: Optional[nn.Module] = None
 
     def compute_candidates(
