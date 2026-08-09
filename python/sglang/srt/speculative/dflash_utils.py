@@ -481,10 +481,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
-    # A DFlash2 draft wraps each sublayer in a grouped dynamic depthwise convolution
-    # along the block; a DFlash checkpoint declares neither field and is served
-    # unchanged. Both or neither, so a checkpoint that declares one and forgets the
-    # other is refused rather than served without the convolution it was trained with.
     conv_kernel_size = _parse_optional_int(
         dflash_cfg.get("conv_kernel_size", 0),
         field_name="DFLASH conv_kernel_size",
@@ -501,11 +497,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"together. Got conv_kernel_size={conv_kernel_size}, "
             f"conv_group_size={conv_group_size}."
         )
-    # Training records which layers carry convolutions. This loader wraps every layer
-    # or none; an ablation checkpoint that convolves a subset declares it here, and
-    # without this it would be served with convolutions the checkpoint has no weights
-    # for -- which loads silently and answers with uninitialized memory.
-    # A DFlash2 draft also carries the candidate selector.
+    # Every layer or none. A checkpoint that convolves a subset would otherwise be
+    # served with convolutions it has no weights for, on uninitialized memory.
     selector_cfg = dflash_cfg.get("dflashv2_selector") or {}
     selector_rank = _parse_optional_int(
         selector_cfg.get("rank", 0), field_name="DFLASH selector rank", min_value=0
