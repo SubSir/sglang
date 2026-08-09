@@ -517,9 +517,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         covered = sorted(int(i) for i in conv_layers)
         if not covered:
             conv_kernel_size = 0
-        elif covered != list(range(len(covered))) or len(covered) != int(
-            getattr(draft_hf_config, "num_hidden_layers", len(covered))
-        ):
+        elif covered != list(range(num_hidden_layers or 0)):
             raise ValueError(
                 "DFLASH serves convolutions on every draft layer or none. This "
                 f"checkpoint declares conv_layers={covered}."
