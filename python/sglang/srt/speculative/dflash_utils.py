@@ -502,15 +502,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"together. Got conv_kernel_size={conv_kernel_size}, "
             f"conv_group_size={conv_group_size}."
         )
-    # The trainer exports these flat; the sglang conversion nests them.
-    selector_cfg = dflash_cfg.get("dflashv2_selector") or {}
     selector_rank = _parse_optional_int(
-        selector_cfg.get("rank", dflash_cfg.get("selector_rank", 0)),
+        dflash_cfg.get("selector_rank", 0),
         field_name="DFLASH selector rank",
         min_value=0,
     )
     selector_top_k = _parse_optional_int(
-        selector_cfg.get("top_k", dflash_cfg.get("selector_top_k", 0)),
+        dflash_cfg.get("selector_top_k", 0),
         field_name="DFLASH selector top_k",
         min_value=0,
     )

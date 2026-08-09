@@ -876,7 +876,7 @@ class Qwen3DFlashSelectorModel(DFlashDraftModel):
         draft_config = self.draft_config
         if not draft_config.selector_rank:
             raise ValueError(
-                "DFlash selector draft requires dflash_config.dflashv2_selector."
+                "DFlash selector draft requires dflash_config.selector_rank."
             )
         # block_size - 1: row 0 holds the anchor, which proposes nothing.
         self.candidate_selector = CandidateSelector(
