@@ -763,12 +763,10 @@ class CandidateSelector(nn.Module):
         vocab_size: int,
         state_rank: int,
         top_k: int,
-        block_size: int,
     ) -> None:
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
-        self.block_size = int(block_size)
         # nn.Embedding for the names training exports, and because the use is a
         # lookup by token id.
         self.predecessor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
@@ -878,13 +876,11 @@ class DFlashV2DraftModel(DFlashDraftModel):
             raise ValueError(
                 "DFlash selector draft requires dflash_config.selector_rank."
             )
-        # block_size - 1: row 0 holds the anchor, which proposes nothing.
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
             state_rank=draft_config.selector_rank,
             top_k=draft_config.selector_top_k,
-            block_size=self.block_size - 1,
         )
         # The draft has no head of its own; the worker points this at the target's
         # before capture.

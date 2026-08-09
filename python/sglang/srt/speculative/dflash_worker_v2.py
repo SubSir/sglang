@@ -937,12 +937,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
         pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
         num_pred = pred_hidden.shape[1]
-        if num_pred != selector.block_size:
-            raise ValueError(
-                f"DFLASH selector expects block_size-1={num_pred} prediction slots to "
-                f"equal the selector block_size={selector.block_size}. Launch with "
-                f"--speculative-num-draft-tokens {selector.block_size + 1}."
-            )
 
         candidate_ids, scores = _selector_lattice(
             draft_model, pred_hidden, anchor_token_ids
