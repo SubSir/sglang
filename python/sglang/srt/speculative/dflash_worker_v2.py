@@ -159,6 +159,16 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _commit_accepted(candidates, accept_len, bonus):
+    """The committed block: drafted tokens shifted left, the bonus at the accept
+    boundary. Returns it with the commit lengths."""
+    out_tokens = torch.empty_like(candidates, dtype=torch.int64)
+    out_tokens[:, :-1].copy_(candidates[:, 1:])
+    out_tokens[:, -1].fill_(0)
+    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+    return out_tokens, accept_len.to(torch.int32) + 1
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -1941,11 +1951,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            out_tokens = torch.empty_like(candidates, dtype=torch.int64)
-            out_tokens[:, :-1].copy_(candidates[:, 1:])
-            out_tokens[:, -1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
-            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens, commit_lens = _commit_accepted(
+                candidates, accept_len, bonus
+            )
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -1956,14 +1964,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            out_tokens, commit_lens = _commit_accepted(
+                candidates, accept_len, bonus
             )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
@@ -1997,34 +2000,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         candidates=candidates,
                         target_predict=target_predict,
                     )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    out_tokens, commit_lens = _commit_accepted(
+                        candidates, accept_len, bonus
                     )
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
-                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                out_tokens = torch.empty(
-                    (bs, int(self.block_size)), dtype=torch.int64, device=device
-                )
-                if int(self.block_size) > 1:
-                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-                out_tokens[:, int(self.block_size) - 1].fill_(0)
-                out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                out_tokens, commit_lens = _commit_accepted(
+                    candidates, accept_len, bonus
                 )
 
         if SIMULATE_ACC_LEN > 0:
