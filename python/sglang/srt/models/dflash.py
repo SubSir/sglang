@@ -298,10 +298,6 @@ class DFlashMLP(nn.Module):
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
                   group_size, taps):
-    # Only the static last dim is reshaped. Splitting the token axis into
-    # (blocks, block_size) instead makes the index arithmetic symbolic on the one
-    # axis that has to stay dynamic, which mark_static cannot reach: 3x slower at
-    # batch 8, 5x at 64. The block boundary is a mask over positions instead.
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks
