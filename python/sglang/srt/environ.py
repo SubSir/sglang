@@ -935,10 +935,6 @@ class Envs:
 
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
-    # Compose the selector's edge maps with a log-depth scan instead of walking
-    # them. Behind by 20% at block 8 and 8% at block 16, so a longer block should
-    # prefer it; measure before switching.
-    SGLANG_DFLASH_SELECTOR_SCAN = EnvBool(False)
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)

@@ -14,7 +14,6 @@ from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -743,38 +742,6 @@ def _follow_maps(maps, initial_indices, edges: int):
     return torch.stack(path, dim=1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _compose_maps(maps, initial_indices, edges: int):
-    """Hillis-Steele: compose the maps pairwise, then read the path in one gather.
-
-    log2(edges) rounds against edges steps, at 16x the element lookups per round --
-    it composes whole K-entry maps where the walk follows a single index. Measured
-    against it at batch 1 to 64: 20% behind at block 8, 8% at block 16, so the
-    crossover is somewhere past 16 and a longer block should prefer this.
-    Re-measure with dflash2-review/modal_scan_vs_sequential.py before switching.
-
-    No torch.cat: concatenating per round makes inductor test, for every output
-    element, which slice it came from, and that chain grows with the rounds. It
-    cost a third to a half of this function.
-    """
-    src = maps
-    offset = 1
-    while offset < edges:
-        # Built from the Python int, not from a shape: under dynamic=True an arange
-        # over a symbolic length puts the round's indices out of the compiler's reach.
-        source = torch.tensor(
-            [max(i - offset, 0) for i in range(edges)], device=maps.device
-        )
-        keep = torch.tensor(
-            [i >= offset for i in range(edges)], device=maps.device
-        ).view(1, -1, 1)
-        expanded = source.view(1, -1, 1).expand(src.shape[0], -1, src.shape[-1])
-        src = torch.where(keep, torch.gather(src, -1, src.gather(1, expanded)), src)
-        offset *= 2
-    suffix = src.gather(-1, initial_indices.view(-1, 1, 1).expand(-1, edges, -1))
-    return torch.cat((initial_indices.unsqueeze(1), suffix[:, :, 0]), dim=1)
-
-
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
@@ -830,8 +797,7 @@ class CandidateSelector(nn.Module):
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         torch._dynamo.mark_static(maps, 1)
         torch._dynamo.mark_static(maps, 2)
-        walk = _compose_maps if envs.SGLANG_DFLASH_SELECTOR_SCAN.get() else _follow_maps
-        return walk(maps, initial_indices, int(maps.shape[1]))
+        return _follow_maps(maps, initial_indices, int(maps.shape[1]))
 
     def decode_local(
         self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
