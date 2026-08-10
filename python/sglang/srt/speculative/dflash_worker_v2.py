@@ -13,7 +13,10 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
+from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    SoftmaxTemp,
+    accept_sampling,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -124,7 +127,7 @@ class _DflashDraftSampler:
         # kernel, so one captured graph serves both.
         self.can_sample = bool(can_sample)
         self.sampling_active = False
-        self.probs = None
+        self.logits = None
         if self.can_sample:
             self.temperatures = torch.ones(
                 (int(max_bs),), dtype=torch.float32, device=device
@@ -142,8 +145,12 @@ class _DflashDraftSampler:
             # captured, so whichever path the graph records is the only one replay
             # can take. One graph samples for every batch and the greedy mask
             # collapses it back to the argmax.
-            self.probs = torch.empty(
-                (max_tokens, self.num_org), dtype=torch.float32, device=device
+            #
+            # Logits rather than probabilities, in the head's own dtype: the verify
+            # softmaxes them once, when a batch actually samples, the same way
+            # DSpark keeps its corrected logits.
+            self.logits = torch.empty(
+                (max_tokens, self.num_org), dtype=weight.dtype, device=device
             )
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
@@ -202,27 +209,27 @@ class _DflashDraftSampler:
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
-        logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.can_sample:
             gamma = self.block_size - 1
-            probs = self.probs[:n].view(bs, gamma, -1)
-            torch.softmax(
-                logits.view(bs, gamma, -1).float()
-                / self.temperatures[:bs].view(bs, 1, 1),
-                dim=-1,
-                out=probs,
-            )
+            logits = self.logits[:n]
+            torch.matmul(hs, self.weight[: self.num_org].T, out=logits)
+            rows = logits.view(bs, gamma, -1)
             out = self.out[:n].view(bs, gamma)
+            temperatures = self.temperatures[:bs, None]
             for position in range(gamma):
                 # In-graph philox: each replay advances the generator and redraws.
-                # argmax(p / Exp(1)) is Gumbel-max, the rule DSpark's kernel uses;
-                # a greedy row divides by one and lands back on the argmax.
+                # argmax(logits / T - log Exp(1)) is Gumbel-max: the softmax's
+                # denominator is constant along the row and cannot move the argmax,
+                # so the distribution never has to be formed here. A greedy row
+                # subtracts log 1 and lands back on the argmax.
                 noise = self.exp_noise[:bs].exponential_()
                 noise.masked_fill_(self.greedy_mask[:bs, None], 1.0)
-                out[:, position].copy_(probs[:, position].div(noise).argmax(dim=-1))
+                keyed = rows[:, position].float().div_(temperatures)
+                out[:, position].copy_(keyed.sub_(noise.log_()).argmax(dim=-1))
             if self.org_vocab_start:
                 out.add_(self.org_vocab_start)
             return
+        logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
             if self.org_vocab_start:
@@ -1735,9 +1742,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_q = None
         if self._draft_sampler is not None and draft_out.can_run_graph:
             if self._draft_sampler.sampling_active:
-                self._draft_q = self._draft_sampler.probs[
+                self._draft_q = self._draft_sampler.logits[
                     : bs * (int(self.block_size) - 1)
-                ].view(bs, int(self.block_size) - 1, -1)
+                ]
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1836,13 +1843,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._draft_q is not None:
             # The draft drew from its own distribution, so the verify can reject
             # against it: accept with min(1, p/q), resample the rest from (p-q)+.
+            gamma = int(self.block_size) - 1
+            draft_probs = SoftmaxTemp.execute(
+                logits=self._draft_q,
+                temperatures=self._draft_sampler.temperatures[:bs],
+                rows_per_request=gamma,
+            ).view(bs, gamma, -1)
             correct_len, bonus, _ = accept_sampling(
                 candidates=candidates,
                 target_logits=logits_output.next_token_logits,
-                draft_probs=self._draft_q,
+                draft_probs=draft_probs,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
-                gamma=int(self.block_size) - 1,
+                gamma=gamma,
                 verify_num_draft_tokens=int(self.block_size),
                 cutoff_verify_lens=None,
             )
