@@ -13,6 +13,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -49,6 +50,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -80,9 +82,13 @@ def _get_fused_kv_materialize_helper():
 
 
 class _DflashDraftSampler:
-    """Capture-safe greedy argmax over the target LM head, run inside the draft
+    """Capture-safe draft sampling over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
+
+    Greedy batches take the argmax; a batch with any non-greedy request draws by
+    Gumbel-max from the draft's own distribution and keeps that distribution as
+    the q the verify rejects against.
 
     tp=1: plain argmax over the local (full) vocab shard.
     tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
@@ -92,7 +98,15 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+        can_sample=False,
     ):
         self.weight = weight
         self.block_size = int(block_size)
@@ -104,6 +118,33 @@ class _DflashDraftSampler:
         device = weight.device
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        # Sampling: a batch with any non-greedy request draws from the draft's own
+        # distribution instead of its argmax, and keeps that distribution as the q
+        # the verify rejects against. Greedy rows take the argmax through the same
+        # kernel, so one captured graph serves both.
+        self.can_sample = bool(can_sample)
+        self.sampling_active = False
+        self.probs = None
+        if self.can_sample:
+            self.temperatures = torch.ones(
+                (int(max_bs),), dtype=torch.float32, device=device
+            )
+            self.greedy_mask = torch.ones(
+                (int(max_bs),), dtype=torch.bool, device=device
+            )
+            # Gumbel-max keys every vocabulary entry, so the noise is per entry.
+            # One block position at a time, the way DSpark reuses it per step,
+            # rather than one buffer for the whole block.
+            self.exp_noise = torch.empty(
+                (int(max_bs), self.num_org), dtype=torch.float32, device=device
+            )
+            # Allocated here, not on the first sampling batch: the branch below is
+            # captured, so whichever path the graph records is the only one replay
+            # can take. One graph samples for every batch and the greedy mask
+            # collapses it back to the argmax.
+            self.probs = torch.empty(
+                (max_tokens, self.num_org), dtype=torch.float32, device=device
+            )
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
@@ -125,6 +166,33 @@ class _DflashDraftSampler:
                 (1, max_tokens), dtype=torch.int64, device=device
             )
 
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> bool:
+        """Fill the temperature and greedy mask; say whether the batch produces q.
+
+        Called before replay, so the captured graph reads values already staged in
+        its static buffers.
+        """
+        if not self.can_sample:
+            return False
+        self.sampling_active = (
+            sampling_info is not None and not sampling_info.is_all_greedy
+        )
+        if not self.sampling_active:
+            # Still written: the graph reads these buffers whatever the batch is,
+            # and the batch before's values would sample a greedy one.
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
+            return False
+        self.temperatures[:bs].copy_(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32).clamp_min(1e-5)
+        )
+        self.greedy_mask[:bs].copy_(
+            resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=self.out.device
+            )[:bs]
+        )
+        return True
+
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
@@ -135,6 +203,26 @@ class _DflashDraftSampler:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
+        if self.can_sample:
+            gamma = self.block_size - 1
+            probs = self.probs[:n].view(bs, gamma, -1)
+            torch.softmax(
+                logits.view(bs, gamma, -1).float()
+                / self.temperatures[:bs].view(bs, 1, 1),
+                dim=-1,
+                out=probs,
+            )
+            out = self.out[:n].view(bs, gamma)
+            for position in range(gamma):
+                # In-graph philox: each replay advances the generator and redraws.
+                # argmax(p / Exp(1)) is Gumbel-max, the rule DSpark's kernel uses;
+                # a greedy row divides by one and lands back on the argmax.
+                noise = self.exp_noise[:bs].exponential_()
+                noise.masked_fill_(self.greedy_mask[:bs, None], 1.0)
+                out[:, position].copy_(probs[:, position].div(noise).argmax(dim=-1))
+            if self.org_vocab_start:
+                out.add_(self.org_vocab_start)
+            return
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
             if self.org_vocab_start:
@@ -203,6 +291,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
+        self._draft_q = None
         self.draft_model = bundle.draft_model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -398,6 +487,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
                 tp_group.world_size,
             )
+        # Sampling needs the draft's whole distribution as q. Under TP each rank
+        # holds a vocabulary shard, and gathering a dense [tokens, vocab] every
+        # step costs more than the acceptance it buys, so those ranks keep the
+        # argmax draft and the target-only verify.
+        can_sample = tp_group.world_size == 1
+        if self.ps.tp_rank == 0 and not can_sample:
+            logger.info(
+                "DFLASH draft sampling disabled under tp=%d; verify stays target-only.",
+                tp_group.world_size,
+            )
         return _DflashDraftSampler(
             weight=lm_head.weight,
             block_size=self.block_size,
@@ -405,6 +504,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
+            can_sample=can_sample,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1621,11 +1721,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+        if self._draft_sampler is not None:
+            self._draft_sampler.stage_sampling_params(
+                bs=bs, sampling_info=batch.sampling_info
+            )
+
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
+        # q exists only when the folded sampler actually drew this step; the eager
+        # fallback still proposes the argmax, which the target-only verify handles.
+        self._draft_q = None
         if self._draft_sampler is not None and draft_out.can_run_graph:
+            if self._draft_sampler.sampling_active:
+                self._draft_q = self._draft_sampler.probs[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1, -1)
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1721,7 +1833,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Only the greedy branch sets target_predict; the simulated-acceptance
         # override below checks for it.
         target_predict = None
-        if (
+        if self._draft_q is not None:
+            # The draft drew from its own distribution, so the verify can reject
+            # against it: accept with min(1, p/q), resample the rest from (p-q)+.
+            correct_len, bonus, _ = accept_sampling(
+                candidates=candidates,
+                target_logits=logits_output.next_token_logits,
+                draft_probs=self._draft_q,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                gamma=int(self.block_size) - 1,
+                verify_num_draft_tokens=int(self.block_size),
+                cutoff_verify_lens=None,
+            )
+            accept_len = correct_len.to(torch.int32)
+            bonus = bonus.to(torch.int64)
+            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens = torch.empty(
+                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            )
+            if int(self.block_size) > 1:
+                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+        elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
