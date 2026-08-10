@@ -733,10 +733,9 @@ def _score_edges(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _follow_maps(maps, initial_indices, edges: int):
-    # One edge at a time. Composing them with a log-depth scan instead gathers the
-    # whole [bs, edges, K] once per round, against one [bs, K] row per step here, so
-    # it does more work for less depth -- and at the block lengths a DFlash draft
-    # uses it loses: 2x at block 8, 1.5-2x at block 16.
+    # One edge at a time. A log-depth scan composes the K->K maps instead, which is
+    # 48x the element lookups at block 8 to halve the depth from six steps to three
+    # rounds -- a round is not a step. It loses by 2x here.
     index = initial_indices
     path = [index]
     for edge in range(edges):
