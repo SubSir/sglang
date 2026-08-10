@@ -733,7 +733,6 @@ def _score_edges(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _follow_maps(maps, initial_indices, edges: int):
-    """Follow the per-edge maps one at a time from initial_indices."""
     index = initial_indices
     path = [index]
     for edge in range(edges):
