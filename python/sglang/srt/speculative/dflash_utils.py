@@ -401,8 +401,6 @@ class DFlashDraftConfig:
     block_size: Optional[int]
     conv_kernel_size: int
     conv_group_size: int
-    conv_layers: frozenset
-    conv_sublayers: frozenset
     selector_rank: int
     selector_top_k: int
     target_layer_ids: Optional[List[int]]
@@ -450,9 +448,6 @@ class DFlashDraftConfig:
                     f"target_layer_ids[{idx}]={val}, target_num_layers={target_num_layers}."
                 )
         return resolved
-
-
-_CONV_SUBLAYERS = frozenset({"attention", "ffn"})
 
 
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
@@ -518,38 +513,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"Got rank={selector_rank}, top_k={selector_top_k}."
         )
 
-    # Which layers were convolved; absent means every one of them.
-    raw_conv_layers = dflash_cfg.get("conv_layers")
-    every_layer = frozenset(range(num_hidden_layers or 0))
-    if not conv_kernel_size:
-        conv_layers = frozenset()
-    elif raw_conv_layers is None:
-        conv_layers = every_layer
-    else:
-        conv_layers = frozenset(int(i) for i in raw_conv_layers)
-        if not conv_layers <= every_layer:
-            raise ValueError(
-                f"DFLASH draft has {num_hidden_layers} layers. This checkpoint "
-                f"declares conv_layers={sorted(conv_layers)}."
-            )
-    if not conv_layers:
-        conv_kernel_size = 0
-
-    # One module convolves a sublayer on the way in and on the way out, so a site
-    # names its sublayer; "attention_input" and "attention" are the same entry.
-    conv_sites = dflash_cfg.get("conv_sites")
-    if not conv_kernel_size:
-        conv_sublayers = frozenset()
-    elif conv_sites is None:
-        conv_sublayers = _CONV_SUBLAYERS
-    else:
-        conv_sublayers = frozenset(str(site).split("_")[0] for site in conv_sites)
-        if not conv_sublayers <= _CONV_SUBLAYERS:
-            raise ValueError(
-                f"DFLASH convolves {sorted(_CONV_SUBLAYERS)}. This checkpoint "
-                f"declares conv_sites={sorted(conv_sites)}."
-            )
-
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -599,8 +562,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         block_size=block_size,
         conv_kernel_size=conv_kernel_size,
         conv_group_size=conv_group_size,
-        conv_layers=conv_layers,
-        conv_sublayers=conv_sublayers,
         selector_rank=selector_rank,
         selector_top_k=selector_top_k,
         target_layer_ids=parsed_target_layer_ids,

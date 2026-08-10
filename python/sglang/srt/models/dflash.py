@@ -453,11 +453,8 @@ class DFlashDraftModel(nn.Module):
         )
         self.block_size = draft_config.resolve_block_size(default=16)
 
-        def grouped_conv(layer_id: int, sublayer: str):
-            if (
-                layer_id not in draft_config.conv_layers
-                or sublayer not in draft_config.conv_sublayers
-            ):
+        def grouped_conv():
+            if not draft_config.conv_kernel_size:
                 return None
             return DFlashGroupedConv(
                 hidden_size,
@@ -471,8 +468,8 @@ class DFlashDraftModel(nn.Module):
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
-                    attention_conv=grouped_conv(i, "attention"),
-                    mlp_conv=grouped_conv(i, "ffn"),
+                    attention_conv=grouped_conv(),
+                    mlp_conv=grouped_conv(),
                     quant_config=quant_config,
                 )
                 for i in range(num_layers)
