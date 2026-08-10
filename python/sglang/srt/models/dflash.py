@@ -732,19 +732,17 @@ def _score_edges(
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _compose_maps(maps, initial_indices, edges: int):
-    # Hillis-Steele. `edges` is a model constant, so the loop unrolls at trace time
-    # and the composition's nine launches fold into one.
-    src = maps
-    offset = 1
-    while offset < edges:
-        src = torch.cat(
-            (src[:, :offset], torch.gather(src[:, offset:], -1, src[:, :-offset])),
-            dim=1,
-        )
-        offset *= 2
-    suffix = src.gather(-1, initial_indices.view(-1, 1, 1).expand(-1, edges, -1))
-    return torch.cat((initial_indices.unsqueeze(1), suffix[:, :, 0]), dim=1)
+def _follow_maps(maps, initial_indices, edges: int):
+    # One edge at a time. Composing them with a log-depth scan instead gathers the
+    # whole [bs, edges, K] once per round, against one [bs, K] row per step here, so
+    # it does more work for less depth -- and at the block lengths a DFlash draft
+    # uses it loses: 2x at block 8, 1.5-2x at block 16.
+    index = initial_indices
+    path = [index]
+    for edge in range(edges):
+        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
+        path.append(index)
+    return torch.stack(path, dim=1)
 
 
 class CandidateSelector(nn.Module):
@@ -802,7 +800,7 @@ class CandidateSelector(nn.Module):
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
         torch._dynamo.mark_static(maps, 1)
         torch._dynamo.mark_static(maps, 2)
-        return _compose_maps(maps, initial_indices, int(maps.shape[1]))
+        return _follow_maps(maps, initial_indices, int(maps.shape[1]))
 
     def decode_local(
         self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
