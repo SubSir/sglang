@@ -462,7 +462,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
             if self.ps.tp_rank == 0:
-                logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
+                logger.info("DFLASH draft head kept eager (reason=%s).", reason)
             return None
 
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
@@ -489,20 +489,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        if self.ps.tp_rank == 0:
-            logger.info(
-                "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
-                tp_group.world_size,
-            )
         # Sampling needs the draft's whole distribution as q. Under TP each rank
         # holds a vocabulary shard, and gathering a dense [tokens, vocab] every
         # step costs more than the acceptance it buys, so those ranks keep the
         # argmax draft and the target-only verify.
         can_sample = tp_group.world_size == 1
-        if self.ps.tp_rank == 0 and not can_sample:
+        if self.ps.tp_rank == 0:
             logger.info(
-                "DFLASH draft sampling disabled under tp=%d; verify stays target-only.",
+                "DFLASH draft head folded into the draft cuda graph "
+                "(tp=%d, sampling=%s).",
                 tp_group.world_size,
+                can_sample,
             )
         return _DflashDraftSampler(
             weight=lm_head.weight,
