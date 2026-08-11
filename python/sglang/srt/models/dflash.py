@@ -296,14 +296,13 @@ class DFlashMLP(nn.Module):
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
-                  group_size, taps):
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks
-    position = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device
-    ) & (block_size - 1)
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device) & (
+        block_size - 1
+    )
     for tap in range(1, taps):
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
         out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
@@ -322,8 +321,10 @@ class DFlashGroupedConv(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
-            raise ValueError(f"DFLASH conv_group_size={group_size} must divide "
-                             f"hidden_size={hidden_size}.")
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
         if block_size & (block_size - 1):
             raise ValueError(f"DFLASH block_size={block_size} must be a power of two.")
         self.hidden_size = int(hidden_size)
@@ -344,8 +345,13 @@ class DFlashGroupedConv(nn.Module):
         torch._dynamo.mark_static(delta, 1)
         torch._dynamo.mark_static(delta, 2)
         return _grouped_conv(
-            hidden_states, delta, self.base_kernel[side],
-            self.block_size, self.num_groups, self.group_size, self.taps,
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
         )
 
     def prepare(self, hidden_states: torch.Tensor):
@@ -710,15 +716,20 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 # Compiled: a dozen small elementwise steps, so the launches cost more than the reads.
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _score_edges(
-    *,
     predecessor_table: torch.Tensor,
     successor_table: torch.Tensor,
+    projection: torch.Tensor,
     candidate_ids: torch.Tensor,
     unary_logits: torch.Tensor,
-    hidden: torch.Tensor,
+    hidden_states: torch.Tensor,
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
+    """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
+
+    pred is cand[b,e-1], and the verified anchor for slot 0.
+    """
+    hidden = F.linear(hidden_states, projection)
     keys = successor_table[candidate_ids]
     candidates = predecessor_table[candidate_ids]
     anchor = predecessor_table[anchor_token_ids]
@@ -772,24 +783,21 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
-
-        pred is cand[b,e-1], and the verified anchor for slot 0.
-        """
         # Everything but the batch is a model constant. Left symbolic, inductor
-        # recovers indices with an integer division per element instead of folding.
-        hidden = self.hidden_projection(hidden_states)
-        for tensor in (candidate_ids, unary_logits, hidden):
+        # recovers indices with an integer division per element instead of folding,
+        # and the marks only take outside the compiled function.
+        for tensor in (candidate_ids, unary_logits, hidden_states):
             torch._dynamo.mark_static(tensor, 1)
             torch._dynamo.mark_static(tensor, 2)
         return _score_edges(
-            predecessor_table=self.predecessor_codebook.weight,
-            successor_table=self.successor_codebook.weight,
-            candidate_ids=candidate_ids,
-            unary_logits=unary_logits,
-            hidden=hidden,
-            anchor_token_ids=anchor_token_ids,
-            top_k=self.top_k,
+            self.predecessor_codebook.weight,
+            self.successor_codebook.weight,
+            self.hidden_projection.weight,
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            anchor_token_ids,
+            self.top_k,
         )
 
     def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:

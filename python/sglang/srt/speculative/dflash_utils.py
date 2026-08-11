@@ -450,6 +450,22 @@ class DFlashDraftConfig:
         return resolved
 
 
+def _paired_settings(dflash_cfg, first: str, second: str, what: str):
+    """Two settings that only mean anything together; absent is both at zero."""
+    values = tuple(
+        _parse_optional_int(
+            dflash_cfg.get(name, 0), field_name=f"DFLASH {name}", min_value=0
+        )
+        for name in (first, second)
+    )
+    if bool(values[0]) != bool(values[1]):
+        raise ValueError(
+            f"DFLASH {what} needs {first} and {second} together. "
+            f"Got {first}={values[0]}, {second}={values[1]}."
+        )
+    return values
+
+
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
@@ -481,37 +497,12 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
-    conv_kernel_size = _parse_optional_int(
-        dflash_cfg.get("conv_kernel_size", 0),
-        field_name="DFLASH conv_kernel_size",
-        min_value=0,
+    conv_kernel_size, conv_group_size = _paired_settings(
+        dflash_cfg, "conv_kernel_size", "conv_group_size", "grouped convolution"
     )
-    conv_group_size = _parse_optional_int(
-        dflash_cfg.get("conv_group_size", 0),
-        field_name="DFLASH conv_group_size",
-        min_value=0,
+    selector_rank, selector_top_k = _paired_settings(
+        dflash_cfg, "selector_rank", "selector_top_k", "selector"
     )
-    if bool(conv_kernel_size) != bool(conv_group_size):
-        raise ValueError(
-            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size "
-            f"together. Got conv_kernel_size={conv_kernel_size}, "
-            f"conv_group_size={conv_group_size}."
-        )
-    selector_rank = _parse_optional_int(
-        dflash_cfg.get("selector_rank", 0),
-        field_name="DFLASH selector rank",
-        min_value=0,
-    )
-    selector_top_k = _parse_optional_int(
-        dflash_cfg.get("selector_top_k", 0),
-        field_name="DFLASH selector top_k",
-        min_value=0,
-    )
-    if bool(selector_rank) != bool(selector_top_k):
-        raise ValueError(
-            "DFLASH selector needs rank and top_k together. "
-            f"Got rank={selector_rank}, top_k={selector_top_k}."
-        )
 
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
