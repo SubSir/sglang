@@ -619,8 +619,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             )
         if server_args.speculative_algorithm == "DFLASH" and server_args.tp_size != 1:
             # Each rank holds a vocabulary shard, so the proposal distribution
-            # would have to be all-gathered dense every step, which costs more
-            # than the acceptance it buys.
+            # would have to be all-gathered dense every step. The acceptance it
+            # buys was measured at tp=1 and is zero, so there is no size of cost
+            # this pays for -- the gather is simply never implemented.
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling for DFLASH requires "
                 f"--tp-size 1, got {server_args.tp_size}."
