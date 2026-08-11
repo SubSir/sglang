@@ -299,6 +299,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self._draft_q = None
+        self._logged_rejection = False
         self.draft_model = bundle.draft_model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -1840,6 +1841,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._draft_q is not None:
             # The draft drew from its own distribution, so the verify can reject
             # against it: accept with min(1, p/q), resample the rest from (p-q)+.
+            if not self._logged_rejection and self.ps.tp_rank == 0:
+                self._logged_rejection = True
+                logger.info("DFLASH verify rejects against the draft's own q.")
             gamma = int(self.block_size) - 1
             draft_probs = SoftmaxTemp.execute(
                 logits=self._draft_q,
