@@ -1,7 +1,7 @@
 import logging
 import math
 from dataclasses import replace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -84,6 +84,35 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _sampling_param_buffers(max_bs: int, device):
+    """Temperature and greedy mask at fixed addresses the captured graph reads."""
+    return (
+        torch.ones((int(max_bs),), dtype=torch.float32, device=device),
+        torch.ones((int(max_bs),), dtype=torch.bool, device=device),
+    )
+
+
+def _stage_sampling_params(*, bs, sampling_info, temperatures, greedy_mask) -> bool:
+    """Fill them before the replay; says whether the batch samples at all.
+
+    An all-greedy batch is written too, not skipped: the graph reads these
+    whatever the batch is, and the batch before's values would sample it.
+    """
+    if sampling_info is None or sampling_info.is_all_greedy:
+        temperatures[:bs].fill_(1.0)
+        greedy_mask[:bs].fill_(True)
+        return False
+    temperatures[:bs].copy_(
+        sampling_info.temperatures.view(-1)[:bs].to(torch.float32).clamp_min(1e-5)
+    )
+    greedy_mask[:bs].copy_(
+        resolve_greedy_mask(
+            bs=bs, sampling_info=sampling_info, device=greedy_mask.device
+        )[:bs]
+    )
+    return True
+
+
 class _DflashDraftSampler:
     """Capture-safe draft sampling over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -119,7 +148,6 @@ class _DflashDraftSampler:
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
-        # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         # Sampling: a batch with any non-greedy request draws from the draft's own
         # distribution instead of its argmax, and keeps that distribution as the q
@@ -129,11 +157,8 @@ class _DflashDraftSampler:
         self.sampling_active = False
         self.logits = None
         if self.can_sample:
-            self.temperatures = torch.ones(
-                (int(max_bs),), dtype=torch.float32, device=device
-            )
-            self.greedy_mask = torch.ones(
-                (int(max_bs),), dtype=torch.bool, device=device
+            self.temperatures, self.greedy_mask = _sampling_param_buffers(
+                max_bs, device
             )
             # Gumbel-max keys every vocabulary entry, so the noise is per entry.
             # One block position at a time, the way DSpark reuses it per step,
@@ -174,31 +199,15 @@ class _DflashDraftSampler:
             )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> bool:
-        """Fill the temperature and greedy mask; say whether the batch produces q.
-
-        Called before replay, so the captured graph reads values already staged in
-        its static buffers.
-        """
         if not self.can_sample:
             return False
-        self.sampling_active = (
-            sampling_info is not None and not sampling_info.is_all_greedy
+        self.sampling_active = _stage_sampling_params(
+            bs=bs,
+            sampling_info=sampling_info,
+            temperatures=self.temperatures,
+            greedy_mask=self.greedy_mask,
         )
-        if not self.sampling_active:
-            # Still written: the graph reads these buffers whatever the batch is,
-            # and the batch before's values would sample a greedy one.
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            return False
-        self.temperatures[:bs].copy_(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32).clamp_min(1e-5)
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.out.device
-            )[:bs]
-        )
-        return True
+        return self.sampling_active
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -252,6 +261,85 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _commit_accepted(candidates, accept_len, bonus):
+    """The committed block: drafted tokens shifted left, the bonus at the accept
+    boundary. Returns it with the commit lengths."""
+    out_tokens = torch.empty_like(candidates, dtype=torch.int64)
+    out_tokens[:, :-1].copy_(candidates[:, 1:])
+    out_tokens[:, -1].fill_(0)
+    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+    return out_tokens, accept_len.to(torch.int32) + 1
+
+
+def _is_all_greedy(sampling_info) -> bool:
+    return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+    # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
+    bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
+    candidate_ids, unary_logits = draft_model.compute_candidates(
+        pred_hidden.reshape(-1, pred_hidden.shape[-1])
+    )
+    candidate_ids = candidate_ids.view(bs, num_pred, -1)
+    return candidate_ids, draft_model.candidate_selector.build_lattice(
+        candidate_ids=candidate_ids,
+        unary_logits=unary_logits.view(bs, num_pred, -1),
+        hidden_states=pred_hidden,
+        anchor_token_ids=anchor_token_ids,
+    )
+
+
+class _SelectorDraftSampler:
+    """Selector decode folded into the draft cuda graph, greedy and T>0 alike.
+
+    One captured graph serves both: it always walks the sampling path, and a static
+    greedy_mask selects the argmax per row.
+    """
+
+    def __init__(self, *, draft_model, block_size, max_bs, device):
+        self.draft_model = draft_model
+        self.selector = draft_model.candidate_selector
+        self.block_size = int(block_size)
+        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        # Written by the host before replay, or read after it; the addresses are
+        # baked into the captured graph.
+        self.temperatures, self.greedy_mask = _sampling_param_buffers(max_bs, device)
+        self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
+        self.candidate_out = torch.empty(
+            (max_bs, gamma, top_k), dtype=torch.int64, device=device
+        )
+        self.q_out = torch.empty(
+            (max_bs, gamma, top_k), dtype=torch.float32, device=device
+        )
+
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> bool:
+        return _stage_sampling_params(
+            bs=bs,
+            sampling_info=sampling_info,
+            temperatures=self.temperatures,
+            greedy_mask=self.greedy_mask,
+        )
+
+    def __call__(self, hidden_states, input_ids):
+        bs = hidden_states.shape[0] // self.block_size
+        block_ids = input_ids.view(bs, self.block_size)
+        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        # In-graph philox draw: each replay advances the generator and redraws.
+        tokens, q_rows = self.selector.sample_path(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            uniforms=self.uniforms[:bs].uniform_(),
+            temperatures=self.temperatures[:bs],
+            greedy_mask=self.greedy_mask[:bs],
+        )
+        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+        self.candidate_out[:bs].copy_(candidate_ids)
+        self.q_out[:bs].copy_(q_rows)
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -285,6 +373,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
+        self._draft_probs_buf = None
         self._logged_first_verify = False
 
         bundle = build_draft_tp_worker(
@@ -307,6 +396,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             get_spec().speculative_use_rejection_sampling
         )
         self.draft_model = bundle.draft_model
+        self.selector = self.draft_model.candidate_selector
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -364,6 +454,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
@@ -483,6 +574,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not torch.is_floating_point(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
+
+        if self.selector is not None:
+            # compute_candidates needs the target lm_head attached before capture.
+            self.draft_model.lm_head = lm_head
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH selector decode (greedy + sampling) folded into the "
+                    "draft cuda graph."
+                )
+            return _SelectorDraftSampler(
+                draft_model=self.draft_model,
+                block_size=self.block_size,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                device=self.device,
+            )
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -913,6 +1019,88 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
+
+    def _propose_selector_block(
+        self,
+        *,
+        draft_logits_output,
+        bs: int,
+        lm_head,
+        anchor_token_ids: torch.Tensor,
+        sampling_info=None,
+    ) -> torch.Tensor:
+        """The eager fallback for batches the draft graph cannot take."""
+        self._selector_sample = None
+        draft_model = self.draft_model
+        selector = draft_model.candidate_selector
+        if draft_model.lm_head is None:
+            draft_model.lm_head = lm_head
+
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH selector draft returned no hidden states.")
+        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+        pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
+        num_pred = pred_hidden.shape[1]
+
+        candidate_ids, scores = _selector_lattice(
+            draft_model, pred_hidden, anchor_token_ids
+        )
+        if not _is_all_greedy(sampling_info):
+            uniforms = torch.rand(
+                bs, num_pred, device=pred_hidden.device, dtype=torch.float32
+            )
+            # Per-request temperature (clamped like DSpark so greedy rows don't div-by-0).
+            temperatures = sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
+            tokens, q_rows = selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=uniforms,
+                temperatures=temperatures,
+            )
+            self._selector_sample = (candidate_ids, q_rows)
+            return tokens.view(bs, num_pred)
+        tokens = selector.decode_local(candidate_ids=candidate_ids, scores=scores)
+        return tokens.view(bs, num_pred)
+
+    def _selector_sampling_accept(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        q_rows: torch.Tensor,
+        sampling_info,
+        draft_input,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        bs, block = candidates.shape
+        gamma = block - 1
+        vocab = int(next_token_logits.shape[-1])
+        # A fresh dense q would zero the whole vocabulary to carry top_k per row.
+        buffer = self._draft_probs_buf
+        if buffer is None or buffer.shape[0] < bs or buffer.shape[1:] != (gamma, vocab):
+            cap = bs if buffer is None else max(bs, buffer.shape[0] * 2)
+            buffer = torch.zeros(
+                (cap, gamma, vocab), dtype=torch.float32, device=candidates.device
+            )
+            self._draft_probs_buf = buffer
+        draft_probs = buffer[:bs]
+        draft_probs.scatter_(-1, candidate_ids, q_rows.float())
+        correct_len, bonus, _ = accept_sampling(
+            candidates=candidates,
+            target_logits=next_token_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=block,
+            cutoff_verify_lens=None,
+        )
+        # Here, not before the next write: candidate_ids may be a view of a buffer
+        # the next draft step overwrites.
+        draft_probs.scatter_(-1, candidate_ids, 0.0)
+        return correct_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1730,7 +1918,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+        if self.selector is not None:
+            self._selector_sample = None
         if self._draft_sampler is not None:
+            # Consumed by the in-graph sample; must be staged before the replay.
             self._draft_sampler.stage_sampling_params(
                 bs=bs, sampling_info=batch.sampling_info
             )
@@ -1742,14 +1933,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         # q exists only when the folded sampler actually drew this step; the eager
         # fallback still proposes the argmax, which the target-only verify handles.
         self._draft_q = None
-        if self._draft_sampler is not None and draft_out.can_run_graph:
-            if self._draft_sampler.sampling_active:
+        folded = self._draft_sampler is not None and draft_out.can_run_graph
+        if folded:
+            if self.selector is None and self._draft_sampler.sampling_active:
                 self._draft_q = self._draft_sampler.logits[
                     : bs * (int(self.block_size) - 1)
                 ]
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
+        elif self.selector is not None:
+            draft_next = self._propose_selector_block(
+                draft_logits_output=draft_logits_output,
+                bs=bs,
+                lm_head=lm_head,
+                anchor_token_ids=block_ids[:, 0],
+                sampling_info=batch.sampling_info,
+            )
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
@@ -1839,45 +2044,43 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        # Only the greedy branch sets target_predict; the simulated-acceptance
-        # override below checks for it.
         target_predict = None
-        if self._draft_q is not None:
+        if self._selector_sample is not None:
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
+            out_tokens, commit_lens = _commit_accepted(candidates, accept_len, bonus)
+        elif self._draft_q is not None:
             # The draft drew from its own distribution, so the verify can reject
             # against it: accept with min(1, p/q), resample the rest from (p-q)+.
             if not self._logged_rejection and self.ps.tp_rank == 0:
                 self._logged_rejection = True
                 logger.info("DFLASH verify rejects against the draft's own q.")
             gamma = int(self.block_size) - 1
-            draft_probs = SoftmaxTemp.execute(
-                logits=self._draft_q,
-                temperatures=self._draft_sampler.temperatures[:bs],
-                rows_per_request=gamma,
-            ).view(bs, gamma, -1)
             correct_len, bonus, _ = accept_sampling(
                 candidates=candidates,
                 target_logits=logits_output.next_token_logits,
-                draft_probs=draft_probs,
+                draft_probs=SoftmaxTemp.execute(
+                    logits=self._draft_q,
+                    temperatures=self._draft_sampler.temperatures[:bs],
+                    rows_per_request=gamma,
+                ).view(bs, gamma, -1),
                 sampling_info=sampling_info,
                 draft_input=draft_input,
                 gamma=gamma,
                 verify_num_draft_tokens=int(self.block_size),
                 cutoff_verify_lens=None,
             )
-            accept_len = correct_len.to(torch.int32)
-            bonus = bonus.to(torch.int64)
-            commit_lens = accept_len.to(torch.int32) + 1
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
-            )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            accept_len, bonus = correct_len.to(torch.int32), bonus.to(torch.int64)
+            out_tokens, commit_lens = _commit_accepted(candidates, accept_len, bonus)
         elif (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
+            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
@@ -1886,14 +2089,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
-            )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            out_tokens, commit_lens = _commit_accepted(candidates, accept_len, bonus)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
@@ -1927,34 +2123,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         candidates=candidates,
                         target_predict=target_predict,
                     )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    out_tokens, commit_lens = _commit_accepted(
+                        candidates, accept_len, bonus
                     )
             else:
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
-                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                out_tokens = torch.empty(
-                    (bs, int(self.block_size)), dtype=torch.int64, device=device
-                )
-                if int(self.block_size) > 1:
-                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-                out_tokens[:, int(self.block_size) - 1].fill_(0)
-                out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                out_tokens, commit_lens = _commit_accepted(
+                    candidates, accept_len, bonus
                 )
 
         if SIMULATE_ACC_LEN > 0:

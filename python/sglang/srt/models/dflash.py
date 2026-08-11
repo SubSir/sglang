@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -35,12 +37,25 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - the fallback when neither this nor flashinfer applies
+    from flashinfer import top_k as _flashinfer_top_k
+except Exception:
+    _flashinfer_top_k = None
+
+
+def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    # The selector's largest single cost: it reads the whole logits tensor.
+    if _flashinfer_top_k is not None:
+        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    return torch.topk(scores, k, dim=-1)
 
 
 def _get_dflash_layer_attention_params(
@@ -280,10 +295,83 @@ class DFlashMLP(nn.Module):
         return x
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
+                  group_size, taps):
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    out = coefficients[:, 0] * blocks
+    position = torch.arange(
+        hidden_states.shape[0], device=hidden_states.device
+    ) & (block_size - 1)
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return out.flatten(-2)
+
+
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise K-tap convolution across one DFlash block.
+
+    Each sublayer is wrapped: `prepare` convolves its input and returns the kernel
+    for `finish` to convolve its output, both from one projection of the input.
+    """
+
+    def __init__(
+        self, hidden_size: int, block_size: int, taps: int, group_size: int
+    ) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(f"DFLASH conv_group_size={group_size} must divide "
+                             f"hidden_size={hidden_size}.")
+        if block_size & (block_size - 1):
+            raise ValueError(f"DFLASH block_size={block_size} must be a power of two.")
+        self.hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = self.hidden_size // self.group_size
+        # [input/output, tap, channel], the layout training exports.
+        self.base_kernel = nn.Parameter(torch.empty(2, self.taps, self.hidden_size))
+        self.kernel_projection = nn.Linear(
+            self.hidden_size, 2 * self.taps * self.num_groups, bias=False
+        )
+
+    def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        # Marked here, not inside: by the time the compiled function traces, the dim
+        # is symbolic and the group index costs an integer div and mod per element.
+        torch._dynamo.mark_static(hidden_states, 1)
+        torch._dynamo.mark_static(delta, 1)
+        torch._dynamo.mark_static(delta, 2)
+        return _grouped_conv(
+            hidden_states, delta, self.base_kernel[side],
+            self.block_size, self.num_groups, self.group_size, self.taps,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor):
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        attention_conv: Optional[DFlashGroupedConv] = None,
+        mlp_conv: Optional[DFlashGroupedConv] = None,
+        quant_config=None,
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -294,6 +382,9 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+
+        self.attention_conv = attention_conv
+        self.mlp_conv = mlp_conv
 
     def forward(
         self,
@@ -315,13 +406,26 @@ class DFlashDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if attention_kernel is not None:
+            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
@@ -344,11 +448,31 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        draft_config = self.draft_config = parse_dflash_draft_config(
+            draft_hf_config=config
+        )
+        self.block_size = draft_config.resolve_block_size(default=16)
+        # Set by DFlashV2DraftModel; a plain DFlash draft leaves it None.
+        self.candidate_selector: Optional[nn.Module] = None
+
+        def grouped_conv():
+            if not draft_config.conv_kernel_size:
+                return None
+            return DFlashGroupedConv(
+                hidden_size,
+                self.block_size,
+                draft_config.conv_kernel_size,
+                draft_config.conv_group_size,
+            )
 
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    attention_conv=grouped_conv(),
+                    mlp_conv=grouped_conv(),
+                    quant_config=quant_config,
                 )
                 for i in range(num_layers)
             ]
@@ -358,7 +482,6 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        draft_config = parse_dflash_draft_config(draft_hf_config=config)
         target_num_layers = (
             int(draft_config.num_target_layers)
             if draft_config.num_target_layers is not None
@@ -374,8 +497,6 @@ class DFlashDraftModel(nn.Module):
             self.num_context_features * hidden_size, hidden_size, bias=False
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-
-        self.block_size = draft_config.resolve_block_size(default=16)
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -586,4 +707,198 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]
+# Compiled: a dozen small elementwise steps, so the launches cost more than the reads.
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _score_edges(
+    *,
+    predecessor_table: torch.Tensor,
+    successor_table: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    keys = successor_table[candidate_ids]
+    candidates = predecessor_table[candidate_ids]
+    anchor = predecessor_table[anchor_token_ids]
+    predecessors = torch.cat(
+        [anchor[:, None, None].expand(-1, 1, top_k, -1), candidates[:, :-1]], dim=1
+    )
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], keys
+    )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _follow_maps(maps, initial_indices, edges: int):
+    index = initial_indices
+    path = [index]
+    for edge in range(edges):
+        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
+        path.append(index)
+    return torch.stack(path, dim=1)
+
+
+class CandidateSelector(nn.Module):
+    """Scores the K x K transitions between adjacent proposal slots, then walks them.
+
+    The [vocab, r] tables are replicated on every TP rank rather than sharded like
+    the LM head: candidate ids are gathered globally, so any rank can need any row.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        vocab_size: int,
+        state_rank: int,
+        top_k: int,
+    ) -> None:
+        super().__init__()
+        self.state_rank = int(state_rank)
+        self.top_k = int(top_k)
+        self.predecessor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
+        self.successor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
+        self.predecessor_codebook.weight.requires_grad_(False)
+        self.successor_codebook.weight.requires_grad_(False)
+        self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
+
+    def build_lattice(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
+
+        pred is cand[b,e-1], and the verified anchor for slot 0.
+        """
+        # Everything but the batch is a model constant. Left symbolic, inductor
+        # recovers indices with an integer division per element instead of folding.
+        hidden = self.hidden_projection(hidden_states)
+        for tensor in (candidate_ids, unary_logits, hidden):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
+        return _score_edges(
+            predecessor_table=self.predecessor_codebook.weight,
+            successor_table=self.successor_codebook.weight,
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden=hidden,
+            anchor_token_ids=anchor_token_ids,
+            top_k=self.top_k,
+        )
+
+    def _candidate_indices_from_maps(self, maps, initial_indices) -> torch.Tensor:
+        torch._dynamo.mark_static(maps, 1)
+        torch._dynamo.mark_static(maps, 2)
+        return _follow_maps(maps, initial_indices, int(maps.shape[1]))
+
+    def decode_local(
+        self, *, candidate_ids: torch.Tensor, scores: torch.Tensor
+    ) -> torch.Tensor:
+        path_indices = self._candidate_indices_from_maps(
+            scores[:, 1:].argmax(dim=-1), scores[:, 0, 0].argmax(dim=-1)
+        )
+        return candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+
+    def sample_path(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
+        greedy_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Ancestral sample one path; returns it with q over the K candidates, which
+        the verify needs.
+
+        greedy_mask rows take the argmax instead, as a select rather than a branch:
+        one captured graph serves greedy and sampling batches alike. The mask and
+        the clamped temperature follow DSpark's draft sampler.
+        """
+        top_k = self.top_k
+        temps = temperatures.view(-1, 1)
+        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
+        initial_indices = (
+            uniforms[:, :1]
+            .ge(initial_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        transition_probs = torch.softmax(
+            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
+        )
+        local_maps = (
+            uniforms[:, 1:, None, None]
+            .ge(transition_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        if greedy_mask is not None:
+            initial_indices = torch.where(
+                greedy_mask, scores[:, 0, 0].argmax(dim=-1), initial_indices
+            )
+            local_maps = torch.where(
+                greedy_mask[:, None, None], scores[:, 1:].argmax(dim=-1), local_maps
+            )
+        path_indices = self._candidate_indices_from_maps(local_maps, initial_indices)
+        tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+        realized_rows = transition_probs.gather(
+            2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
+        )[:, :, 0]
+        q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
+        return tokens, q_rows
+
+
+class DFlashV2DraftModel(DFlashDraftModel):
+    """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        draft_config = self.draft_config
+        if not draft_config.selector_rank:
+            raise ValueError(
+                "DFlash selector draft requires dflash_config.selector_rank."
+            )
+        self.candidate_selector = CandidateSelector(
+            hidden_size=int(config.hidden_size),
+            vocab_size=int(config.vocab_size),
+            state_rank=draft_config.selector_rank,
+            top_k=draft_config.selector_top_k,
+        )
+        # The draft has no head of its own; the worker points this at the target's
+        # before capture.
+        self.lm_head: Optional[nn.Module] = None
+
+    def compute_candidates(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-k base candidates via the target lm_head: hidden [N, H] -> global
+        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
+        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
+        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
+        assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        k = self.candidate_selector.top_k
+        weight = self.lm_head.weight
+        hidden = hidden.to(weight.dtype)
+        if get_tensor_model_parallel_world_size() == 1:
+            org = int(self.lm_head.org_vocab_size)
+            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
+            return ids.long(), vals.float()
+        shard = self.lm_head.shard_indices
+        vals, ids = _radix_topk(
+            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
+        )
+        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+        return torch.gather(gathered_ids, -1, sel).long(), top_vals.float()
+
+
+EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, DFlashV2DraftModel]
