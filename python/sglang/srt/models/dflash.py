@@ -10,11 +10,14 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -296,18 +299,137 @@ class DFlashMLP(nn.Module):
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _grouped_conv(hidden_states, delta, base, block_size, num_groups,
-                  group_size, taps):
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks
-    position = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device
-    ) & (block_size - 1)
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device) & (
+        block_size - 1
+    )
     for tap in range(1, taps):
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
         out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
     return out.flatten(-2)
+
+
+@triton.jit
+def _conv_add_rmsnorm_kernel(
+    states_ptr,
+    delta_ptr,
+    base_ptr,
+    residual_ptr,
+    weight_ptr,
+    out_ptr,
+    new_residual_ptr,
+    hidden: tl.constexpr,
+    block_size: tl.constexpr,
+    group_size: tl.constexpr,
+    num_groups: tl.constexpr,
+    eps,
+    WIDTH: tl.constexpr,
+):
+    """The output convolution and the add+RMSNorm behind it, one program per row.
+
+    Both are launch-bound on an 8x2560 tensor -- each costs 0.1us more than an
+    empty kernel replayed from a graph -- so the whole win is the dispatch this
+    removes. The RMS reduction needs the row resident, hence one block per token.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, WIDTH)
+    mask = offs < hidden
+    row_base = states_ptr + row * hidden
+    current = tl.load(row_base + offs, mask=mask, other=0.0).to(tl.float32)
+    position = row % block_size
+    previous = tl.load(
+        row_base - hidden + offs, mask=mask & (position != 0), other=0.0
+    ).to(tl.float32)
+
+    group = offs // group_size
+    delta_row = delta_ptr + row * (2 * num_groups)
+    coefficient_0 = tl.load(base_ptr + offs, mask=mask).to(tl.float32) + tl.load(
+        delta_row + group, mask=mask
+    ).to(tl.float32)
+    coefficient_1 = tl.load(base_ptr + hidden + offs, mask=mask).to(
+        tl.float32
+    ) + tl.load(delta_row + num_groups + group, mask=mask).to(tl.float32)
+
+    updated = (
+        tl.load(residual_ptr + row * hidden + offs, mask=mask, other=0.0).to(tl.float32)
+        + coefficient_0 * current
+        + coefficient_1 * previous
+    )
+    tl.store(new_residual_ptr + row * hidden + offs, updated, mask=mask)
+
+    variance = tl.sum(updated * updated, axis=0) / hidden
+    weight = tl.load(weight_ptr + offs, mask=mask).to(tl.float32)
+    tl.store(
+        out_ptr + row * hidden + offs,
+        updated * tl.rsqrt(variance + eps) * weight,
+        mask=mask,
+    )
+
+
+def _fused_conv_add_rmsnorm(
+    *, states, delta, base, residual, weight, block_size, group_size, eps
+):
+    """finish() and the RMSNorm after it as one kernel; returns (normed, residual)."""
+    rows, hidden = states.shape
+    out = torch.empty_like(states)
+    new_residual = torch.empty_like(residual)
+    _conv_add_rmsnorm_kernel[(rows,)](
+        states,
+        delta,
+        base,
+        residual,
+        weight,
+        out,
+        new_residual,
+        hidden=hidden,
+        block_size=block_size,
+        group_size=group_size,
+        num_groups=hidden // group_size,
+        eps=eps,
+        WIDTH=triton.next_power_of_2(hidden),
+        num_warps=16,
+    )
+    return out, new_residual
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _native_conv_add_rmsnorm(
+    states,
+    delta,
+    base,
+    residual,
+    weight,
+    block_size,
+    num_groups,
+    group_size,
+    taps,
+    eps,
+):
+    """The same thing in plain torch, for inductor to fuse into one kernel.
+
+    Only reachable with a forward_native RMSNorm: sglang's dispatches to
+    sgl_kernel or a JIT build, which inductor cannot see through.
+    """
+    # num_groups arrives rather than being derived: hidden // group_size inside
+    # the compiled region is a symbolic expression dynamo cannot unify with
+    # delta's group axis, and the broadcast fails at trace time.
+    blocks = states.unflatten(-1, (num_groups, group_size))
+    kernel = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    position = torch.arange(states.shape[0], device=states.device) & (block_size - 1)
+    convolved = kernel[:, 0] * blocks
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        convolved = convolved + kernel[:, tap] * shifted * (position >= tap).view(
+            -1, 1, 1
+        )
+    updated = residual + convolved.flatten(-2)
+    normed = updated.float() * torch.rsqrt(
+        updated.float().pow(2).mean(-1, keepdim=True) + eps
+    )
+    return (normed * weight).to(states.dtype), updated
 
 
 class DFlashGroupedConv(nn.Module):
@@ -322,8 +444,10 @@ class DFlashGroupedConv(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
-            raise ValueError(f"DFLASH conv_group_size={group_size} must divide "
-                             f"hidden_size={hidden_size}.")
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
         if block_size & (block_size - 1):
             raise ValueError(f"DFLASH block_size={block_size} must be a power of two.")
         self.hidden_size = int(hidden_size)
@@ -344,8 +468,13 @@ class DFlashGroupedConv(nn.Module):
         torch._dynamo.mark_static(delta, 1)
         torch._dynamo.mark_static(delta, 2)
         return _grouped_conv(
-            hidden_states, delta, self.base_kernel[side],
-            self.block_size, self.num_groups, self.group_size, self.taps,
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
         )
 
     def prepare(self, hidden_states: torch.Tensor):
@@ -359,6 +488,56 @@ class DFlashGroupedConv(nn.Module):
 
     def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
         return self._convolve(hidden_states, coefficients, side=1)
+
+    def finish_and_norm(self, hidden_states, coefficients, residual, norm):
+        """finish() and the norm behind it, as one kernel when asked for one.
+
+        Worth 3.5us of dispatch per site at batch 1 -- ten sites, 0.67% of a
+        decode cycle -- and it costs sglang's tuned RMSNorm on the draft, which
+        is why "none" is the default. See dflash2-review/fusion-ceiling.md.
+        """
+        mode = envs.SGLANG_DFLASH_FUSE_CONV_NORM.get()
+        if mode == "none":
+            return norm(self._convolve(hidden_states, coefficients, side=1), residual)
+        arguments = dict(
+            states=hidden_states.contiguous(),
+            delta=coefficients.reshape(hidden_states.shape[0], -1).contiguous(),
+            base=self.base_kernel[1].contiguous(),
+            residual=residual,
+            weight=norm.weight,
+            eps=norm.variance_epsilon,
+        )
+        if mode == "triton":
+            return _fused_conv_add_rmsnorm(
+                block_size=self.block_size, group_size=self.group_size, **arguments
+            )
+        if mode == "native":
+            # The Triton kernel indexes a flat coefficient row; the torch form
+            # broadcasts, so it keeps the (tap, group) axes. And the marks
+            # _convolve needs: left symbolic, dynamo cannot prove that
+            # hidden // group_size is the group count and the broadcast fails.
+            states = arguments["states"]
+            delta = coefficients.reshape(
+                hidden_states.shape[0], self.taps, self.num_groups
+            ).contiguous()
+            torch._dynamo.mark_static(states, 1)
+            torch._dynamo.mark_static(delta, 1)
+            torch._dynamo.mark_static(delta, 2)
+            return _native_conv_add_rmsnorm(
+                states,
+                delta,
+                arguments["base"],
+                residual,
+                norm.weight,
+                self.block_size,
+                self.num_groups,
+                self.group_size,
+                self.taps,
+                norm.variance_epsilon,
+            )
+        raise ValueError(
+            f"SGLANG_DFLASH_FUSE_CONV_NORM must be none/triton/native, got {mode!r}."
+        )
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -416,9 +595,11 @@ class DFlashDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if attention_kernel is not None:
-            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
-
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+            hidden_states, residual = self.attention_conv.finish_and_norm(
+                attn_out, attention_kernel, residual, self.post_attention_layernorm
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
         if self.mlp_conv is not None:

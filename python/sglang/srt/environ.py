@@ -936,6 +936,11 @@ class Envs:
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # A/B: fold the output convolution into the add+RMSNorm that follows it.
+    # "none" ships. "triton" is one hand kernel; "native" gives inductor a
+    # forward_native RMSNorm to fuse with. Both replace sglang's tuned norm on
+    # the draft, which is why neither is the default.
+    SGLANG_DFLASH_FUSE_CONV_NORM = EnvStr("none")
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
