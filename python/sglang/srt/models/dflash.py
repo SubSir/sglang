@@ -452,7 +452,6 @@ class DFlashDraftModel(nn.Module):
             draft_hf_config=config
         )
         self.block_size = draft_config.resolve_block_size(default=16)
-        # Set by DFlashV2DraftModel; a plain DFlash draft leaves it None.
         self.candidate_selector: Optional[nn.Module] = None
 
         def grouped_conv():
