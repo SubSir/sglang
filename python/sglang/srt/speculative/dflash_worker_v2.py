@@ -32,7 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -300,6 +300,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self._draft_q = None
         self._logged_rejection = False
+        # EAGLE's switch, now that DFLASH can produce a target-vocabulary
+        # proposal too. Off by default there and here: on a draft that takes the
+        # argmax at every position the two rules accept at the same rate.
+        self._use_rejection_sampling = bool(
+            get_spec().speculative_use_rejection_sampling
+        )
         self.draft_model = bundle.draft_model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -490,11 +496,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        # Sampling needs the draft's whole distribution as q. Under TP each rank
-        # holds a vocabulary shard, and gathering a dense [tokens, vocab] every
-        # step costs more than the acceptance it buys, so those ranks keep the
-        # argmax draft and the target-only verify.
-        can_sample = tp_group.world_size == 1
+        # Startup refuses the flag under TP, so world_size is 1 whenever it is
+        # set; the check stays because the sampler's buffers are sized for it.
+        can_sample = self._use_rejection_sampling and tp_group.world_size == 1
         if self.ps.tp_rank == 0:
             logger.info(
                 "DFLASH draft head folded into the draft cuda graph "

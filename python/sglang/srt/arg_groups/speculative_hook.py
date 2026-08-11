@@ -608,14 +608,22 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
-        # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
-        # the rejection-sampling kernel consumes; everything else (STANDALONE,
-        # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
-        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        # These draft workers emit a target-vocab proposal that the
+        # rejection-sampling kernel consumes; STANDALONE, FROZEN_KV_MTP and
+        # NGRAM do not.
+        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is only supported for "
-                "EAGLE / EAGLE3 / NEXTN, not "
+                "EAGLE / EAGLE3 / NEXTN / DFLASH, not "
                 f"speculative_algorithm={server_args.speculative_algorithm}."
+            )
+        if server_args.speculative_algorithm == "DFLASH" and server_args.tp_size != 1:
+            # Each rank holds a vocabulary shard, so the proposal distribution
+            # would have to be all-gathered dense every step, which costs more
+            # than the acceptance it buys.
+            raise NotImplementedError(
+                "--speculative-use-rejection-sampling for DFLASH requires "
+                f"--tp-size 1, got {server_args.tp_size}."
             )
         if server_args.speculative_eagle_topk != 1:
             raise ValueError(
