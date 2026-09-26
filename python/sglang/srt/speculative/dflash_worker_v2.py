@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
     dflash_tree_accept_compact,
+    dflash_tree_move_kv,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
@@ -2258,6 +2259,34 @@ class DFlashWorkerV2(BaseSpecWorker):
             tree_mask_buf=self._tree_mask_buf,
         )
 
+    def _tree_move_accepted_kv(
+        self,
+        loc2d: torch.Tensor,
+        accept_local: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> bool:
+        """Per-request parallel move of the accepted path's target KV; False when a
+        pool lacks the copy metadata and the generic move must run instead."""
+        kv = self.model_runner.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(kv, "swa_kv_pool") and hasattr(kv, "full_kv_pool"):
+            swa_loc2d = kv.translate_loc_from_full_to_swa(loc2d.reshape(-1)).view_as(
+                loc2d
+            )
+            pools = [(kv.full_kv_pool, loc2d), (kv.swa_kv_pool, swa_loc2d)]
+        else:
+            pools = [(kv, loc2d)]
+        pools = [(p, l) for p, l in pools if getattr(p, "layer_num", 1) != 0]
+        if any(
+            getattr(p, "_kv_copy_config", None) is None
+            or getattr(p, "use_hnd", False)
+            or not hasattr(p, "data_ptrs")
+            for p, _ in pools
+        ):
+            return False
+        for pool, locs in pools:
+            dflash_tree_move_kv(pool, locs.to(torch.int64), accept_local, commit_lens)
+        return True
+
     def _tree_accept_and_commit(
         self,
         *,
@@ -2313,15 +2342,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             commit_lens=commit_lens,
             prefix_lens=prefix_lens,
         )
-        if batch.req_to_token_pool is None:
-            batch.req_to_token_pool = self.model_runner.req_to_token_pool
         batch.out_cache_loc = verify_out_cache_loc
-        move_accept_tokens_to_target_kvcache(
-            batch,
-            accept_index,
-            accept_token_num,
-            self.model_runner.token_to_kv_pool_allocator,
-        )
+        if not self._tree_move_accepted_kv(
+            verify_out_cache_loc_2d, accept_local, commit_lens
+        ):
+            if batch.req_to_token_pool is None:
+                batch.req_to_token_pool = self.model_runner.req_to_token_pool
+            move_accept_tokens_to_target_kvcache(
+                batch,
+                accept_index,
+                accept_token_num,
+                self.model_runner.token_to_kv_pool_allocator,
+            )
         if on_publish is not None:
             on_publish(new_seq_lens)
 

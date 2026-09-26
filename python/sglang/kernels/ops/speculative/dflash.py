@@ -413,3 +413,64 @@ def selector_walk_triton(
         num_warps=1,
     )
     return tokens, q_rows
+
+
+@triton.jit
+def _dflash_tree_move_kv_kernel(
+    data_ptrs,  # [num_buffers] uint64: every K and V layer buffer of one pool
+    strides,  # [num_buffers] row bytes
+    loc2d_ptr,  # [bs, n] int64: the request's verify-window slots
+    accept_local_ptr,  # [bs, n] int64: window index of the c-th accepted node
+    commit_lens_ptr,  # [bs] int32
+    n,
+    N_POW2: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    buf = tl.program_id(0)
+    req = tl.program_id(1)
+    tile = tl.program_id(2)
+    stride = tl.load(strides + buf)
+    base = tl.cast(tl.load(data_ptrs + buf), tl.pointer_type(tl.uint8))
+    cols = tl.arange(0, N_POW2)
+    in_row = cols < n
+    commit = tl.load(commit_lens_ptr + req)
+    local = tl.load(accept_local_ptr + req * n + cols, mask=in_row, other=0)
+    tgt = tl.load(loc2d_ptr + req * n + cols, mask=in_row, other=0)
+    src = tl.load(loc2d_ptr + req * n + local, mask=in_row, other=0)
+    rows = in_row & (cols < commit) & (src != tgt)
+    byte_off = tile * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    tl.multiple_of(byte_off, 16)
+    m = rows[:, None] & (byte_off < stride)[None, :]
+    # A request's slots never overlap another's, and every load of this program
+    # lands before its stores, so shifting its own rows in place is safe.
+    vals = tl.load(base + src[:, None] * stride + byte_off[None, :], mask=m)
+    tl.store(base + tgt[:, None] * stride + byte_off[None, :], vals, mask=m)
+
+
+def dflash_tree_move_kv(
+    pool,
+    loc2d: torch.Tensor,
+    accept_local: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Move each request's accepted tree nodes to the front of its verify window,
+    one program per (layer buffer, request, byte tile). The generic
+    copy_all_layer_kv_cache_tiled gives one program a whole batch of rows per layer
+    so that any overlap stays safe; here overlaps are per request, so requests can
+    run in parallel. Rows already in place are skipped."""
+    bs, n = loc2d.shape
+    if bs == 0:
+        return
+    cfg = pool._kv_copy_config
+    grid = (pool.data_ptrs.numel(), bs, cfg["byte_tiles"])
+    _dflash_tree_move_kv_kernel[grid](
+        pool.data_ptrs,
+        pool.data_strides,
+        loc2d.contiguous(),
+        accept_local.contiguous(),
+        commit_lens.contiguous(),
+        n,
+        N_POW2=triton.next_power_of_2(n),
+        BYTES_PER_TILE=cfg["bytes_per_tile"],
+        num_warps=cfg["num_warps"],
+    )

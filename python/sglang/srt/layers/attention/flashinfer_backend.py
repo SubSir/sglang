@@ -256,6 +256,21 @@ def fast_prefill_plan(
         paged_kv_indices,
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
+    if custom_mask is not None:
+        # Same packing as plan(), all on device: no readback.
+        from flashinfer.prefill import _compute_page_mask_indptr
+        from flashinfer.quantization import segment_packbits
+
+        mask_indptr = _compute_page_mask_indptr(
+            qo_indptr, paged_kv_indptr, paged_kv_last_page_len, page_size
+        )
+        packed_custom_mask, mask_indptr = segment_packbits(
+            custom_mask.contiguous().view(-1), mask_indptr, bitorder="little"
+        )
+        self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+            packed_custom_mask, non_blocking=non_blocking
+        )
+        self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
 
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
@@ -832,11 +847,10 @@ class FlashInferAttnBackend(AttentionBackend):
             and forward_mode.is_target_verify()
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-            and getattr(spec_info, "custom_mask", None) is None
             and self.prefill_backend == "fa2"
-            # Host-rebuilt layout only matches full attention (single wrapper);
-            # SWA/cross-attn keep the plain plan().
-            and self.dispatch_reason is None
+            # Full attention, and SWA with its window-trimmed host kv lengths
+            # (update_sliding_window); cross-attn keeps the plain plan().
+            and self.dispatch_reason in (None, WrapperDispatch.SLIDING_WINDOW)
         ):
             # DFLASH target-verify replays are shape-static per
             # (bs, draft_token_num): qo_indptr is a constant arange stride of
@@ -2008,6 +2022,22 @@ class FlashInferIndicesUpdaterPrefill:
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
             )
+            # Host kv lengths for the sync-free DFLASH verify plan: the batch
+            # carries seq_lens_cpu = prefix + verify window, and the SWA wrapper
+            # sees min(prefix, window) + verify window.
+            kv_lens_cpu = None
+            if (
+                seq_lens_cpu is not None
+                and spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+                and not use_ragged
+            ):
+                n = int(spec_info.num_tokens_per_req)
+                kv_lens_cpu = (
+                    torch.clamp(seq_lens_cpu - n, max=sliding_window_size) + n
+                    if wrapper_id == 0
+                    else seq_lens_cpu
+                )
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
@@ -2026,6 +2056,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                seq_lens_cpu=kv_lens_cpu,
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -2271,9 +2302,6 @@ class FlashInferIndicesUpdaterPrefill:
             )
             assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
                 f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
-            )
-            assert use_custom_mask is None, (
-                "fast_prefill_plan does not support custom_mask; keep the plain plan()"
             )
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(

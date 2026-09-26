@@ -1315,10 +1315,15 @@ def build_selector_tree(
     score_blocks = [beam_score]
     token_blocks = [candidate_ids[:, 0].gather(1, beam_idx)]
     parent_blocks = [torch.arange(-1, topk, device=device).expand(bs, topk + 1)]
+    # topk == K: every candidate is a child, in lattice order -- no per-row sort.
+    all_children = torch.arange(num_cand, device=device).repeat(topk).expand(bs, -1)
     for e in range(1, num_slots):
         rows = probs[:, e].gather(1, beam_idx[:, :, None].expand(-1, -1, num_cand))
-        child_p, child_idx = rows.topk(topk, dim=-1)  # [bs, topk, topk]
-        child_idx = child_idx.flatten(1)
+        if topk == num_cand:
+            child_p, child_idx = rows, all_children
+        else:
+            child_p, child_idx = rows.topk(topk, dim=-1)  # [bs, topk, topk]
+            child_idx = child_idx.flatten(1)
         expand = (beam_score[:, :, None] * child_p).flatten(1)
         score_blocks.append(expand)
         token_blocks.append(candidate_ids[:, e].gather(1, child_idx))
