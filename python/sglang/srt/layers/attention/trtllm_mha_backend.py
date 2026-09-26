@@ -413,6 +413,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+        # XQA keeps its semaphores at the front of its workspace and needs them
+        # zero between calls; trtllm-gen's scratch in the shared workspace breaks
+        # that, so the tree-verify XQA calls get a buffer of their own.
+        self._xqa_workspace = (
+            torch.zeros(
+                self.workspace_size, dtype=torch.uint8, device=model_runner.device
+            )
+            if self._tree_verify_xqa and not self.is_xqa_impl
+            else None
+        )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1394,10 +1404,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             if backend is not None:
                 kwargs["backend"] = backend
+            if backend == "xqa":
+                # XQA reads Q densely; here it is a view into the fused QKV rows.
+                group_query = group_query.contiguous()
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
                 kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=(
+                    self._xqa_workspace
+                    if backend == "xqa" and self._xqa_workspace is not None
+                    else self.workspace_buffer
+                ),
                 block_tables=group_block_tables,
                 seq_lens=group_seq_lens,
                 max_seq_len=self.max_context_len,
