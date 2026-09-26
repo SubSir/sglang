@@ -262,20 +262,21 @@ def fast_prefill_plan(
         # mask buffer instead, which is sized for the longest context.
         from flashinfer.quantization.packbits import get_quantization_module
 
-        # _compute_page_mask_indptr's `mask_indptr[0] = 0` is a host write.
-        kv_lens = (paged_kv_indptr.diff() - 1) * page_size + paged_kv_last_page_len
-        mask_indptr = torch.zeros_like(qo_indptr, dtype=torch.int32)
-        mask_indptr[1:] = torch.cumsum(qo_indptr.diff() * kv_lens, 0)
-        packed_indptr = torch.zeros_like(mask_indptr)
-        packed_indptr[1:] = torch.cumsum((mask_indptr.diff() + 7) // 8, 0)
+        # The segment offsets follow from the host-known layout: build them on
+        # the host and ship both in one copy instead of ~15 tiny device ops.
+        seg = qo_indptr_host.diff().to(torch.int64) * kv_lens_host.to(torch.int64)
+        indptrs = torch.zeros((2, batch_size + 1), dtype=torch.int32)
+        indptrs[0, 1:] = torch.cumsum(seg, 0)
+        indptrs[1, 1:] = torch.cumsum((seg + 7) // 8, 0)
+        indptrs = indptrs.pin_memory().to(self.device, non_blocking=True)
         get_quantization_module().segment_packbits(
             custom_mask.contiguous().view(-1),
-            mask_indptr,
-            packed_indptr,
+            indptrs[0],
+            indptrs[1],
             "little",
             self._custom_mask_buf,
         )
-        self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
+        self._mask_indptr_buf.copy_(indptrs[1], non_blocking=non_blocking)
 
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
@@ -2241,6 +2242,7 @@ class FlashInferIndicesUpdaterPrefill:
                         paged_kernel_lens_sum,
                         self.req_to_token,
                         kv_start_idx=kv_start_idx,
+                        sliding_window=use_sliding_window_kv_pool,
                     )
                 )
             else:

@@ -53,6 +53,11 @@ class DFlashVerifyInput(SpecInput):
     tree_selected_index: Optional[torch.Tensor] = None
     tree_depth: int = 0
     tree_mask_buf: Optional[torch.Tensor] = None
+    # Sliding-window layers see min(prefix, window) + tree keys per request, so
+    # their mask rows are shorter than the full-attention ones.
+    tree_swa_window: Optional[int] = None
+    tree_mask_buf_swa: Optional[torch.Tensor] = None
+    custom_mask_swa: Optional[torch.Tensor] = None
     retrieve_index: Optional[torch.Tensor] = None
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
@@ -167,6 +172,20 @@ class DFlashVerifyInput(SpecInput):
             tree_mask_mode=TreeMaskMode.FULL_MASK,
             tree_mask_buf=self.tree_mask_buf,
         )
+        if self.tree_swa_window is not None:
+            self.custom_mask_swa = build_tree_kernel_efficient(
+                bonus_tokens=tokens[:, 0],
+                parent_list=self.tree_parent_list,
+                top_scores_index=self.tree_selected_index,
+                draft_tokens=tokens[:, 1:],
+                seq_lens=torch.clamp(batch.seq_lens, max=self.tree_swa_window),
+                seq_lens_sum=0,
+                topk=int(self.topk),
+                spec_steps=int(self.tree_depth),
+                num_verify_tokens=n,
+                tree_mask_mode=TreeMaskMode.FULL_MASK,
+                tree_mask_buf=self.tree_mask_buf_swa,
+            )[0]
 
     def generate_attn_arg_prefill(
         self,
@@ -176,6 +195,7 @@ class DFlashVerifyInput(SpecInput):
         req_to_token: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor] = None,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        sliding_window: bool = False,
     ):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
@@ -226,6 +246,8 @@ class DFlashVerifyInput(SpecInput):
             req_to_token.size(1),
         )
         mask = self.custom_mask
+        if sliding_window and self.custom_mask_swa is not None:
+            mask = self.custom_mask_swa
         if mask is not None:
             mask_numel = (
                 paged_kernel_lens_sum * self.draft_token_num

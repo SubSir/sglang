@@ -657,6 +657,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._tree_topk = int(get_spec().speculative_dflash_tree_topk or 0)
         self._tree_mask_buf: Optional[torch.Tensor] = None
+        self._tree_mask_buf_swa: Optional[torch.Tensor] = None
         self._tree_eager = None
         if self._tree_topk:
             if self.selector is None:
@@ -2246,6 +2247,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         need = n * bs * int(self.target_worker.model_runner.model_config.context_len + n)
         if self._tree_mask_buf is None or self._tree_mask_buf.numel() < need:
             self._tree_mask_buf = torch.empty(need, dtype=torch.bool, device=self.device)
+        window = self.target_worker.model_runner.sliding_window_size
+        swa_window = int(window) if window is not None and window > 0 else None
+        if swa_window is not None:
+            need_swa = n * bs * (swa_window + n)
+            if self._tree_mask_buf_swa is None or self._tree_mask_buf_swa.numel() < need_swa:
+                self._tree_mask_buf_swa = torch.empty(
+                    need_swa, dtype=torch.bool, device=self.device
+                )
         return DFlashVerifyInput(
             draft_token=tokens.reshape(-1),
             positions=None,
@@ -2257,6 +2266,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             tree_selected_index=selected,
             tree_depth=n - 1,
             tree_mask_buf=self._tree_mask_buf,
+            tree_swa_window=swa_window,
+            tree_mask_buf_swa=self._tree_mask_buf_swa if swa_window else None,
         )
 
     def _tree_move_accepted_kv(
