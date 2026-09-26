@@ -1101,11 +1101,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            # One packed-mask buffer per wrapper: plan() packs each wrapper's mask
+            # at offset 0, so a shared buffer lets the full-attention wrapper's
+            # mask overwrite the sliding-window wrapper's, whose rows are shorter
+            # once the prefix passes the window.
+            self.cuda_graph_custom_masks = [
+                torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                for _ in range(self.num_wrappers)
+            ]
+            self.cuda_graph_custom_mask = self.cuda_graph_custom_masks[-1]
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -1151,7 +1159,7 @@ class FlashInferAttnBackend(AttentionBackend):
         for i in range(self.num_wrappers):
             extra = (
                 {
-                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "custom_mask_buf": self.cuda_graph_custom_masks[i],
                     "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
                 }
                 if use_custom_mask
