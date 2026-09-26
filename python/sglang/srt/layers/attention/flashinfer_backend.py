@@ -260,12 +260,12 @@ def fast_prefill_plan(
         # Same packing as plan(), all on device. segment_packbits() reads the
         # packed length back to size its output; pack straight into the graph's
         # mask buffer instead, which is sized for the longest context.
-        from flashinfer.prefill import _compute_page_mask_indptr
         from flashinfer.quantization.packbits import get_quantization_module
 
-        mask_indptr = _compute_page_mask_indptr(
-            qo_indptr, paged_kv_indptr, paged_kv_last_page_len, page_size
-        ).to(torch.int32)
+        # _compute_page_mask_indptr's `mask_indptr[0] = 0` is a host write.
+        kv_lens = (paged_kv_indptr.diff() - 1) * page_size + paged_kv_last_page_len
+        mask_indptr = torch.zeros_like(qo_indptr, dtype=torch.int32)
+        mask_indptr[1:] = torch.cumsum(qo_indptr.diff() * kv_lens, 0)
         packed_indptr = torch.zeros_like(mask_indptr)
         packed_indptr[1:] = torch.cumsum((mask_indptr.diff() + 7) // 8, 0)
         get_quantization_module().segment_packbits(
@@ -2266,7 +2266,11 @@ class FlashInferIndicesUpdaterPrefill:
 
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
-            kv_last_index = kv_indptr[-1]
+            # Slicing by the device scalar drains the stream; the DFLASH verify
+            # path already carries the host kv lengths.
+            kv_last_index = (
+                int(seq_lens_cpu.sum()) if seq_lens_cpu is not None else kv_indptr[-1]
+            )
             kv_indices[:kv_last_index] = (
                 self._swa_kv_pool.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]

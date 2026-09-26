@@ -1310,6 +1310,21 @@ def build_selector_tree(
     """
     bs, num_slots, num_cand = candidate_ids.shape
     device = candidate_ids.device
+    if (
+        topk == num_cand
+        and candidate_ids.is_cuda
+        and num_cand & (num_cand - 1) == 0
+    ):
+        from sglang.kernels.ops.speculative.dflash import selector_tree_expand
+
+        score_list, token_list, parents = selector_tree_expand(candidate_ids, scores)
+        selected = (
+            score_list.topk(num_verify_tokens - 1, dim=-1).indices.sort(dim=-1).values
+        )
+        draft_tokens = torch.cat(
+            [anchor_ids[:, None], token_list.gather(1, selected)], dim=1
+        )
+        return draft_tokens, parents, selected
     probs = scores.float().softmax(dim=-1)
     beam_score, beam_idx = probs[:, 0, 0].topk(topk, dim=-1)
     score_blocks = [beam_score]

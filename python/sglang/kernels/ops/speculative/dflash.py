@@ -474,3 +474,110 @@ def dflash_tree_move_kv(
         BYTES_PER_TILE=cfg["bytes_per_tile"],
         num_warps=cfg["num_warps"],
     )
+
+
+@triton.jit
+def _selector_tree_expand_kernel(
+    scores_ptr,  # [bs, S, K, K] selector edge scores
+    cand_ptr,  # [bs, S, K] candidate ids
+    out_scores_ptr,  # [bs, K + K*K*(S-1)] path probabilities, EAGLE score-list order
+    out_tokens_ptr,  # [bs, K + K*K*(S-1)]
+    out_parents_ptr,  # [bs, 1 + K*(S-1)]
+    stride_sb,
+    stride_ss,
+    stride_sp,
+    stride_cb,
+    stride_cs,
+    stride_ob,
+    stride_pb,
+    S: tl.constexpr,
+    K: tl.constexpr,
+    KK: tl.constexpr,
+):
+    """build_selector_tree's beam for topk == K, one program per request: each depth
+    softmaxes the K beams' transition rows, scores all K*K children by path
+    probability and keeps the top K by K rounds of argmax."""
+    b = tl.program_id(0)
+    offs_k = tl.arange(0, K)
+    offs_kk = tl.arange(0, KK)
+    s_base = scores_ptr + b * stride_sb
+    c_base = cand_ptr + b * stride_cb
+
+    row = tl.load(s_base + offs_k).to(tl.float32)  # slot 0, predecessor = anchor
+    row = tl.exp(row - tl.max(row, axis=0))
+    beam_score = row / tl.sum(row, axis=0)
+    beam_idx = offs_k
+    tl.store(out_scores_ptr + b * stride_ob + offs_k, beam_score)
+    tl.store(out_tokens_ptr + b * stride_ob + offs_k, tl.load(c_base + offs_k))
+    tl.store(out_parents_ptr + b * stride_pb, -1)
+    tl.store(out_parents_ptr + b * stride_pb + 1 + offs_k, offs_k.to(tl.int64))
+
+    for e in tl.static_range(1, S):
+        m = tl.load(
+            s_base + e * stride_ss + beam_idx[:, None] * stride_sp + offs_k[None, :]
+        ).to(tl.float32)
+        m = tl.exp(m - tl.max(m, axis=1)[:, None])
+        m = m / tl.sum(m, axis=1)[:, None]
+        expand = beam_score[:, None] * m  # [K parents, K children]
+        base = K + (e - 1) * KK
+        flat = offs_k[:, None] * K + offs_k[None, :]
+        tl.store(out_scores_ptr + b * stride_ob + base + flat, expand)
+        tok = tl.load(c_base + e * stride_cs + offs_k)
+        tl.store(
+            out_tokens_ptr + b * stride_ob + base + flat,
+            tl.broadcast_to(tok[None, :], (K, K)),
+        )
+        vals = tl.reshape(expand, (KK,))
+        remaining = offs_kk < KK
+        top_v = tl.zeros((K,), tl.float32)
+        top_i = tl.zeros((K,), tl.int32)
+        for r in tl.static_range(K):
+            masked = tl.where(remaining, vals, -1.0)
+            mx = tl.max(masked, axis=0)
+            pick = tl.min(tl.where(remaining & (masked == mx), offs_kk, KK), axis=0)
+            remaining = remaining & (offs_kk != pick)
+            top_v = tl.where(offs_k == r, mx, top_v)
+            top_i = tl.where(offs_k == r, pick, top_i)
+        if e < S - 1:
+            tl.store(
+                out_parents_ptr + b * stride_pb + (K + 1) + (e - 1) * K + offs_k,
+                (top_i + base).to(tl.int64),
+            )
+        beam_score = top_v
+        beam_idx = top_i % K
+
+
+def selector_tree_expand(candidate_ids: torch.Tensor, scores: torch.Tensor):
+    """Fused build_selector_tree beam for topk == K (a power of 2).
+    Returns (score_list [bs, K+K*K*(S-1)], token_list, parent_list [bs, 1+K*(S-1)])."""
+    bs, num_slots, k = candidate_ids.shape
+    width = k + k * k * (num_slots - 1)
+    device = candidate_ids.device
+    out_scores = torch.empty((bs, width), dtype=torch.float32, device=device)
+    out_tokens = torch.empty((bs, width), dtype=candidate_ids.dtype, device=device)
+    out_parents = torch.empty(
+        (bs, 1 + k * (num_slots - 1)), dtype=torch.int64, device=device
+    )
+    if bs == 0:
+        return out_scores, out_tokens, out_parents
+    scores = scores.contiguous()
+    candidate_ids = candidate_ids.contiguous()
+    _selector_tree_expand_kernel[(bs,)](
+        scores,
+        candidate_ids,
+        out_scores,
+        out_tokens,
+        out_parents,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        candidate_ids.stride(0),
+        candidate_ids.stride(1),
+        out_scores.stride(0),
+        out_parents.stride(0),
+        S=num_slots,
+        K=k,
+        KK=k * k,
+        num_warps=4,
+    )
+    return out_scores, out_tokens, out_parents
