@@ -1,0 +1,30 @@
+--- a/csrc/xqa/mha.cu
++++ b/csrc/xqa/mha.cu
+@@ -496,7 +496,14 @@
+ #if SLIDING_WINDOW
+       // Per-row window begin (inclusive); see winBegBase at the call site.
+       // Callers disable window masking with a large negative winBegBase.
+-      int32_t const rowWinBeg = winBegBase + int32_t(tokenRow);
++      // A draft token sits at its depth, not its row: the row's ancestor mask
++      // holds depth + 1 bits (root through itself). A causal chain gives row + 1.
++      uint32_t rowDepth = 0;
++#pragma unroll
++      for (uint32_t w = 0; w < nbPackedMasksPerRow; w++) {
++        rowDepth += __popc(uint32_t(uint16Mask[tokenRow * nbPackedMasksPerRow + w]));
++      }
++      int32_t const rowWinBeg = winBegBase + int32_t(rowDepth) - 1;
+ #endif
+ #pragma unroll
+       for (uint32_t mask_n = 0; mask_n < acc.cols / MMAS_N_PER_MASK; mask_n++) {
+@@ -1780,7 +1787,10 @@
+   int32_t const specDecWinBegBase =
+       int32_t(cacheSeqLen - actualQSeqLen + 1) - int32_t(slidingWinSize);
+   uint32_t const ctaTokenRowBeg = min(idxHeadTokenInGrp / headGrpSize, actualQSeqLen - 1);
+-  int32_t const ctaWinBeg = specDecWinBegBase + int32_t(ctaTokenRowBeg);
++  // Any row of this CTA may sit at depth 0 (tree drafts), so skip only up to
++  // the shallowest possible window begin.
++  (void)ctaTokenRowBeg;
++  int32_t const ctaWinBeg = specDecWinBegBase;
+   uint32_t const nbTotalSkipTokens = (rtIsReallySliding && ctaWinBeg > 0) ? uint32_t(ctaWinBeg) : 0;
+ #else
+   uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;

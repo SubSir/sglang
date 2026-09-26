@@ -1,0 +1,1294 @@
+From c14620267a5aefda6b4337ab43c0a44446f66c87 Mon Sep 17 00:00:00 2001
+From: SubSir <tiancaizhangdaxian@sjtu.edu.cn>
+Date: Sat, 26 Sep 2026 06:07:03 -0700
+Subject: [PATCH] trtllm-gen spec-dec tree custom mask (from flashinfer PR
+ 3585) on 0.6.18, pre-packed mask arg, SWA custom persistent scheduler,
+ fmha_gen_tree module name
+
+---
+ csrc/trtllm_fmha_kernel_launcher.cu           | 168 ++++++-
+ csrc/trtllm_fmha_spec_dec_mask.cu             | 234 ++++++++++
+ flashinfer/decode.py                          | 436 +++++++++++++++++-
+ flashinfer/jit/attention/modules.py           |   4 +-
+ .../flashinfer/trtllm/fmha/fmhaKernels.cuh    | 148 +++++-
+ .../flashinfer/trtllm/fmha/fmhaRunnerParams.h |  28 +-
+ 6 files changed, 994 insertions(+), 24 deletions(-)
+ create mode 100644 csrc/trtllm_fmha_spec_dec_mask.cu
+
+diff --git a/csrc/trtllm_fmha_kernel_launcher.cu b/csrc/trtllm_fmha_kernel_launcher.cu
+index 689b049..235c05e 100644
+--- a/csrc/trtllm_fmha_kernel_launcher.cu
++++ b/csrc/trtllm_fmha_kernel_launcher.cu
+@@ -122,7 +122,10 @@ void trtllm_paged_attention_launcher(
+     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
+     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
+     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
+-    bool uses_spcompress, cudaStream_t stream) {
++    bool uses_spcompress, const uint32_t* packed_custom_mask,
++    const int64_t* custom_mask_offsets, const int32_t* first_sparse_mask_offsets_kv,
++    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window,
++    bool uses_2insts_q_decode_kernels, cudaStream_t stream) {
+   if (num_qo_heads % num_kv_heads != 0) {
+     std::ostringstream err_msg;
+     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
+@@ -155,6 +158,12 @@ void trtllm_paged_attention_launcher(
+   runner_params.kSfBasePtr = k_block_scales_ptr;
+   runner_params.vSfBasePtr = v_block_scales_ptr;
+   runner_params.seqLensKvPtr = seq_lens;
++  // Default to no custom mask; the generation path below overrides these for
++  // spec-dec tree attention. The struct has no member initializers, so set
++  // them explicitly on every path.
++  runner_params.customMaskPtr = nullptr;
++  runner_params.customMaskOffsetsPtr = nullptr;
++  runner_params.firstSparseMaskOffsetsKvPtr = nullptr;
+   runner_params.oPtr = out;
+   runner_params.mHeadDimQk = head_dim_qk;
+   runner_params.mHeadDimV = head_dim_vo;
+@@ -163,6 +172,8 @@ void trtllm_paged_attention_launcher(
+   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
+   runner_params.mBatchSize = batch_size;
+   runner_params.mMaxSeqLenKv = max_kv_len;
++  runner_params.mForceSpecDecTreeKeeps = force_spec_dec_tree_keeps;
++  runner_params.mUses2InstsQDecodeKernels = uses_2insts_q_decode_kernels;
+   runner_params.mMaxNumPagesPerSeqKv = max_num_blocks_per_seq;
+   runner_params.mNumTokensPerPage = page_size;
+   runner_params.mQkvLayout = QkvLayout::PagedKv;
+@@ -254,6 +265,21 @@ void trtllm_paged_attention_launcher(
+     // one tokenQ in those cases, so dense mask works the same as causal mask.
+     runner_params.mMaskType =
+         is_mla_decode ? TrtllmGenAttentionMaskType::Dense : TrtllmGenAttentionMaskType::Causal;
++    if (packed_custom_mask != nullptr) {
++      // Spec-dec tree attention: the packed custom mask covers the KV tail
++      // starting at first_sparse_mask_offsets_kv; everything before it is
++      // implicitly unmasked.
++      TVM_FFI_ICHECK(!is_mla_decode) << "custom mask is not supported for MLA decode";
++      TVM_FFI_ICHECK(custom_mask_offsets != nullptr && first_sparse_mask_offsets_kv != nullptr)
++          << "custom_mask_offsets and first_sparse_mask_offsets_kv must be provided with "
++             "packed_custom_mask";
++      runner_params.mMaskType = custom_mask_uses_sliding_window
++                                    ? TrtllmGenAttentionMaskType::SlidingWindowCustom
++                                    : TrtllmGenAttentionMaskType::Custom;
++      runner_params.customMaskPtr = packed_custom_mask;
++      runner_params.customMaskOffsetsPtr = custom_mask_offsets;
++      runner_params.firstSparseMaskOffsetsKvPtr = first_sparse_mask_offsets_kv;
++    }
+     runner_params.mKernelType = FmhaKernelType::Generation;
+     bool use_multi_block = true;
+     runner_params.mTileScheduler =
+@@ -358,13 +384,34 @@ void trtllm_paged_attention_decode(
+     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
+     int64_t lse_stride_heads, bool enable_block_sparse_attention,
+     Optional<TensorView> sparse_mla_top_k_lens, int64_t bf16q_fp8kv_transform_mode,
+-    Optional<bool> use_fp16_softmax) {
++    Optional<bool> use_fp16_softmax, Optional<TensorView> packed_custom_mask,
++    Optional<TensorView> custom_mask_offsets, Optional<TensorView> first_sparse_mask_offsets_kv,
++    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window,
++    bool uses_2insts_q_decode_kernels) {
+   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
+   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
+   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
+   for (int i = 0; i < key_cache.ndim(); i++) {
+     TVM_FFI_ICHECK_EQ(key_cache.size(i), value_cache.size(i));
+   }
++  const uint32_t* packed_custom_mask_ptr = nullptr;
++  const int64_t* custom_mask_offsets_ptr = nullptr;
++  const int32_t* first_sparse_mask_offsets_kv_ptr = nullptr;
++  if (packed_custom_mask.has_value()) {
++    TVM_FFI_ICHECK_EQ(packed_custom_mask.value().dtype(), dl_uint32)
++        << "packed_custom_mask must be a uint32 tensor";
++    TVM_FFI_ICHECK(custom_mask_offsets.has_value() && first_sparse_mask_offsets_kv.has_value())
++        << "custom_mask_offsets and first_sparse_mask_offsets_kv must be provided with "
++           "packed_custom_mask";
++    TVM_FFI_ICHECK_EQ(custom_mask_offsets.value().dtype(), dl_int64)
++        << "custom_mask_offsets must be an int64 tensor";
++    TVM_FFI_ICHECK_EQ(first_sparse_mask_offsets_kv.value().dtype(), dl_int32)
++        << "first_sparse_mask_offsets_kv must be an int32 tensor";
++    packed_custom_mask_ptr = static_cast<const uint32_t*>(packed_custom_mask.value().data_ptr());
++    custom_mask_offsets_ptr = static_cast<const int64_t*>(custom_mask_offsets.value().data_ptr());
++    first_sparse_mask_offsets_kv_ptr =
++        static_cast<const int32_t*>(first_sparse_mask_offsets_kv.value().data_ptr());
++  }
+   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
+   int sum_seq_q = query.size(0);
+   int num_qo_heads = query.size(1);
+@@ -533,7 +580,112 @@ void trtllm_paged_attention_decode(
+       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
+       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
+       lse_stride_tokens, lse_stride_heads, bf16q_fp8kv_transform_mode, use_fp16_softmax_value,
+-      uses_spcompress_value, stream);
++      uses_spcompress_value, packed_custom_mask_ptr, custom_mask_offsets_ptr,
++      first_sparse_mask_offsets_kv_ptr, force_spec_dec_tree_keeps, custom_mask_uses_sliding_window,
++      uses_2insts_q_decode_kernels, stream);
++}
++
++bool trtllm_fmha_has_spec_dec_tree_kernel(
++    TensorView query, TensorView key_cache, TensorView value_cache, TensorView out,
++    int64_t batch_size, int64_t max_q_len, int64_t max_kv_len, int64_t attention_window_size,
++    Optional<bool> uses_shared_paged_kv_idx, bool force_spec_dec_tree_keeps,
++    bool custom_mask_uses_sliding_window, bool uses_2insts_q_decode_kernels) {
++  auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
++  auto k_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
++  auto v_data_type = dl_dtype_to_tllm_data_type(value_cache.dtype());
++  auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
++  int const head_dim_k = is_4bit(k_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
++  int const head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
++  int const head_dim_v = is_4bit(v_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
++  int const head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
++  TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
++      << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
++      << std::to_string(head_dim_q);
++  TVM_FFI_ICHECK_EQ(head_dim_v, head_dim_o)
++      << "head_dim_v and head_dim_o must be the same, got " << std::to_string(head_dim_v) << " and "
++      << std::to_string(head_dim_o);
++
++  auto fmha_runner =
++      TllmGenFmhaRunnerCache::get(q_data_type, k_data_type, v_data_type, o_data_type);
++  TllmGenFmhaRunnerParams runner_params{};
++  runner_params.qPtr = query.data_ptr();
++  runner_params.kPtr = key_cache.data_ptr();
++  runner_params.vPtr = value_cache.data_ptr();
++  runner_params.oPtr = out.data_ptr();
++  runner_params.customMaskPtr = nullptr;
++  runner_params.customMaskOffsetsPtr = nullptr;
++  runner_params.firstSparseMaskOffsetsKvPtr = nullptr;
++  runner_params.slidingWindowKvPoolPtr = nullptr;
++  runner_params.kvPageIdxPtr = nullptr;
++  runner_params.kSfBasePtr = nullptr;
++  runner_params.vSfBasePtr = nullptr;
++  runner_params.seqLensKvPtr = nullptr;
++  runner_params.cumSeqLensQPtr = nullptr;
++  runner_params.cumSeqLensKvPtr = nullptr;
++  runner_params.multiCtasKvCounterPtr = nullptr;
++  runner_params.multiCtasKvScratchPtr = nullptr;
++  runner_params.softmaxStatsPtr = nullptr;
++  runner_params.lsePtr = nullptr;
++  runner_params.ptrAttentionSinks = nullptr;
++  runner_params.sparseMlaTopKLensPtr = nullptr;
++  runner_params.outputScalePtr = nullptr;
++  runner_params.scaleSoftmaxLog2Ptr = nullptr;
++  runner_params.kvSfScalePtr = nullptr;
++  runner_params.oSfPtr = nullptr;
++  runner_params.mMaskType = custom_mask_uses_sliding_window
++                                ? TrtllmGenAttentionMaskType::SlidingWindowCustom
++                                : TrtllmGenAttentionMaskType::Custom;
++  runner_params.mKernelType = FmhaKernelType::Generation;
++  runner_params.mTileScheduler = TileScheduler::Static;
++  runner_params.mMultiCtasKvMode = true;
++  runner_params.mHeadDimQk = head_dim_q;
++  runner_params.mHeadDimV = head_dim_v;
++  runner_params.mNumHeadsQ = query.size(1);
++  runner_params.mNumHeadsKv = key_cache.size(-3);
++  runner_params.mNumHeadsQPerKv = runner_params.mNumHeadsQ / runner_params.mNumHeadsKv;
++  runner_params.mBatchSize = batch_size;
++  runner_params.mMaxSeqLenQ = max_q_len;
++  runner_params.mSumOfSeqLensQ = query.size(0);
++  runner_params.mMaxSeqLenKv = max_kv_len;
++  runner_params.mMaxNumPagesPerSeqKv = 0;
++  runner_params.mNumTokensPerPage = key_cache.size(-2);
++  runner_params.mQkvLayout = QkvLayout::PagedKv;
++  runner_params.mMultiProcessorCount = getMultiProcessorCount();
++  runner_params.mChunkedAttentionSize = INT_MAX;
++  runner_params.mAttentionWindowSize =
++      custom_mask_uses_sliding_window ? attention_window_size : INT_MAX;
++  runner_params.mSparseMlaType = TrtllmGenSparseMlaType::None;
++  runner_params.mSparseMlaTopK = 0;
++  runner_params.mHasSlidingWindowKvPool = false;
++  runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx.value_or(true);
++  runner_params.mSkipsSoftmaxWhenPossible = false;
++  runner_params.mForceSpecDecTreeKeeps = force_spec_dec_tree_keeps;
++  runner_params.mUses2InstsQDecodeKernels = uses_2insts_q_decode_kernels;
++  runner_params.mSkipSoftmaxThresholdScaleFactor = 0.0f;
++  runner_params.mScaleSfKv = 1.0f;
++  runner_params.mScaleSfO = -1.0f;
++  runner_params.mSfStartTokenIdx = 0;
++  runner_params.outputScale = 1.0f;
++  runner_params.scaleSoftmaxLog2 = 1.0f;
++  runner_params.qStrideTokens = query.stride(0);
++  runner_params.qStrideHeads = query.stride(1);
++  int const stride_idx_factor = is_4bit(k_data_type) ? 2 : 1;
++  runner_params.kStrideKeysValues = key_cache.stride(-2) * stride_idx_factor;
++  runner_params.kStrideHeads = key_cache.stride(-3) * stride_idx_factor;
++  runner_params.kStrideBatch = key_cache.stride(0) * stride_idx_factor;
++  runner_params.vStrideKeysValues = value_cache.stride(-2) * stride_idx_factor;
++  runner_params.vStrideHeads = value_cache.stride(-3) * stride_idx_factor;
++  runner_params.vStrideBatch = value_cache.stride(0) * stride_idx_factor;
++  runner_params.kSfStrideHeads = 0;
++  runner_params.kSfStrideBatch = 0;
++  runner_params.vSfStrideHeads = 0;
++  runner_params.vSfStrideBatch = 0;
++  runner_params.lseStrideTokens = 0;
++  runner_params.lseStrideHeads = 0;
++  runner_params.enable_pdl = false;
++  runner_params.stream = nullptr;
++
++  return fmha_runner->isSupported(runner_params);
+ }
+ 
+ void trtllm_paged_attention_context(
+@@ -677,7 +829,9 @@ void trtllm_paged_attention_context(
+       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
+       k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
+       lse_stride_tokens, lse_stride_heads, /*bf16q_fp8kv_transform_mode=*/0, use_fp16_softmax_value,
+-      uses_spcompress_value, stream);
++      uses_spcompress_value, /*packed_custom_mask=*/nullptr, /*custom_mask_offsets=*/nullptr,
++      /*first_sparse_mask_offsets_kv=*/nullptr, /*force_spec_dec_tree_keeps=*/false,
++      /*custom_mask_uses_sliding_window=*/false, /*uses_2insts_q_decode_kernels=*/false, stream);
+ }
+ 
+ void trtllm_ragged_attention_launcher(
+@@ -1035,7 +1189,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
+       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
+       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
+       /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, /*use_fp16_softmax=*/false,
+-      /*uses_spcompress=*/false, stream);
++      /*uses_spcompress=*/false, /*packed_custom_mask=*/nullptr, /*custom_mask_offsets=*/nullptr,
++      /*first_sparse_mask_offsets_kv=*/nullptr, /*force_spec_dec_tree_keeps=*/false,
++      /*custom_mask_uses_sliding_window=*/false, /*uses_2insts_q_decode_kernels=*/false, stream);
+ }
+ 
+ namespace trtllm_cubin_loader {
+@@ -1043,6 +1199,8 @@ namespace trtllm_cubin_loader {
+ }
+ 
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fmha_has_spec_dec_tree_kernel,
++                              trtllm_fmha_has_spec_dec_tree_kernel);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
+                               trtllm_paged_attention_decode_sparse_mla_dsv4);
+diff --git a/csrc/trtllm_fmha_spec_dec_mask.cu b/csrc/trtllm_fmha_spec_dec_mask.cu
+new file mode 100644
+index 0000000..a6bdc3b
+--- /dev/null
++++ b/csrc/trtllm_fmha_spec_dec_mask.cu
+@@ -0,0 +1,234 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <cuda_runtime.h>
++
++#include "tvm_ffi_utils.h"
++
++namespace flashinfer {
++
++namespace {
++
++// Tile geometry of the TRTLLM custom-mask spec-dec generation cubins
++// used here: Q128 KeepsMmaAbForGeneration with tileSizeQ == tileSizeKv == 128.
++// numInstsQ = stepQ / tileSizeQ (2 for the 2Qx1KV SlidingWindowCustom cubins,
++// else 1) and numInstsKv = stepKv / tileSizeKv (2 for same-dtype Q/KV cubins,
++// 1 for mixed-dtype and for 2Qx1KV); both are passed in by the caller and
++// must match the selected kernel's instance split.
++constexpr int kTileSizeQ = 128;
++constexpr int kTileSizeKv = 128;
++constexpr int kThreadsPerBlock = 256;
++constexpr int kKeepsMaskLayout = 0;
++constexpr int kSwapsMaskLayout = 1;
++
++// Packs a dense spec-dec tree mask (one bool per (draft tokenQ, draft tokenKv)
++// pair) into the per-sequence packed custom mask consumed by the kernels.
++//
++// The bit layout mirrors TRT-LLM's consumer-side packer
++// (cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.cu,
++// prepareCustomMaskBuffersKernelForKeepsMmaAb): per sequence the packed mask
++// is a bit array shaped
++//   [numTilesQ, numCustomMaskTilesKv, numInstsQ, numInstsKv,
++//    tileSizeQ(=128), tileSizeKv(=128)]
++// with rows indexed by tokenQ * numHeadsQPerKv + head (head-broadcast) and
++// numCustomMaskTilesKv = ceilDiv(seqLenKv, stepKv) - firstSparseTileKv.
++//
++// The KV range starts at the tile-aligned firstSparseMaskOffsetKv: KV tokens
++// before the draft tail (the prefix) are emitted as visible, draft-tail
++// tokens take the tree mask bit, and out-of-range tokens are masked.
++//
++// window_left >= 0 folds a sliding window into the mask: the published
++// custom-mask cubins have no SlidingWindow+Custom mask type, and KV below
++// firstSparseMaskOffsetKv is implicitly visible, so the window forces
++// firstSparseMaskOffsetKv = 0 and explicit bits over the whole presented KV
++// range. The window uses slot indices (kv visible iff
++// kv_idx >= prefix + tokenQ - window_left), matching the kernel-side
++// window_left rule the non-tree spec-dec paths and FA2 references apply.
++// Callers should trim the presented KV (page table + seq_lens) to roughly
++// the window so the mask region stays small. Proper SlidingWindow+Custom
++// kernel support in TRTLLM would remove the firstSparseMaskOffsetKv = 0
++// requirement and the packing cost; that is a planned follow-up.
++//
++// The mask region size depends on the runtime seqLensKv values, so this runs
++// as a device kernel (CUDA-graph capturable) over a static worst-case grid.
++__global__ void PackSpecDecMaskKernel(uint32_t* packed_mask, int32_t* first_sparse_mask_offsets_kv,
++                                      bool const* tree_mask, int const* seq_lens_kv, int q_len,
++                                      int num_heads_q_per_kv, int num_insts_q, int num_insts_kv,
++                                      int tile_size_q, int mask_layout, int max_words_per_seq,
++                                      int window_left) {
++  int const batch_idx = blockIdx.y;
++  int const seq_len_kv = seq_lens_kv[batch_idx];
++  int const prefix_len = seq_len_kv >= q_len ? seq_len_kv - q_len : 0;
++  int const tile_size_kv_per_cta = kTileSizeKv * num_insts_kv;
++  bool const has_window = window_left >= 0;
++  int const first_sparse_tile_kv = has_window ? 0 : prefix_len / tile_size_kv_per_cta;
++  int const adjusted_offset_kv = first_sparse_tile_kv * tile_size_kv_per_cta;
++  if (blockIdx.x == 0 && threadIdx.x == 0) {
++    first_sparse_mask_offsets_kv[batch_idx] = adjusted_offset_kv;
++  }
++  bool const is_swaps = mask_layout == kSwapsMaskLayout;
++  int const padded_tile_size_q = ((tile_size_q + 31) / 32) * 32;
++  int const num_tiles_q_per_token =
++      (num_heads_q_per_kv + padded_tile_size_q - 1) / padded_tile_size_q;
++  int const tile_size_q_per_cta = kTileSizeQ * num_insts_q;
++  int const num_tiles_q =
++      is_swaps ? q_len * num_tiles_q_per_token
++               : (q_len * num_heads_q_per_kv + tile_size_q_per_cta - 1) / tile_size_q_per_cta;
++  int const num_mask_tiles_kv =
++      (seq_len_kv + tile_size_kv_per_cta - 1) / tile_size_kv_per_cta - first_sparse_tile_kv;
++  int const words_per_q = is_swaps ? (tile_size_q + 31) / 32 : 0;
++  int const words_per_inst = is_swaps ? kTileSizeKv * words_per_q : kTileSizeQ * kTileSizeKv / 32;
++  int const words_per_tile_block = num_insts_q * num_insts_kv * words_per_inst;
++  int const num_words = num_tiles_q * num_mask_tiles_kv * words_per_tile_block;
++
++  bool const* local_tree_mask = tree_mask + static_cast<int64_t>(batch_idx) * q_len * q_len;
++  uint32_t* local_packed_mask = packed_mask + static_cast<int64_t>(batch_idx) * max_words_per_seq;
++
++  int const linear_idx_start = blockIdx.x * blockDim.x + threadIdx.x;
++  int const linear_idx_stride = gridDim.x * blockDim.x;
++  if (is_swaps) {
++    int const num_positions = q_len * num_mask_tiles_kv * tile_size_kv_per_cta;
++    for (int linear_idx = linear_idx_start; linear_idx < num_positions;
++         linear_idx += linear_idx_stride) {
++      int const token_idx_q = linear_idx / (num_mask_tiles_kv * tile_size_kv_per_cta);
++      int const kv_in_region = linear_idx % (num_mask_tiles_kv * tile_size_kv_per_cta);
++      int const token_idx_kv = adjusted_offset_kv + kv_in_region;
++      if (token_idx_kv >= seq_len_kv) {
++        continue;
++      }
++
++      int const window_floor = has_window ? prefix_len + token_idx_q - window_left : INT_MIN;
++      bool visible = false;
++      if (token_idx_kv < prefix_len) {
++        visible = token_idx_kv >= window_floor;
++      } else {
++        visible = local_tree_mask[token_idx_q * q_len + (token_idx_kv - prefix_len)] &&
++                  token_idx_kv >= window_floor;
++      }
++      if (!visible) {
++        continue;
++      }
++
++      int const tile_idx_kv = kv_in_region / tile_size_kv_per_cta;
++      int const inst_idx_kv = (kv_in_region % tile_size_kv_per_cta) / kTileSizeKv;
++      int const token_idx_in_tile_kv = (kv_in_region % tile_size_kv_per_cta) % kTileSizeKv;
++      for (int head_idx_q = 0; head_idx_q < num_heads_q_per_kv; ++head_idx_q) {
++        int const tile_idx_q =
++            token_idx_q * num_tiles_q_per_token + head_idx_q / padded_tile_size_q;
++        int const token_idx_in_tile_q = head_idx_q % padded_tile_size_q;
++        int64_t const tile_offset =
++            static_cast<int64_t>(tile_idx_q) * num_mask_tiles_kv + tile_idx_kv;
++        int64_t const inst_offset = tile_offset * num_insts_kv + inst_idx_kv;
++        int64_t mask_offset = inst_offset * padded_tile_size_q * kTileSizeKv;
++        int const thread_idx_q = (token_idx_in_tile_q % 8) / 2;
++        int const thread_idx_kv = (token_idx_in_tile_kv % 8) + (token_idx_in_tile_kv / 32) * 8;
++        int const token_idx_in_warp_tile_kv = token_idx_in_tile_kv % 32;
++        int const elt_idx_in_thread = (token_idx_in_tile_q % 2) +
++                                      ((token_idx_in_warp_tile_kv / 8) % 2) * 2 +
++                                      (token_idx_in_tile_q / 8) * 4 +
++                                      (token_idx_in_warp_tile_kv / 16) * 4 * (tile_size_q / 8);
++        mask_offset += (thread_idx_kv * 4 + thread_idx_q) * 32 + elt_idx_in_thread;
++        atomicOr(local_packed_mask + (mask_offset >> 5), 1U << (mask_offset & 0x1F));
++      }
++    }
++    return;
++  }
++
++  for (int word_idx = linear_idx_start; word_idx < num_words; word_idx += linear_idx_stride) {
++    int const tile_block_idx = word_idx / words_per_tile_block;
++    int const word_in_block = word_idx % words_per_tile_block;
++    int const tile_idx_q = tile_block_idx / num_mask_tiles_kv;
++    int const tile_idx_kv = tile_block_idx % num_mask_tiles_kv;
++    // Instance order matches the reference layout: [.., numInstsQ, numInstsKv, ..].
++    int const inst_idx_q = word_in_block / (num_insts_kv * words_per_inst);
++    int const inst_idx_kv = (word_in_block % (num_insts_kv * words_per_inst)) / words_per_inst;
++    int const word_in_inst = word_in_block % words_per_inst;
++    uint32_t word = 0u;
++    int const token_idx_in_tile_q = word_in_inst / (kTileSizeKv / 32);
++    int const kv_word = word_in_inst % (kTileSizeKv / 32);
++    int const row_q =
++        tile_idx_q * tile_size_q_per_cta + inst_idx_q * kTileSizeQ + token_idx_in_tile_q;
++    if (row_q < q_len * num_heads_q_per_kv) {
++      int const token_idx_q = row_q / num_heads_q_per_kv;
++      int const kv_base = adjusted_offset_kv + tile_idx_kv * tile_size_kv_per_cta +
++                          inst_idx_kv * kTileSizeKv + kv_word * 32;
++      int const window_floor = has_window ? prefix_len + token_idx_q - window_left : INT_MIN;
++#pragma unroll
++      for (int bit = 0; bit < 32; ++bit) {
++        int const token_idx_kv = kv_base + bit;
++        bool visible = false;
++        if (token_idx_kv < prefix_len) {
++          visible = token_idx_kv >= window_floor;
++        } else if (token_idx_kv < seq_len_kv) {
++          visible = local_tree_mask[token_idx_q * q_len + (token_idx_kv - prefix_len)] &&
++                    token_idx_kv >= window_floor;
++        }
++        word |= (static_cast<uint32_t>(visible) << bit);
++      }
++    }
++    local_packed_mask[word_idx] = word;
++  }
++}
++
++}  // namespace
++
++void trtllm_fmha_pack_spec_dec_mask(TensorView packed_mask, TensorView first_sparse_mask_offsets_kv,
++                                    TensorView tree_mask, TensorView seq_lens,
++                                    int64_t num_heads_q_per_kv, int64_t num_insts_q,
++                                    int64_t num_insts_kv, int64_t tile_size_q, int64_t mask_layout,
++                                    int64_t window_left) {
++  TVM_FFI_ICHECK_EQ(tree_mask.dtype(), dl_bool) << "tree_mask must be a bool tensor";
++  TVM_FFI_ICHECK_EQ(tree_mask.ndim(), 3) << "tree_mask must have shape [batch, q_len, q_len]";
++  TVM_FFI_ICHECK_EQ(tree_mask.size(1), tree_mask.size(2))
++      << "tree_mask must have shape [batch, q_len, q_len]";
++  TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be an int32 tensor";
++  TVM_FFI_ICHECK_EQ(packed_mask.dtype(), dl_uint32) << "packed_mask must be a uint32 tensor";
++  TVM_FFI_ICHECK_EQ(packed_mask.ndim(), 2)
++      << "packed_mask must have shape [batch, max_words_per_seq]";
++  TVM_FFI_ICHECK_EQ(first_sparse_mask_offsets_kv.dtype(), dl_int32)
++      << "first_sparse_mask_offsets_kv must be an int32 tensor";
++  TVM_FFI_ICHECK(num_insts_kv == 1 || num_insts_kv == 2) << "num_insts_kv must be 1 or 2";
++  TVM_FFI_ICHECK(num_insts_q == 1 || num_insts_q == 2) << "num_insts_q must be 1 or 2";
++  TVM_FFI_ICHECK(num_insts_q * num_insts_kv <= 2)
++      << "at most two tile instances are supported (numInstsQ * numInstsKv <= 2)";
++  TVM_FFI_ICHECK(num_insts_q == 1 || mask_layout == kKeepsMaskLayout)
++      << "num_insts_q == 2 is only supported by the keeps mask layout";
++  TVM_FFI_ICHECK(tile_size_q == 8 || tile_size_q == 16 || tile_size_q == 32 || tile_size_q == 128)
++      << "tile_size_q must be 8, 16, 32, or 128";
++  TVM_FFI_ICHECK(mask_layout == kKeepsMaskLayout || mask_layout == kSwapsMaskLayout)
++      << "mask_layout must be keeps or swaps";
++
++  int const batch_size = tree_mask.size(0);
++  int const q_len = tree_mask.size(1);
++  int const max_words_per_seq = packed_mask.size(1);
++  TVM_FFI_ICHECK_EQ(packed_mask.size(0), batch_size);
++  TVM_FFI_ICHECK_EQ(first_sparse_mask_offsets_kv.size(0), batch_size);
++  TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
++
++  const auto stream = get_stream(packed_mask.device());
++  cudaMemsetAsync(packed_mask.data_ptr(), 0,
++                  packed_mask.size(0) * packed_mask.size(1) * sizeof(uint32_t), stream);
++  dim3 const grid((max_words_per_seq + kThreadsPerBlock - 1) / kThreadsPerBlock, batch_size);
++  PackSpecDecMaskKernel<<<grid, kThreadsPerBlock, 0, stream>>>(
++      static_cast<uint32_t*>(packed_mask.data_ptr()),
++      static_cast<int32_t*>(first_sparse_mask_offsets_kv.data_ptr()),
++      static_cast<bool const*>(tree_mask.data_ptr()), static_cast<int const*>(seq_lens.data_ptr()),
++      q_len, static_cast<int>(num_heads_q_per_kv), static_cast<int>(num_insts_q),
++      static_cast<int>(num_insts_kv), static_cast<int>(tile_size_q), static_cast<int>(mask_layout),
++      max_words_per_seq, static_cast<int>(window_left));
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fmha_pack_spec_dec_mask, trtllm_fmha_pack_spec_dec_mask);
++
++}  // namespace flashinfer
+diff --git a/flashinfer/decode.py b/flashinfer/decode.py
+index 21c0187..074e1e4 100644
+--- a/flashinfer/decode.py
++++ b/flashinfer/decode.py
+@@ -16,9 +16,10 @@ limitations under the License.
+ 
+ import functools
+ import math
++import os
+ import warnings
+ from types import SimpleNamespace
+-from typing import Any, List, Literal, Optional, Tuple, Union, overload
++from typing import Any, List, Literal, NamedTuple, Optional, Tuple, Union, overload
+ 
+ import torch
+ 
+@@ -2907,6 +2908,12 @@ class TrtllmGenDecodeModule:
+             None,  # sparse_mla_top_k_lens
+             bf16q_fp8kv_transform_mode,
+             None,  # use_fp16_softmax
++            None,  # packed_custom_mask
++            None,  # custom_mask_offsets
++            None,  # first_sparse_mask_offsets_kv
++            False,  # force_spec_dec_tree_keeps
++            False,  # custom_mask_uses_sliding_window
++            False,  # use_spec_dec_tree_2q
+         )
+         return out
+ 
+@@ -3069,6 +3076,292 @@ def get_trtllm_gen_decode_module(*args):
+     )
+ 
+ 
++def _check_xqa_nvfp4_page_size(page_size: int) -> None:
++    """Validate page_size for the XQA backend with an NVFP4 KV cache.
++
++    XQA's NVFP4 path only supports page_size 64 or 128; page_size 16/32 reach
++    the kernel but silently produce wrong results, so reject them early.
++    """
++    if page_size in (16, 32):
++        raise ValueError(
++            "NVFP4 KV cache page_size 16 and 32 are not supported by "
++            "FlashInfer XQA. Use page_size 64 or 128 instead. "
++            f"Got page_size={page_size}."
++        )
++
++
++class _SpecDecTreeKernelLayout(NamedTuple):
++    kernel_layout: Literal["keeps", "swaps"]
++    tile_size_q: int
++    num_insts_kv: int
++    num_heads_q_per_kv: int
++    # stepQ / tileSizeQ of the selected cubin: 2 selects the 2Qx1KV Keeps
++    # schedule (which always has num_insts_kv == 1), else 1.
++    num_insts_q: int = 1
++
++    @property
++    def layout_id(self) -> int:
++        return 1 if self.kernel_layout == "swaps" else 0
++
++    def words_per_sequence(
++        self, q_len: int, max_seq_len: Optional[int], window_left: int
++    ) -> int:
++        tile_size_kv_per_cta = 128 * self.num_insts_kv
++        if window_left >= 0:
++            if max_seq_len is None:
++                raise ValueError(
++                    "window_left >= 0 requires max_seq_len for mask sizing"
++                )
++            max_mask_tiles_kv = ceil_div(max_seq_len, tile_size_kv_per_cta)
++        else:
++            max_mask_tiles_kv = ceil_div(
++                tile_size_kv_per_cta - 1 + q_len, tile_size_kv_per_cta
++            )
++        if self.kernel_layout == "swaps":
++            tile_size_q = ceil_div(self.tile_size_q, 32) * 32
++            num_tiles_q = q_len * ceil_div(self.num_heads_q_per_kv, tile_size_q)
++            words_per_tile_block = (
++                self.num_insts_kv * 128 * ceil_div(self.tile_size_q, 32)
++            )
++        else:
++            num_tiles_q = ceil_div(
++                q_len * self.num_heads_q_per_kv, 128 * self.num_insts_q
++            )
++            words_per_tile_block = (
++                self.num_insts_q * self.num_insts_kv * (128 * 128 // 32)
++            )
++        return num_tiles_q * max_mask_tiles_kv * words_per_tile_block
++
++
++def _select_trtllm_gen_spec_dec_tree_kernel(
++    q_dtype: torch.dtype,
++    kv_dtype: torch.dtype,
++    num_heads_q_per_kv: int,
++    q_len: int,
++    force_keeps: bool = False,
++) -> _SpecDecTreeKernelLayout:
++    num_tokens_heads_q = num_heads_q_per_kv * q_len
++    num_insts_kv = 1 if q_dtype != kv_dtype else 2
++    if force_keeps:
++        return _SpecDecTreeKernelLayout("keeps", 128, num_insts_kv, num_heads_q_per_kv)
++    if num_tokens_heads_q <= 8:
++        return _SpecDecTreeKernelLayout("swaps", 8, num_insts_kv, num_heads_q_per_kv)
++    if num_tokens_heads_q <= 16:
++        return _SpecDecTreeKernelLayout("swaps", 16, num_insts_kv, num_heads_q_per_kv)
++    if num_tokens_heads_q <= 64:
++        return _SpecDecTreeKernelLayout("swaps", 32, num_insts_kv, num_heads_q_per_kv)
++    return _SpecDecTreeKernelLayout("keeps", 128, num_insts_kv, num_heads_q_per_kv)
++
++
++def _should_force_trtllm_gen_spec_dec_tree_keeps(
++    layout: _SpecDecTreeKernelLayout,
++    seq_lens: torch.Tensor,
++    q_len: int,
++    window_left: int,
++) -> bool:
++    if layout.kernel_layout != "swaps":
++        return False
++    if os.environ.get("FLASHINFER_TRTLLM_GEN_SPEC_DEC_TREE_ENABLE_SWAPS") != "1":
++        # Swaps remains available for explicit benchmarking, but regresses the
++        # small B300 verify shapes measured for the initial native artifact.
++        return True
++    if window_left >= 0:
++        return True
++    if seq_lens.is_cuda and torch.cuda.is_current_stream_capturing():
++        # Sequence lengths are device-resident during graph capture. Avoid a
++        # host sync and select the layout that is valid for every alignment.
++        return True
++    tile_size_kv_per_cta = 128 * layout.num_insts_kv
++    prefix_lens = seq_lens - q_len
++    straddles_kv_cta = (
++        prefix_lens % tile_size_kv_per_cta
++    ) + q_len > tile_size_kv_per_cta
++    return bool(torch.any(straddles_kv_cta).item())
++
++
++# Cross-repo capability flag read by callers (e.g. sglang's trtllm_mha
++# backend) to gate untrimmed SWA page tables for spec-dec tree verify: native
++# SlidingWindowCustom cubins skip out-of-window KV tiles in-kernel, and when a
++# shape has no native cubin the window is folded into the packed custom mask,
++# which stays correct over the full presented KV range.
++trtllm_gen_supports_untrimmed_swa_spec_dec_tree = True
++
++
++def _prefers_trtllm_gen_spec_dec_tree_2q(
++    layout: _SpecDecTreeKernelLayout,
++    q_dtype: torch.dtype,
++    kv_dtype: torch.dtype,
++    o_dtype: torch.dtype,
++    batch_size: int,
++    num_kv_heads: int,
++    q_len: int,
++    window_left: int,
++    custom_mask_uses_sliding_window: bool,
++    sm_count: int,
++) -> bool:
++    """Wave-transition tuning heuristic for the 2Qx1KV Keeps schedule.
++
++    A fully populated 2Q tile halves the CTA count, which wins when the 2Q
++    grid fits in one wave and the 1Q grid does not. This decision lives here,
++    next to the mask packing, because the packed custom mask must be laid out
++    for the selected schedule's instance split; the C++ runner obeys the
++    resulting flag instead of re-deciding. fp16/bf16 and window <= 256 are
++    the measured tuning bounds.
++    """
++    if layout.kernel_layout != "keeps":
++        return False
++    if not custom_mask_uses_sliding_window:
++        return False
++    if q_dtype not in (torch.float16, torch.bfloat16):
++        return False
++    if kv_dtype != q_dtype or o_dtype != q_dtype:
++        return False
++    # The runner maps window_left to mAttentionWindowSize = window_left + 1.
++    if window_left + 1 > 256:
++        return False
++    num_ctas_2q = batch_size * num_kv_heads
++    return (
++        batch_size >= 64
++        and num_ctas_2q <= sm_count
++        and 2 * num_ctas_2q > sm_count
++        and q_len * layout.num_heads_q_per_kv >= 2 * layout.tile_size_q
++    )
++
++
++def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
++    query: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    out: torch.Tensor,
++    batch_size: int,
++    max_q_len: int,
++    max_seq_len: int,
++    window_left: int,
++    uses_shared_paged_kv_idx: bool,
++    force_keeps: bool,
++    use_2q: bool = False,
++) -> bool:
++    return bool(
++        get_trtllm_gen_fmha_module().trtllm_fmha_has_spec_dec_tree_kernel(
++            query,
++            k_cache,
++            v_cache,
++            out,
++            batch_size,
++            max_q_len,
++            max_seq_len,
++            window_left,
++            uses_shared_paged_kv_idx,
++            force_keeps,
++            True,
++            use_2q,
++        )
++    )
++
++
++def _pack_trtllm_gen_spec_dec_mask(
++    mask: torch.Tensor,
++    seq_lens: torch.Tensor,
++    q_len_per_req: Optional[int],
++    q_dtype: torch.dtype,
++    kv_dtype: torch.dtype,
++    num_heads_q_per_kv: int,
++    batch_size: int,
++    window_left: int = -1,
++    max_seq_len: Optional[int] = None,
++    force_keeps: bool = False,
++    use_2q: bool = False,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Pack a dense spec-dec tree mask into the TRTLLM custom-mask layout.
++
++    The packed bit layout matches the Q128 KeepsMmaAbForGeneration custom-mask
++    cubins and mirrors TRT-LLM's prepareCustomMask.cu: rows are
++    tokenQ * numHeadsQPerKv + head (head-broadcast), grouped into
++    [numTilesQ, numMaskTilesKv, numInstsKv, 128, 128] bit tiles. numInstsKv =
++    stepKv / tileSizeKv of the selected cubin: 2 for same-dtype Q/KV (stepKv
++    256) and 1 for mixed-dtype (stepKv 128); the packing must agree with the
++    instancing the selected cubin was built with. Each sequence occupies a
++    fixed stride in the packed buffer and the offsets tensor carries
++    per-sequence starts in uint32 units, so all shapes are static for a given
++    (batch_size, q_len_per_req) and the packing kernel is CUDA-graph
++    capturable.
++
++    ``window_left >= 0`` selects the compatibility fallback layout: the
++    sliding window is folded into the packed mask, the kernel-side window is
++    disabled, and the mask region covers the whole presented KV range sized
++    by ``max_seq_len``. Native ``SlidingWindowCustom`` kernels pass
++    ``window_left=-1`` here so the packed mask is tail-only and the kernel
++    applies the window analytically.
++    """
++    if q_len_per_req is None or q_len_per_req <= 1:
++        raise ValueError(
++            "mask requires uniform q_len_per_req > 1 for the trtllm-gen backend"
++        )
++    if mask.dtype != torch.bool or mask.shape != (
++        batch_size,
++        q_len_per_req,
++        q_len_per_req,
++    ):
++        raise ValueError(
++            "mask must be a bool tensor of shape [batch_size, q_len_per_req, "
++            f"q_len_per_req], got {mask.dtype} {tuple(mask.shape)}"
++        )
++    if window_left >= 0:
++        if max_seq_len is None:
++            raise ValueError("window_left >= 0 requires max_seq_len for mask sizing")
++        if seq_lens.numel() != batch_size:
++            raise ValueError(
++                f"seq_lens must have shape [{batch_size}] when packing spec-dec masks"
++            )
++        is_cuda_graph_capturing = (
++            mask.is_cuda and torch.cuda.is_current_stream_capturing()
++        )
++        if not is_cuda_graph_capturing and int(seq_lens.max().item()) > max_seq_len:
++            raise ValueError(
++                "seq_lens contains values larger than max_seq_len; trim the "
++                "presented KV/page table and pass the trimmed bound."
++            )
++    if use_2q:
++        # The 2Qx1KV Keeps schedule needs its own mask layout: two Q instances
++        # per CTA (per-instance rows) and a single KV instance.
++        kernel_layout = _SpecDecTreeKernelLayout(
++            "keeps", 128, 1, num_heads_q_per_kv, num_insts_q=2
++        )
++    else:
++        kernel_layout = _select_trtllm_gen_spec_dec_tree_kernel(
++            q_dtype, kv_dtype, num_heads_q_per_kv, q_len_per_req, force_keeps
++        )
++    words_per_seq = kernel_layout.words_per_sequence(
++        q_len_per_req, max_seq_len, window_left
++    )
++    packed_custom_mask = torch.empty(
++        (batch_size, words_per_seq), dtype=torch.uint32, device=mask.device
++    )
++    custom_mask_offsets = torch.arange(
++        0,
++        batch_size * words_per_seq,
++        words_per_seq,
++        dtype=torch.int64,
++        device=mask.device,
++    )
++    first_sparse_mask_offsets_kv = torch.empty(
++        (batch_size,), dtype=torch.int32, device=mask.device
++    )
++    get_trtllm_gen_fmha_module().trtllm_fmha_pack_spec_dec_mask(
++        packed_custom_mask,
++        first_sparse_mask_offsets_kv,
++        mask.contiguous(),
++        seq_lens.to(device=mask.device, dtype=torch.int32),
++        num_heads_q_per_kv,
++        kernel_layout.num_insts_q,
++        kernel_layout.num_insts_kv,
++        kernel_layout.tile_size_q,
++        kernel_layout.layout_id,
++        window_left,
++    )
++    return packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv
++
++
+ @flashinfer_api(trace=trtllm_batch_decode_trace_dispatch)
+ def trtllm_batch_decode_with_kv_cache(
+     query: torch.Tensor,
+@@ -3102,6 +3395,9 @@ def trtllm_batch_decode_with_kv_cache(
+     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+     enable_block_sparse_attention: bool = False,
+     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
++    spec_dec_packed_mask: Optional[
++        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
++    ] = None,
+ ) -> Union[
+     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
+ ]:
+@@ -3206,7 +3502,24 @@ def trtllm_batch_decode_with_kv_cache(
+         output scale factor for xqa fp8 output.
+ 
+     mask : Optional[torch.Tensor] = None
+-        causal attention mask for xqa speculative decoding.
++        Attention mask for speculative decoding (``q_len_per_req > 1``).
++        The format is backend specific:
++
++        - ``xqa``: packed causal mask with shape
++          ``[batch_size, q_len_per_req, ceil(q_len_per_req / 32) * 2]``.
++        - ``trtllm-gen``: dense bool spec-dec tree mask with shape
++          ``[batch_size, q_len_per_req, q_len_per_req]`` (True = attend).
++          Row ``i`` masks draft token ``i`` against the draft tail; the KV
++          prefix before the draft tail is always attended. Requires uniform
++          query lengths (``q_len_per_req``), paged KV cache, and head_dim 64
++          or 128. When the loaded TRTLLM artifact contains native
++          ``SlidingWindowCustom`` kernels, ``window_left >= 0`` keeps the full
++          presented KV range and applies the window in-kernel using the same
++          slot-index rule as non-tree window paths (kv visible iff
++          ``kv_idx >= prefix + row - window_left``). Older artifacts fall back
++          to folding the window into the packed mask; in that mode callers
++          should trim the page table and ``seq_lens`` to roughly the window
++          and pass the trimmed bound as ``max_seq_len``.
+ 
+     max_q_len: Optional[int] = None
+         The maximum query sequence length across all requests when using variable-length queries.
+@@ -3544,6 +3857,119 @@ def trtllm_batch_decode_with_kv_cache(
+                     "block-sparse attention requires contiguous seq_lens and "
+                     "block_tables tensors"
+                 )
++        packed_custom_mask = None
++        custom_mask_offsets = None
++        first_sparse_mask_offsets_kv = None
++        force_spec_dec_tree_keeps = False
++        custom_mask_uses_sliding_window = False
++        use_spec_dec_tree_2q = False
++        if mask is not None:
++            if q_len_per_req is None or q_len_per_req <= 1:
++                raise ValueError("TRTLLM spec-dec tree mask requires q_len_per_req > 1")
++            num_kv_heads = k_cache.shape[-3]
++            spec_dec_tree_layout = _select_trtllm_gen_spec_dec_tree_kernel(
++                query.dtype,
++                k_cache.dtype,
++                query.size(1) // num_kv_heads,
++                q_len_per_req,
++            )
++            native_force_spec_dec_tree_keeps = (
++                _should_force_trtllm_gen_spec_dec_tree_keeps(
++                    spec_dec_tree_layout,
++                    seq_lens,
++                    q_len_per_req,
++                    -1,
++                )
++            )
++            custom_mask_uses_sliding_window = (
++                window_left >= 0
++                and _has_trtllm_gen_native_spec_dec_tree_window_kernel(
++                    query,
++                    k_cache,
++                    v_cache,
++                    out,
++                    batch_size,
++                    max_q_len,
++                    max_seq_len,
++                    window_left,
++                    uses_shared_paged_kv_idx,
++                    native_force_spec_dec_tree_keeps,
++                )
++            )
++            mask_pack_window_left = (
++                -1 if custom_mask_uses_sliding_window else window_left
++            )
++            force_spec_dec_tree_keeps = _should_force_trtllm_gen_spec_dec_tree_keeps(
++                spec_dec_tree_layout,
++                seq_lens,
++                q_len_per_req,
++                mask_pack_window_left,
++            )
++            # The 2Qx1KV schedule decision is made here, before packing,
++            # because the packed mask layout must match the schedule's
++            # instance split; the C++ runner obeys the flag. Only take it
++            # when the loaded artifact actually has the 2Q cubin.
++            use_spec_dec_tree_2q = _prefers_trtllm_gen_spec_dec_tree_2q(
++                spec_dec_tree_layout,
++                query.dtype,
++                k_cache.dtype,
++                out.dtype if isinstance(out, torch.Tensor) else query.dtype,
++                batch_size,
++                num_kv_heads,
++                q_len_per_req,
++                window_left,
++                custom_mask_uses_sliding_window,
++                sm_count,
++            ) and _has_trtllm_gen_native_spec_dec_tree_window_kernel(
++                query,
++                k_cache,
++                v_cache,
++                out,
++                batch_size,
++                max_q_len,
++                max_seq_len,
++                window_left,
++                uses_shared_paged_kv_idx,
++                native_force_spec_dec_tree_keeps,
++                use_2q=True,
++            )
++            if (
++                spec_dec_packed_mask is not None
++                and mask_pack_window_left == -1
++                and not force_spec_dec_tree_keeps
++                and not use_spec_dec_tree_2q
++            ):
++                # Packed once per step by the caller (tail-only layout, which
++                # every layer shares); skips a pack per layer.
++                (
++                    packed_custom_mask,
++                    custom_mask_offsets,
++                    first_sparse_mask_offsets_kv,
++                ) = spec_dec_packed_mask
++            else:
++                (
++                    packed_custom_mask,
++                    custom_mask_offsets,
++                    first_sparse_mask_offsets_kv,
++                ) = _pack_trtllm_gen_spec_dec_mask(
++                    mask,
++                    seq_lens,
++                    q_len_per_req,
++                    query.dtype,
++                    k_cache.dtype,
++                    query.size(1) // num_kv_heads,
++                    batch_size,
++                    mask_pack_window_left,
++                    max_seq_len,
++                    force_spec_dec_tree_keeps,
++                    use_2q=use_spec_dec_tree_2q,
++                )
++            if not custom_mask_uses_sliding_window:
++                # Older artifacts have no SlidingWindowCustom mask type, so
++                # the window is folded into the packed mask above and the
++                # kernel runs without a kernel-side window.
++                window_left = -1
++
+ 
+         num_qo_heads = query.size(1)
+         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+@@ -3602,6 +4028,12 @@ def trtllm_batch_decode_with_kv_cache(
+             None,  # sparse_mla_top_k_lens
+             bf16q_fp8kv_transform_mode_value,
+             None,  # use_fp16_softmax
++            packed_custom_mask,
++            custom_mask_offsets,
++            first_sparse_mask_offsets_kv,
++            force_spec_dec_tree_keeps,
++            custom_mask_uses_sliding_window,
++            use_spec_dec_tree_2q,
+         )
+ 
+         result_out = (
+diff --git a/flashinfer/jit/attention/modules.py b/flashinfer/jit/attention/modules.py
+index a9ab6b4..a0e45b1 100644
+--- a/flashinfer/jit/attention/modules.py
++++ b/flashinfer/jit/attention/modules.py
+@@ -1904,9 +1904,11 @@ def gen_trtllm_gen_fmha_module():
+     assert metainfo, f"{header_name}.h not found"
+ 
+     return gen_jit_spec(
+-        "fmha_gen",
++        # ponytail: renamed so the prebuilt fmha_gen in flashinfer-jit-cache never shadows this build
++        "fmha_gen_tree",
+         [
+             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
++            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_spec_dec_mask.cu",
+             jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
+             jit_env.FLASHINFER_CSRC_DIR / "trtllm_sage_quant.cu",
+             jit_env.FLASHINFER_CSRC_DIR
+diff --git a/include/flashinfer/trtllm/fmha/fmhaKernels.cuh b/include/flashinfer/trtllm/fmha/fmhaKernels.cuh
+index 94b625d..39639a5 100644
+--- a/include/flashinfer/trtllm/fmha/fmhaKernels.cuh
++++ b/include/flashinfer/trtllm/fmha/fmhaKernels.cuh
+@@ -348,13 +348,31 @@ class TllmGenFmhaKernel {
+   }
+ 
+   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
+-    // The selectKernelParams that might be updated.
+     SelectKernelParams selectKernelParams{params};
+-    // Select the kernel.
+-    selectKernel(params, selectKernelParams);
+-    // Hash the runner params.
+-    auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
+-    return std::make_pair(mKernelMetaMap.find(hashId) != mKernelMetaMap.end(), info);
++    CtaLaunchParams ctaLaunchParams;
++
++    // Match run(): a shape can reselect after CTA sizing (for example, short KV sequences
++    // disable multi-CTA reduction). Checking only the initial key can therefore report a kernel
++    // that the launch will not use.
++    static constexpr int kMaxKernelSelectionPasses = 4;
++    std::string info;
++    for (int pass = 0; pass < kMaxKernelSelectionPasses; ++pass) {
++      selectKernel(params, selectKernelParams);
++      auto [hashId, currentInfo] = hashFromRunnerParams(params, selectKernelParams);
++      info = currentInfo;
++      auto const kernelIt = mKernelMetaMap.find(hashId);
++      if (kernelIt == mKernelMetaMap.end()) {
++        // With mUses2InstsQDecodeKernels this reports the 2Qx1KV cubin's absence (older
++        // artifact or unexported dtype); the caller falls back to the 1Q layout before packing.
++        return std::make_pair(false, info);
++      }
++      computeCtaAndClusterConfig(ctaLaunchParams, params, mKernelMeta[kernelIt->second],
++                                 selectKernelParams);
++      if (!selectKernelParams.mSelectNewKernel) {
++        return std::make_pair(true, info);
++      }
++    }
++    return std::make_pair(false, info);
+   }
+ 
+   // start here
+@@ -614,8 +632,27 @@ class TllmGenFmhaKernel {
+       // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
+       // The factor of 2 is applied here to ensure the reduction overhead does not outweigh the
+       // benefits of a shorter mainloop.
+-      int const maxNumCtasPerSeqKv =
++      int maxNumCtasPerSeqKv =
+           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
++      // For sliding-window custom masks, the kernels skip the below-window KV tiles and divide
++      // only the window-region work among the KV CTAs: the runtime recomputes
++      // numCtasKv = min(divUp(validSeqLenKv, stepKv), maxNumCtasKv) and CTAs beyond it exit
++      // before the mainloop. Cap the split at the window's step count so we never launch CTAs
++      // the runtime will prune; this cannot change the active split. Do not apply the factor-2
++      // minimum work per CTA to the window region: halving the window's steps doubles each CTA's
++      // mainloop depth and measures 1.3-1.5x slower on B200 at small batch (window 640,
++      // maxSeqLenKv 8192 and 131072). A window that fits one minimum-work CTA clamps to a single
++      // CTA to select the disabled-reduction kernel (also the config the 2-instsQ decode kernels
++      // require).
++      if (isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
++        int const windowSpanKv =
++            std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
++        int const windowCapKv =
++            (windowSpanKv + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv) == 1
++                ? 1
++                : flashinfer::ceil_div(windowSpanKv, kernelMeta.mStepKv);
++        maxNumCtasPerSeqKv = std::min(maxNumCtasPerSeqKv, windowCapKv);
++      }
+       int tunedMaxNumCtasPerSeqKv = maxNumCtasPerSeqKv;
+       // Cap BF16Q+FP8KV separate-transform splits so the runtime key selects
+       // CGA reduction when the smaller split is expected.
+@@ -656,8 +693,16 @@ class TllmGenFmhaKernel {
+       // Disable the multiCtasKvMode if there is only one CtaKv.
+       if (numCtasPerSeqKv <= 1) {
+         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+-        // Enable the persistent scheduler for better performance.
+-        selectKernelParams.mTileScheduler = TileScheduler::Persistent;
++        // Enable the persistent scheduler for better performance. Spec-dec custom-mask
++        // generation kernels keep the static scheduler chosen at selection: their grids are
++        // small (batch x kvHeads) and an underfilled persistent grid only adds tile-scheduler
++        // overhead per launch.
++        // SlidingWindowCustom ships no static single-CTA-per-sequence cubin, only the persistent
++        // one, so it takes the persistent scheduler like the causal kernels.
++        if (!isCustomMask(selectKernelParams.mMaskType) ||
++            isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
++          selectKernelParams.mTileScheduler = TileScheduler::Persistent;
++        }
+         // Need to select a different kernel.
+         selectKernelParams.mSelectNewKernel = true;
+       } else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) &&
+@@ -1135,6 +1180,77 @@ class TllmGenFmhaKernel {
+     }
+   }
+ 
++  // Selects the generation kernel for custom-mask (spec-dec tree) attention.
++  // Mirrors the TRTLLM kernel autotuner's spec-dec tree selection. SwapsMmaAb
++  // uses one draft token per CTA and packs the custom mask in the Swaps LDTM
++  // bit layout; KeepsMmaAb uses the Q128 row-major custom-mask layout. The
++  // Python mask packer mirrors this same threshold table.
++  // CgaSmemReduction is feasible for some Swaps cases, but the TRTLLM autotuner
++  // selects GmemReduction for spec-dec tree, so keep the reduction mode aligned.
++  void selectSpecDecTreeGenerationKernel(RunnerParams const& params,
++                                         SelectKernelParams& selectKernelParams) const {
++    FLASHINFER_CHECK(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
++                     "Custom-mask spec-dec generation requires headDimQk 64 or 128, got %d.",
++                     params.mHeadDimQk);
++    FLASHINFER_CHECK(isPagedKv(params.mQkvLayout),
++                     "Custom-mask spec-dec generation requires a paged KV cache.");
++    if (!isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
++      FLASHINFER_CHECK(
++          params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
++              params.mChunkedAttentionSize == INT_MAX,
++          "Custom-mask spec-dec generation requires SlidingWindowCustom metadata for "
++          "kernel-side sliding-window masking; fold the window into the packed custom mask "
++          "instead.");
++    } else {
++      FLASHINFER_CHECK(
++          params.mAttentionWindowSize != INT_MAX && params.mChunkedAttentionSize == INT_MAX,
++          "SlidingWindowCustom spec-dec generation requires sliding-window attention "
++          "and does not support chunked attention.");
++    }
++    // groupsTokensHeadsQ is a pre-load kernel-key trait: the custom-mask Keeps
++    // cubins are token-grouped and the Swaps cubins are single-token, so set it
++    // with the kernel type here, before any loadKernel() probe hashes it.
++    int const numTokensHeadsQ = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
++    if (params.mForceSpecDecTreeKeeps) {
++      selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
++      selectKernelParams.mTileSizeQ = 128;
++      selectKernelParams.mGroupsTokensHeadsQ = true;
++    } else if (numTokensHeadsQ <= 8) {
++      selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
++      selectKernelParams.mTileSizeQ = 8;
++      selectKernelParams.mGroupsTokensHeadsQ = false;
++    } else if (numTokensHeadsQ <= 16) {
++      selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
++      selectKernelParams.mTileSizeQ = 16;
++      selectKernelParams.mGroupsTokensHeadsQ = false;
++    } else if (numTokensHeadsQ <= 64) {
++      selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
++      selectKernelParams.mTileSizeQ = 32;
++      selectKernelParams.mGroupsTokensHeadsQ = false;
++    } else {
++      selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
++      selectKernelParams.mTileSizeQ = 128;
++      selectKernelParams.mGroupsTokensHeadsQ = true;
++    }
++    selectKernelParams.mTileSizeKv = 128;
++    selectKernelParams.mForceGmemReduction = true;
++
++    // Select the 2Qx1KV Keeps schedule when the caller asks for it. The caller owns the
++    // decision (the wave-transition tuning heuristic lives in Python next to the mask packing)
++    // because the packed custom mask must be laid out for the schedule's instance split; a
++    // silent fallback here would run a 1Q kernel against a 2Q-packed mask. Callers probe
++    // checkIfKernelExist with the flag before packing, so a missing cubin at run() is an error.
++    if (params.mUses2InstsQDecodeKernels) {
++      FLASHINFER_CHECK(
++          selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
++              isSlidingWindowCustomMask(selectKernelParams.mMaskType),
++          "mUses2InstsQDecodeKernels requires the Keeps SlidingWindowCustom spec-dec tree path.");
++      selectKernelParams.mUses2QSlidingWindowKernel = true;
++      selectKernelParams.mTileScheduler = TileScheduler::Static;
++      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
++    }
++  }
++
+   // Select a kernel based on the heuristic.
+   void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const {
+     // Normalize this before heuristic probing; some GQA-generation heuristics load candidate
+@@ -1156,7 +1272,11 @@ class TllmGenFmhaKernel {
+             "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
+       }
+     } else if (isGenerationKernel(params.mKernelType)) {
+-      selectGqGenerationKernel(params, selectKernelParams);
++      if (isCustomMask(selectKernelParams.mMaskType)) {
++        selectSpecDecTreeGenerationKernel(params, selectKernelParams);
++      } else {
++        selectGqGenerationKernel(params, selectKernelParams);
++      }
+     }
+ 
+     // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration
+@@ -1170,7 +1290,7 @@ class TllmGenFmhaKernel {
+     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
+     // window size or chunked attention size. This is supported by causal-mask context kernels and
+     // generation-phase kernels.
+-    if (!isSparseMla(params.mSparseMlaType) &&
++    if (!isSparseMla(params.mSparseMlaType) && !isCustomMask(selectKernelParams.mMaskType) &&
+         (selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal ||
+          !isContextKernel(params.mKernelType)) &&
+         (params.mMaxSeqLenKv > params.mAttentionWindowSize ||
+@@ -1208,7 +1328,9 @@ class TllmGenFmhaKernel {
+         ", bf16QFp8KvTransformMode=" +
+         std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
+         ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
+-        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
++        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) +
++        ", uses2QSlidingWindowKernel=" +
++        std::to_string(selectKernelParams.mUses2QSlidingWindowKernel);
+     IKL_LOG_DEBUG(
+         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
+         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
+@@ -1226,7 +1348,7 @@ class TllmGenFmhaKernel {
+                selectKernelParams.mGroupsTokensHeadsQ, static_cast<int>(params.mSparseMlaType),
+                selectKernelParams.mSkipsSoftmaxWhenPossible,
+                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
+-               /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
++               selectKernelParams.mUses2QSlidingWindowKernel, selectKernelParams.mUseFp16Softmax,
+                selectKernelParams.mUsesSpcompress),
+         info);
+   }
+diff --git a/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h b/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
+index af413e3..0ae35c6 100644
+--- a/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
++++ b/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
+@@ -35,7 +35,9 @@ enum class TrtllmGenAttentionMaskType {
+   // Sliding window or chunked causal mask.
+   SlidingOrChunkedCausal,
+   // Custom mask.
+-  Custom
++  Custom,
++  // Custom mask combined with sliding-window masking.
++  SlidingWindowCustom
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -50,10 +52,15 @@ enum class TrtllmGenAttentionMaskType {
+ ATTENTION_MASK_TYPE_FUNCTION(Dense)
+ ATTENTION_MASK_TYPE_FUNCTION(Causal)
+ ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
+-ATTENTION_MASK_TYPE_FUNCTION(Custom)
++ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ 
+ #undef ATTENTION_MASK_TYPE_FUNCTION
+ 
++inline bool isCustomMask(TrtllmGenAttentionMaskType maskType) {
++  return maskType == TrtllmGenAttentionMaskType::Custom ||
++         maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ enum class FmhaKernelType {
+@@ -312,6 +319,14 @@ struct TllmGenFmhaRunnerParams {
+   int mAttentionWindowSize;
+   // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
+   int mChunkedAttentionSize;
++  // Force the spec-dec tree custom-mask path onto KeepsMmaAb when a runtime
++  // sequence shape cannot be represented safely by the Swaps packed layout.
++  bool mForceSpecDecTreeKeeps;
++  // Select the 2Qx1KV Keeps schedule for spec-dec tree SlidingWindowCustom decode. The caller
++  // owns this decision because the packed custom mask must be laid out for the schedule's
++  // instance split (numInstsQ=2, numInstsKv=1); probe checkIfKernelExist with this flag before
++  // packing.
++  bool mUses2InstsQDecodeKernels;
+   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
+   int mSumOfSeqLensQ;
+   int mSumOfSeqLensKv;
+@@ -382,6 +397,9 @@ struct TllmGenFmhaRunnerParams {
+       case 3:  // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+         mMaskType = TrtllmGenAttentionMaskType::Custom;
+         break;
++      case 4:  // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CUSTOM
++        mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCustom;
++        break;
+       default:
+         FLASHINFER_ERROR("Invalid attention mask type");
+     }
+@@ -438,6 +456,9 @@ struct TllmGenSelectKernelParams {
+   bool mGroupsTokensHeadsQ;
+   // Transform mode for BF16 query + FP8 KV generation kernels.
+   Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
++  // Select the 2Qx1KV Keeps generation kernel (caller-owned via
++  // RunnerParams::mUses2InstsQDecodeKernels; the packed mask layout must match).
++  bool mUses2QSlidingWindowKernel;
+ 
+   // The constructor.
+   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
+@@ -461,5 +482,6 @@ struct TllmGenSelectKernelParams {
+         mTileSizeKv(128),
+         mUses2CtaMma(false),
+         mGroupsTokensHeadsQ(false),
+-        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode) {};
++        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode),
++        mUses2QSlidingWindowKernel(false) {};
+ };
+-- 
+2.50.1 (Apple Git-155)
+
