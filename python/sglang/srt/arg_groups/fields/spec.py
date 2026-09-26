@@ -71,7 +71,8 @@ class Spec(msgspec.Struct):
         "DFLASH selector (DFlash2) only. Verify a draft tree instead of the chain: each "
         "depth keeps this many beams, a beam's children are the top of its selector "
         "transition row, and the tree is the top block_size-1 nodes by path probability, "
-        "so the verify budget stays block_size. 0 = chain verify.",
+        "so the verify budget stays block_size. 0 = chain verify; 1 = the greedy chain "
+        "verified through the tree path.",
     ] = 0
     speculative_domino_candidate_pool_size: A[
         int,

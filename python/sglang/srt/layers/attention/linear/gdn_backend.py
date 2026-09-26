@@ -21,7 +21,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_spec
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -543,6 +543,95 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        # DFLASH draft trees verify through the fused tree kernels: no per-node
+        # state snapshots; the commit replays the accepted path from a stash.
+        self.tree_fused_verify = bool(
+            get_spec().speculative_dflash_tree_topk
+        ) and not model_runner.is_draft_worker
+        self.tree_stash = None
+
+    def _tree_fused_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        batch_size: int,
+        draft_token_num: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        retrieve_parent_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Tree verify with the fused kernels. Writes no SSM state: each layer
+        stashes its raw (k, v, b) and g, and the commit replays the accepted
+        path."""
+        from sglang.kernels.ops.attention.fla.gdn_tree_verify import (
+            alloc_tree_structure_buffers,
+            build_tree_ancestor_masks,
+            build_tree_structure_into,
+            tree_gdn_triton_verify,
+            tree_mask_capacity,
+        )
+        bs, T = batch_size, draft_token_num
+        H, V = layer.num_v_heads, layer.head_v_dim
+        Hg, K = layer.num_k_heads, layer.head_k_dim
+        ordinal = self.req_to_token_pool.mamba_map[layer.layer_id]
+        if self.tree_stash is None:
+            rows = self.verify_intermediate_state_indices.numel()
+            layers = len(self.req_to_token_pool.mamba_map)
+            dev = query.device
+            self.tree_stash = dict(
+                k=torch.zeros(layers, rows, T, Hg * K, dtype=query.dtype, device=dev),
+                v=torch.zeros(layers, rows, T, H * V, dtype=value.dtype, device=dev),
+                g=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
+                beta=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
+                anc=torch.zeros(
+                    rows,
+                    tree_mask_capacity(T),
+                    tree_mask_capacity(T) // 64,
+                    dtype=torch.int64,
+                    device=dev,
+                ),
+                struct=alloc_tree_structure_buffers(rows, T, T - 1, dev),
+                dims=(Hg, K, V),
+            )
+        st = self.tree_stash
+        if ordinal == 0:
+            # Once per verify, shared by every GDN layer (recorded in the graph).
+            parents = retrieve_parent_token[:bs]
+            st["tree"] = build_tree_structure_into(parents.to(torch.int64), st["struct"])
+            build_tree_ancestor_masks(parents, T, out=st["anc"])
+        g, _ = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        st["g"][ordinal, :bs].copy_(g.view(bs, T, H))
+        # Raw b: the commit takes sigmoid in fp32 (fused_gdn_gating rounds beta).
+        st["beta"][ordinal, :bs].copy_(b.reshape(bs, T, H))
+        # Raw q/k: the kernels l2-normalize in fp32, as the recurrent verify does.
+        q = query.reshape(bs, T, Hg, K).contiguous()
+        k = st["k"][ordinal, :bs].view(bs, T, Hg, K)
+        k.copy_(key.reshape(bs, T, Hg, K))
+        v = st["v"][ordinal, :bs].view(bs, T, H, V)
+        v.copy_(value.reshape(bs, T, H, V))
+        o = tree_gdn_triton_verify(
+            layer.A_log,
+            a.reshape(bs, T, H).contiguous(),
+            layer.dt_bias,
+            1.0,
+            20.0,
+            q,
+            k,
+            v,
+            b.reshape(bs, T, H).contiguous(),
+            ssm_states,
+            cache_indices[:bs].long(),
+            st["tree"],
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            precision="tf32",
+        )
+        return o.view(1, bs * T, H, V)
 
     def init_forward_metadata_out_graph(
         self,
@@ -1070,6 +1159,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            elif self.tree_fused_verify and retrieve_parent_token is not None:
+                core_attn_out = self._tree_fused_target_verify(
+                    layer=layer,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    retrieve_parent_token=retrieve_parent_token,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which

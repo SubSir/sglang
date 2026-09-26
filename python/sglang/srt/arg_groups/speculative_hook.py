@@ -288,10 +288,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     tree_topk = int(cfg.speculative_dflash_tree_topk or 0)
-    if tree_topk < 0 or tree_topk == 1:
+    if tree_topk < 0:
         raise ValueError(
-            "--speculative-dflash-tree-topk must be 0 (chain) or >= 2, "
-            f"got {tree_topk}."
+            f"--speculative-dflash-tree-topk must be >= 0, got {tree_topk}."
         )
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
