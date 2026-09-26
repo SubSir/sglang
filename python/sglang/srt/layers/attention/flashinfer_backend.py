@@ -257,20 +257,25 @@ def fast_prefill_plan(
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
     if custom_mask is not None:
-        # Same packing as plan(), all on device: no readback.
+        # Same packing as plan(), all on device. segment_packbits() reads the
+        # packed length back to size its output; pack straight into the graph's
+        # mask buffer instead, which is sized for the longest context.
         from flashinfer.prefill import _compute_page_mask_indptr
-        from flashinfer.quantization import segment_packbits
+        from flashinfer.quantization.packbits import get_quantization_module
 
         mask_indptr = _compute_page_mask_indptr(
             qo_indptr, paged_kv_indptr, paged_kv_last_page_len, page_size
+        ).to(torch.int32)
+        packed_indptr = torch.zeros_like(mask_indptr)
+        packed_indptr[1:] = torch.cumsum((mask_indptr.diff() + 7) // 8, 0)
+        get_quantization_module().segment_packbits(
+            custom_mask.contiguous().view(-1),
+            mask_indptr,
+            packed_indptr,
+            "little",
+            self._custom_mask_buf,
         )
-        packed_custom_mask, mask_indptr = segment_packbits(
-            custom_mask.contiguous().view(-1), mask_indptr, bitorder="little"
-        )
-        self._custom_mask_buf[: len(packed_custom_mask)].copy_(
-            packed_custom_mask, non_blocking=non_blocking
-        )
-        self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
+        self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
 
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
