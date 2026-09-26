@@ -287,6 +287,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
+    tree_topk = int(cfg.speculative_dflash_tree_topk or 0)
+    if tree_topk < 0 or tree_topk == 1:
+        raise ValueError(
+            "--speculative-dflash-tree-topk must be 0 (chain) or >= 2, "
+            f"got {tree_topk}."
+        )
+
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
     # RoPE reservation). Force them to 1 to avoid surprising memory behavior.

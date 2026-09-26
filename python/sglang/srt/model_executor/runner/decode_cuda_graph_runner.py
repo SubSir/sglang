@@ -1608,6 +1608,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            # Tree verify carries a per-node ancestor mask: the captured verify
+            # graph must be the mask-capable one.
+            tree_topk = int(get_spec().speculative_dflash_tree_topk or 0)
+            if tree_topk and not self.model_runner.is_draft_worker:
+                build_custom_mask = True
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
@@ -1616,6 +1621,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
                     else self.buffers.custom_mask
+                ),
+                topk=(
+                    tree_topk
+                    if tree_topk and not self.model_runner.is_draft_worker
+                    else 1
                 ),
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL

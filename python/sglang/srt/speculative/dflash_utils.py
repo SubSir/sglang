@@ -1282,3 +1282,58 @@ def table_qk_norm_rope_(
         D=head_dim,
         EPS=eps,
     )
+
+
+def build_selector_tree(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    anchor_ids: torch.Tensor,
+    topk: int,
+    num_verify_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DFlash2 draft tree over the selector lattice, in the EAGLE tree layout.
+
+    candidate_ids [bs, S, K] and scores [bs, S, K, K] come from
+    `CandidateSelector.build_lattice`: scores[b, e, p, c] scores candidate c at slot e
+    after candidate p at slot e-1 (slot 0: after the anchor, every row p alike). Each
+    depth keeps `topk` beams; a beam's children are the top `topk` of its transition
+    row softmax, scored by path probability, and the next beams are the top `topk` of
+    those topk**2 children -- EAGLE's beam, except a child's probability depends on
+    its parent, which the chain selector only walks along one path. The tree is the
+    top num_verify_tokens-1 nodes over all depths, so the verify budget matches the
+    chain's. Fixed shapes only: capture-safe inside the draft cuda graph.
+
+    Returns draft_tokens [bs, num_verify_tokens] (anchor first), parent_list
+    [bs, 1 + topk*(S-1)] and selected_index [bs, num_verify_tokens-1], as
+    `build_tree_kernel_efficient` takes them.
+    """
+    bs, num_slots, num_cand = candidate_ids.shape
+    device = candidate_ids.device
+    probs = scores.float().softmax(dim=-1)
+    beam_score, beam_idx = probs[:, 0, 0].topk(topk, dim=-1)
+    score_blocks = [beam_score]
+    token_blocks = [candidate_ids[:, 0].gather(1, beam_idx)]
+    parent_blocks = [torch.arange(-1, topk, device=device).expand(bs, topk + 1)]
+    for e in range(1, num_slots):
+        rows = probs[:, e].gather(1, beam_idx[:, :, None].expand(-1, -1, num_cand))
+        child_p, child_idx = rows.topk(topk, dim=-1)  # [bs, topk, topk]
+        child_idx = child_idx.flatten(1)
+        expand = (beam_score[:, :, None] * child_p).flatten(1)
+        score_blocks.append(expand)
+        token_blocks.append(candidate_ids[:, e].gather(1, child_idx))
+        beam_score, keep = expand.topk(topk, dim=-1)
+        if e < num_slots - 1:
+            parent_blocks.append(keep + (topk * topk * (e - 1) + topk))
+        beam_idx = child_idx.gather(1, keep)
+    selected = (
+        torch.cat(score_blocks, dim=1)
+        .topk(num_verify_tokens - 1, dim=-1)
+        .indices.sort(dim=-1)
+        .values
+    )
+    draft_tokens = torch.cat(
+        [anchor_ids[:, None], torch.cat(token_blocks, dim=1).gather(1, selected)],
+        dim=1,
+    )
+    return draft_tokens, torch.cat(parent_blocks, dim=1), selected

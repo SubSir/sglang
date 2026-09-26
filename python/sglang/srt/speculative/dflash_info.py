@@ -35,7 +35,7 @@ class DFlashVerifyInput(SpecInput):
     positions: torch.Tensor
     draft_token_num: int
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
+    # 1 for the chain verify; the tree branching width under --speculative-dflash-tree-topk.
     topk: int = 1
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
@@ -46,6 +46,16 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # Tree verify (EAGLE layout). Set with positions=None; prepare_for_verify then
+    # builds the ancestor mask, the per-node positions and the retrieve pointers.
+    tree_parent_list: Optional[torch.Tensor] = None
+    tree_selected_index: Optional[torch.Tensor] = None
+    tree_depth: int = 0
+    tree_mask_buf: Optional[torch.Tensor] = None
+    retrieve_index: Optional[torch.Tensor] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
     live_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -72,6 +82,8 @@ class DFlashVerifyInput(SpecInput):
         """
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
+        if self.tree_parent_list is not None and not batch.forward_mode.is_idle():
+            self._build_tree(batch)
         batch.input_ids = self.draft_token
         batch.spec_info = self
         if _is_npu and not batch.forward_mode.is_idle():
@@ -125,6 +137,36 @@ class DFlashVerifyInput(SpecInput):
             )
 
         return verify_forward_batch, can_run_cuda_graph
+
+    def _build_tree(self, batch: ScheduleBatch) -> None:
+        from sglang.srt.speculative.eagle_utils import (
+            TreeMaskMode,
+            build_tree_kernel_efficient,
+        )
+
+        n = int(self.draft_token_num)
+        tokens = self.draft_token.view(-1, n)
+        (
+            self.custom_mask,
+            self.positions,
+            self.retrieve_index,
+            self.retrieve_next_token,
+            self.retrieve_next_sibling,
+            self.draft_token,
+        ) = build_tree_kernel_efficient(
+            bonus_tokens=tokens[:, 0],
+            parent_list=self.tree_parent_list,
+            top_scores_index=self.tree_selected_index,
+            draft_tokens=tokens[:, 1:],
+            seq_lens=batch.seq_lens,
+            # Unused with a preallocated buffer; the kernel writes the used front.
+            seq_lens_sum=0,
+            topk=int(self.topk),
+            spec_steps=int(self.tree_depth),
+            num_verify_tokens=n,
+            tree_mask_mode=TreeMaskMode.FULL_MASK,
+            tree_mask_buf=self.tree_mask_buf,
+        )
 
     def generate_attn_arg_prefill(
         self,
@@ -204,4 +246,8 @@ class DFlashVerifyInput(SpecInput):
                     dim=0,
                 )
                 self.custom_mask = mask
+            elif mask.numel() > mask_numel:
+                # The tree-mask buffer is sized for the longest context; hand the
+                # backend only the used front so its mask packing stays small.
+                mask = mask[:mask_numel]
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
