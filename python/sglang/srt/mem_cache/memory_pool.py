@@ -73,7 +73,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -812,6 +812,9 @@ class MambaPool:
                     and conv_window_dedup_enabled(
                         _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                     )
+                    # DFLASH draft trees verify like EAGLE topk > 1: each node's
+                    # window holds its own ancestors.
+                    and not get_spec().speculative_dflash_tree_topk
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:

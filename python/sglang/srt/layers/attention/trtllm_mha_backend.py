@@ -402,9 +402,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # that path (packed once per verify, shared by every layer); otherwise
         # XQA's spec-dec mask carries it. Both stage the rows in the XQA buffer.
         tree_verify = bool(get_spec().speculative_dflash_tree_topk)
+        # trtllm-gen ships custom-mask generation cubins for head_dim 64/128 only.
         self._tree_verify_trtllm_gen = (
             tree_verify
             and not self.is_xqa_impl
+            and model_runner.model_config.head_dim in (64, 128)
             and hasattr(flashinfer.decode, "_pack_trtllm_gen_spec_dec_mask")
         )
         self._tree_verify_xqa = tree_verify and not self._tree_verify_trtllm_gen
@@ -1238,11 +1240,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             return
         packed = getattr(spec_info, "custom_mask", None)
-        if packed is None or packed.dtype != torch.uint16:
+        # One byte per node row up to 8 draft tokens, two up to 16.
+        if packed is None or packed.dtype not in (torch.uint8, torch.uint16):
             return
         n = self._xqa_spec_dec_mask.shape[1]
         rows = packed.numel() // n
-        self._xqa_spec_dec_mask[:rows, :, 0].copy_(packed.view(rows, n))
+        rows_i16 = (
+            packed.view(torch.int16)
+            if packed.dtype == torch.uint16
+            else packed.to(torch.int16)
+        )
+        self._xqa_spec_dec_mask[:rows, :, 0].view(torch.int16).copy_(
+            rows_i16.view(rows, n)
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""

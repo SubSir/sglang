@@ -72,7 +72,11 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.topk = get_spec().speculative_eagle_topk or 0
+        # DFLASH draft trees verify with the same tree links as EAGLE topk > 1.
+        self.topk = max(
+            get_spec().speculative_eagle_topk or 0,
+            get_spec().speculative_dflash_tree_topk or 0,
+        )
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -371,9 +375,8 @@ class MambaAttnBackendBase(AttentionBackend):
         if self.topk <= 1 or cuda_graph_bs is None:
             return
         if (
-            not isinstance(spec_info, EagleVerifyInput)
-            or spec_info.retrieve_next_token is None  # dummy / capture runs
-        ):
+            getattr(spec_info, "retrieve_next_token", None) is None
+        ):  # dummy / capture runs, chain verify
             return
         bs_without_pad = spec_info.retrieve_next_token.shape[0]
         self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(

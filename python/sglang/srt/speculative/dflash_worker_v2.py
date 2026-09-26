@@ -665,12 +665,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise ValueError(
                     "--speculative-dflash-tree-topk needs a DFlash2 (selector) draft."
                 )
-            if self._need_mamba_verify_commit:
-                # Recurrent targets need per-branch state in the verify kernels.
-                raise ValueError(
-                    "--speculative-dflash-tree-topk does not support Mamba/linear-"
-                    "attention targets yet."
-                )
 
     def init_cuda_graphs(self):
         with (
@@ -2051,8 +2045,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify: torch.Tensor,
         seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
+        accept_local: Optional[torch.Tensor] = None,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
+
+        `accept_local` ([bs, n] block-local node per accepted step) maps steps to
+        tree nodes, whose intermediate states the tree verify kernels keep.
 
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
         cache per-step intermediate states. After acceptance, we need to commit the
@@ -2063,6 +2061,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        if accept_local is not None:
+            last_correct_step_indices = accept_local.gather(
+                1, last_correct_step_indices[:, None]
+            ).squeeze(1)
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -2078,10 +2080,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             can_track_mask = to_track_mask & (
                 to_track_ith < commit_lens.to(to_track_ith.dtype)
             )
+            track_step = to_track_ith.to(torch.int64)
+            if accept_local is not None:
+                track_step = accept_local.gather(
+                    1, track_step.clamp(max=accept_local.shape[1] - 1)[:, None]
+                ).squeeze(1)
             mamba_steps_to_track = torch.where(
                 can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                track_step,
+                torch.full_like(track_step, -1),
             )
 
         model_runner = self.target_worker.model_runner
@@ -2302,6 +2309,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 loc2d
             )
             pools = [(kv.full_kv_pool, loc2d), (kv.swa_kv_pool, swa_loc2d)]
+        elif hasattr(kv, "full_kv_pool"):
+            # Hybrid linear-attention pool: only its full-attention layers hold KV.
+            pools = [(kv.full_kv_pool, loc2d)]
         else:
             pools = [(kv, loc2d)]
         pools = [(p, l) for p, l in pools if getattr(p, "layer_num", 1) != 0]
@@ -2329,6 +2339,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         verify_out_cache_loc_2d: torch.Tensor,
         on_publish,
+        seq_lens_pre_verify: Optional[torch.Tensor] = None,
     ) -> GenerationBatchResult:
         """Greedy walk of the verified tree, then commit the accepted path: its KV is
         moved to the front of the verify window (the tree scatters it; the next
@@ -2382,6 +2393,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_index,
                 accept_token_num,
                 self.model_runner.token_to_kv_pool_allocator,
+            )
+        if self._need_mamba_verify_commit:
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=new_seq_lens,
+                commit_lens=commit_lens,
+                accept_local=accept_local,
             )
         if on_publish is not None:
             on_publish(new_seq_lens)
@@ -2974,6 +2993,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc=verify_out_cache_loc,
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 on_publish=on_publish,
+                seq_lens_pre_verify=seq_lens_pre_verify,
             )
 
         candidates = draft_tokens
