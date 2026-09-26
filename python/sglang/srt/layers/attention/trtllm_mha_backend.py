@@ -397,12 +397,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"got {self.decode_seq_len_splits}"
             )
         self._xqa_spec_dec_mask = None
-        # DFLASH draft trees verify through XQA, whose spec-dec kernel takes a
-        # per-request ancestor mask over the draft block; trtllm-gen has none.
-        self._tree_verify_xqa = bool(get_spec().speculative_dflash_tree_topk)
-        if (
-            self.is_xqa_impl or self._tree_verify_xqa
-        ) and self.speculative_num_draft_tokens:
+        # DFLASH draft trees verify with a per-request ancestor mask over the draft
+        # block. trtllm-gen takes it as a packed custom mask when flashinfer has
+        # that path (packed once per verify, shared by every layer); otherwise
+        # XQA's spec-dec mask carries it. Both stage the rows in the XQA buffer.
+        tree_verify = bool(get_spec().speculative_dflash_tree_topk)
+        self._tree_verify_trtllm_gen = (
+            tree_verify
+            and not self.is_xqa_impl
+            and hasattr(flashinfer.decode, "_pack_trtllm_gen_spec_dec_mask")
+        )
+        self._tree_verify_xqa = tree_verify and not self._tree_verify_trtllm_gen
+        self._tree_mask = self._tree_packed = None
+        if (self.is_xqa_impl or tree_verify) and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
             max_bs = model_runner.max_running_requests + 1
             words_per_row = (draft_len + 31) // 32 * 2
@@ -413,6 +420,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+            if self._tree_verify_trtllm_gen:
+                cfg = model_runner.model_config
+                attn_tp_size = get_parallel().attn_tp_size
+                self._tree_heads_per_kv = (
+                    cfg.num_attention_heads // attn_tp_size
+                ) // cfg.get_num_kv_heads(attn_tp_size)
+                self._tree_bit_idx = torch.arange(
+                    draft_len, dtype=torch.int32, device=self.device
+                )
         # XQA keeps its semaphores at the front of its workspace and needs them
         # zero between calls; trtllm-gen's scratch in the shared workspace breaks
         # that, so the tree-verify XQA calls get a buffer of their own.
@@ -1191,11 +1207,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
+        if (
+            self._tree_verify_trtllm_gen
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self._pack_tree_verify_mask(forward_batch.batch_size)
+
+    def _pack_tree_verify_mask(self, bs: int) -> None:
+        """Expand the staged ancestor rows into trtllm-gen's dense [bs, n, n] tree
+        mask and pack it once for every layer of this verify (recorded in the
+        graph under CUDA graphs, so each replay repacks the staged rows)."""
+        n = self._tree_bit_idx.numel()
+        rows = self._xqa_spec_dec_mask[:bs, :, 0].view(torch.int16).to(torch.int32)
+        self._tree_mask = ((rows[:, :, None] >> self._tree_bit_idx) & 1).bool()
+        self._tree_packed = flashinfer.decode._pack_trtllm_gen_spec_dec_mask(
+            self._tree_mask,
+            self.forward_metadata.cache_seqlens_int32[:bs],
+            n,
+            self.q_data_type,
+            self.data_type,
+            self._tree_heads_per_kv,
+            bs,
+        )
 
     def _stage_tree_verify_mask(self, spec_info) -> None:
         """Copy the step's packed ancestor mask ([bs * n] uint16, bit j = node j)
-        into the static XQA mask the verify kernels read."""
-        if not self._tree_verify_xqa or spec_info is None:
+        into the static XQA mask buffer the tree verify reads."""
+        if not (self._tree_verify_xqa or self._tree_verify_trtllm_gen) or (
+            spec_info is None
+        ):
             return
         packed = getattr(spec_info, "custom_mask", None)
         if packed is None or packed.dtype != torch.uint16:
@@ -1336,6 +1376,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         self.forward_metadata = metadata
+        if (
+            self._tree_verify_trtllm_gen
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self._pack_tree_verify_mask(batch_size)
 
     def _reshape_paged_kv_cache(
         self,
@@ -1377,6 +1422,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         out_dtype: Optional[torch.dtype] = None,
         mask: Optional[torch.Tensor] = None,
         backend: Optional[str] = None,
+        packed_mask: Optional[tuple] = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1404,6 +1450,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             if backend is not None:
                 kwargs["backend"] = backend
+            if packed_mask is not None and group_mask is None:
+                kwargs["spec_dec_packed_mask"] = packed_mask
             if backend == "xqa":
                 # XQA reads Q densely; here it is a view into the fused QKV rows.
                 group_query = group_query.contiguous()
@@ -1458,7 +1506,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # Tree masks differ per request; follow the reorder.
                 group_mask=(
                     mask.index_select(0, indices)
-                    if mask is not None and self._tree_verify_xqa
+                    if mask is not None
+                    and (self._tree_verify_xqa or self._tree_verify_trtllm_gen)
                     else None
                 ),
             )
@@ -1765,12 +1814,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
-                mask = (
-                    self._xqa_spec_dec_mask
-                    if forward_batch.forward_mode.is_target_verify()
+                spec_verify = (
+                    forward_batch.forward_mode.is_target_verify()
                     and self.forward_metadata.max_seq_len_q > 1
-                    else None
                 )
+                mask = self._xqa_spec_dec_mask if spec_verify else None
+                packed_mask = None
+                if spec_verify and self._tree_verify_trtllm_gen:
+                    mask, packed_mask = self._tree_mask, self._tree_packed
                 o = self._run_fixed_q_len_decode(
                     q,
                     kv_cache,
@@ -1790,6 +1841,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         if self._tree_verify_xqa and mask is not None
                         else None
                     ),
+                    packed_mask=packed_mask,
                 )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
