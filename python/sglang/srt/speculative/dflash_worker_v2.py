@@ -55,6 +55,7 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     build_selector_tree,
+    resolve_dflash_verify_mask_policy,
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -2242,6 +2243,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         else:
             tokens, parents, selected = self._tree_eager
         n = int(self.block_size)
+        attn_name, _ = resolve_dflash_verify_mask_policy(
+            self.target_worker.model_runner.attn_backend
+        )
+        if attn_name == "TRTLLMHAAttnBackend":
+            # XQA verify: bit-packed n x n ancestor rows, prefix implicit.
+            return DFlashVerifyInput(
+                draft_token=tokens.reshape(-1),
+                positions=None,
+                draft_token_num=n,
+                custom_mask=None,
+                topk=self._tree_topk,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                tree_parent_list=parents,
+                tree_selected_index=selected,
+                tree_depth=n - 1,
+                tree_mask_packed=True,
+            )
         # Ancestor mask, one row per node over (prefix + tree). Sized for the
         # longest context once, so no step reads seq_lens back to size it.
         need = n * bs * int(self.target_worker.model_runner.model_config.context_len + n)

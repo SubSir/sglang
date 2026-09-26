@@ -53,6 +53,9 @@ class DFlashVerifyInput(SpecInput):
     tree_selected_index: Optional[torch.Tensor] = None
     tree_depth: int = 0
     tree_mask_buf: Optional[torch.Tensor] = None
+    # True: only the [bs * n] bit-packed ancestor rows (XQA takes the prefix as
+    # visible); False: flashinfer's full [n x (prefix + n)] per-request mask.
+    tree_mask_packed: bool = False
     # Sliding-window layers see min(prefix, window) + tree keys per request, so
     # their mask rows are shorter than the full-attention ones.
     tree_swa_window: Optional[int] = None
@@ -151,6 +154,27 @@ class DFlashVerifyInput(SpecInput):
 
         n = int(self.draft_token_num)
         tokens = self.draft_token.view(-1, n)
+        if self.tree_mask_packed:
+            (
+                self.custom_mask,
+                self.positions,
+                self.retrieve_index,
+                self.retrieve_next_token,
+                self.retrieve_next_sibling,
+                self.draft_token,
+            ) = build_tree_kernel_efficient(
+                bonus_tokens=tokens[:, 0],
+                parent_list=self.tree_parent_list,
+                top_scores_index=self.tree_selected_index,
+                draft_tokens=tokens[:, 1:],
+                seq_lens=batch.seq_lens,
+                seq_lens_sum=0,
+                topk=int(self.topk),
+                spec_steps=int(self.tree_depth),
+                num_verify_tokens=n,
+                tree_mask_mode=TreeMaskMode.QLEN_ONLY_BITPACKING,
+            )
+            return
         (
             self.custom_mask,
             self.positions,

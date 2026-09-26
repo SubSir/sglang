@@ -1605,13 +1605,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             # Avoid enabling custom-mask modes during graph capture for backends that
             # can express DFLASH verify via their built-in causal path.
-            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+            attn_name, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
             # Tree verify carries a per-node ancestor mask: the captured verify
-            # graph must be the mask-capable one.
+            # graph must be the mask-capable one (trtllm-mha keeps its own XQA
+            # mask buffer instead).
             tree_topk = int(get_spec().speculative_dflash_tree_topk or 0)
-            if tree_topk and not self.model_runner.is_draft_worker:
+            if (
+                tree_topk
+                and not self.model_runner.is_draft_worker
+                and attn_name != "TRTLLMHAAttnBackend"
+            ):
                 build_custom_mask = True
             spec_info = DFlashVerifyInput(
                 draft_token=None,

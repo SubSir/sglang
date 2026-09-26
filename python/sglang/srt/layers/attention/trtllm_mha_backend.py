@@ -397,7 +397,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"got {self.decode_seq_len_splits}"
             )
         self._xqa_spec_dec_mask = None
-        if self.is_xqa_impl and self.speculative_num_draft_tokens:
+        # DFLASH draft trees verify through XQA, whose spec-dec kernel takes a
+        # per-request ancestor mask over the draft block; trtllm-gen has none.
+        self._tree_verify_xqa = bool(get_spec().speculative_dflash_tree_topk)
+        if (
+            self.is_xqa_impl or self._tree_verify_xqa
+        ) and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
             max_bs = model_runner.max_running_requests + 1
             words_per_row = (draft_len + 31) // 32 * 2
@@ -1061,6 +1066,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
             )
 
+        if forward_mode.is_target_verify():
+            self._stage_tree_verify_mask(spec_info)
         if forward_mode.is_decode_or_idle():
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
@@ -1175,6 +1182,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out_cache_loc=forward_batch.out_cache_loc,
         )
 
+    def _stage_tree_verify_mask(self, spec_info) -> None:
+        """Copy the step's packed ancestor mask ([bs * n] uint16, bit j = node j)
+        into the static XQA mask the verify kernels read."""
+        if not self._tree_verify_xqa or spec_info is None:
+            return
+        packed = getattr(spec_info, "custom_mask", None)
+        if packed is None or packed.dtype != torch.uint16:
+            return
+        n = self._xqa_spec_dec_mask.shape[1]
+        rows = packed.numel() // n
+        self._xqa_spec_dec_mask[:rows, :, 0].copy_(packed.view(rows, n))
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
@@ -1209,6 +1228,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
+            self._stage_tree_verify_mask(forward_batch.spec_info)
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._assert_ragged_verify_supported()
@@ -1346,6 +1366,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         out: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
         mask: Optional[torch.Tensor] = None,
+        backend: Optional[str] = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1355,12 +1376,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else (out.dtype if out is not None else self.q_data_type)
         )
 
-        def run_group(group_query, group_block_tables, group_seq_lens, group_out=None):
+        def run_group(
+            group_query,
+            group_block_tables,
+            group_seq_lens,
+            group_out=None,
+            group_mask=None,
+        ):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
             if mask is not None:
-                kwargs["mask"] = mask[: group_seq_lens.shape[0]]
+                kwargs["mask"] = (
+                    group_mask
+                    if group_mask is not None
+                    else mask[: group_seq_lens.shape[0]]
+                )
+            if backend is not None:
+                kwargs["backend"] = backend
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
                 kv_cache=kv_cache,
@@ -1405,6 +1438,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 block_tables.index_select(0, indices),
                 seq_lens.index_select(0, indices),
+                # Tree masks differ per request; follow the reorder.
+                group_mask=(
+                    mask.index_select(0, indices)
+                    if mask is not None and self._tree_verify_xqa
+                    else None
+                ),
             )
             output_by_request.index_copy_(
                 0,
@@ -1729,6 +1768,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                     mask=mask,
+                    backend=(
+                        "xqa"
+                        if self._tree_verify_xqa and mask is not None
+                        else None
+                    ),
                 )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
