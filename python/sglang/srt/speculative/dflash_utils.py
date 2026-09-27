@@ -4,7 +4,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1127,6 +1127,64 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+def dflash_tree_sampling_verify(
+    *,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+) -> None:
+    """Target-only speculative sampling over a DFLASH draft tree (fills predicts,
+    accept_index and accept_token_num like the greedy tree verify).
+
+    Each node tries its children in sibling order; a rejected child's mass leaves
+    the target distribution before the next sibling is tried, and the bonus is
+    drawn from what remains. The draft tree is a deterministic function of the
+    selector lattice, so the target distribution is preserved (thresholds 1.0)."""
+    if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
+        raise RuntimeError(
+            "DFLASH non-greedy verification is unavailable on this build/device."
+        )
+    bs, n = candidates.shape
+    device = next_token_logits.device
+    with borrow_graph_pool(user="DFLASH tree verify probabilities"):
+        target_probs = build_dflash_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=n,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+        )
+        draft_probs = torch.zeros_like(target_probs)
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates.to(torch.int64),
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=torch.rand((bs, n), dtype=torch.float32, device=device),
+            uniform_samples_for_final_sampling=torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            ),
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=float(get_spec().speculative_accept_threshold_single),
+            threshold_acc=max(float(get_spec().speculative_accept_threshold_acc), 1e-9),
+            deterministic=True,
+        )
+        del target_probs, draft_probs
+
+
 def build_dflash_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -1310,11 +1368,7 @@ def build_selector_tree(
     """
     bs, num_slots, num_cand = candidate_ids.shape
     device = candidate_ids.device
-    if (
-        topk == num_cand
-        and candidate_ids.is_cuda
-        and num_cand & (num_cand - 1) == 0
-    ):
+    if topk == num_cand and candidate_ids.is_cuda and num_cand & (num_cand - 1) == 0:
         from sglang.kernels.ops.speculative.dflash import selector_tree_expand
 
         score_list, token_list, parents = selector_tree_expand(candidate_ids, scores)
@@ -1357,3 +1411,161 @@ def build_selector_tree(
         dim=1,
     )
     return draft_tokens, torch.cat(parent_blocks, dim=1), selected
+
+
+class SampledSelectorTree(NamedTuple):
+    draft_tokens: torch.Tensor  # [bs, n], anchor first
+    parent_list: torch.Tensor  # EAGLE parent list, as build_selector_tree
+    selected_index: torch.Tensor  # [bs, n - 1]
+    node_cand: torch.Tensor  # [bs, n, K] tokens of each node's ranked child candidates
+    node_q: torch.Tensor  # [bs, n, K] draft probs of those candidates (0: leaf row)
+    node_has_row: torch.Tensor  # [bs, n] bool: the node has a child row
+
+
+def build_selector_tree_sampled(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    anchor_ids: torch.Tensor,
+    topk: int,
+    num_verify_tokens: int,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    uniforms: torch.Tensor,
+) -> SampledSelectorTree:
+    """DFlash2 draft tree for speculative sampling.
+
+    The tree's shape (how many children each node keeps, by rank) comes from the
+    unperturbed selector probabilities, as in build_selector_tree, so it does not
+    depend on the draws. Each node's children are then the first draws, without
+    replacement (Gumbel-top-k at the request temperature), from the transition row
+    of that node's own sampled token: the rank-0 path is exactly the chain sampler's
+    draw. Greedy rows draw no noise. uniforms [bs, S, K, K] feed the Gumbel keys.
+    """
+    bs, num_slots, num_cand = candidate_ids.shape
+    device = candidate_ids.device
+    if topk == num_cand and candidate_ids.is_cuda and num_cand & (num_cand - 1) == 0:
+        from sglang.kernels.ops.speculative.dflash import selector_tree_sampled
+
+        return SampledSelectorTree(
+            *selector_tree_sampled(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                anchor_ids=anchor_ids,
+                num_verify_tokens=num_verify_tokens,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                uniforms=uniforms,
+            )
+        )
+    logq = torch.log_softmax(scores.float() / temperatures.view(-1, 1, 1, 1), dim=-1)
+    probs = logq.exp()
+    gumbel = -torch.log(-torch.log(uniforms.clamp(1e-10, 1.0 - 1e-7)))
+    gumbel = torch.where(greedy_mask.view(-1, 1, 1, 1), 0.0, gumbel)
+    order = (logq + gumbel).argsort(dim=-1, descending=True)  # rank -> candidate
+    q_rank = probs.gather(-1, order)
+    # Shape at T=1, as build_selector_tree: a greedy row's clamped T would zero
+    # every non-argmax beam and leave the shape to topk tie-breaking.
+    shape_p, shape_idx = scores.float().softmax(dim=-1).sort(dim=-1, descending=True)
+
+    def rows_at(t, e, row):  # t[:, e, row[b, j], :] -> [bs, J, K]
+        return t[:, e].gather(1, row[:, :, None].expand(-1, -1, num_cand))
+
+    beam_score = shape_p[:, 0, 0, :topk]
+    row_u = shape_idx[:, 0, 0, :topk]  # shape beams: the unperturbed nodes
+    row_s = order[:, 0, 0, :topk]  # the same ranks, sampled
+    score_blocks = [beam_score]
+    row_blocks = [row_s]
+    depth_blocks = [torch.ones_like(row_s)]
+    parent_blocks = [torch.arange(-1, topk, device=device).expand(bs, topk + 1)]
+    for e in range(1, num_slots):
+        child_p = rows_at(shape_p, e, row_u)[:, :, :topk]
+        cand_u = rows_at(shape_idx, e, row_u)[:, :, :topk].flatten(1)
+        cand_s = rows_at(order, e, row_s)[:, :, :topk].flatten(1)
+        expand = (beam_score[:, :, None] * child_p).flatten(1)
+        score_blocks.append(expand)
+        row_blocks.append(cand_s)
+        depth_blocks.append(torch.full_like(cand_s, e + 1))
+        beam_score, keep = expand.topk(topk, dim=-1)
+        if e < num_slots - 1:
+            parent_blocks.append(keep + (topk * topk * (e - 1) + topk))
+        row_u = cand_u.gather(1, keep)
+        row_s = cand_s.gather(1, keep)
+    selected = (
+        torch.cat(score_blocks, dim=1)
+        .topk(num_verify_tokens - 1, dim=-1)
+        .indices.sort(dim=-1)
+        .values
+    )
+    rows = torch.cat(row_blocks, dim=1).gather(1, selected)
+    depths = torch.cat(depth_blocks, dim=1).gather(1, selected)
+    slot_of_row = (depths - 1).clamp(max=num_slots - 1)
+    tokens = candidate_ids[torch.arange(bs, device=device)[:, None], slot_of_row, rows]
+    draft_tokens = torch.cat([anchor_ids[:, None], tokens], dim=1)
+    # A node at depth d draws its children from slot d, row = its own candidate.
+    node_row = torch.cat([torch.zeros_like(rows[:, :1]), rows], dim=1)
+    child_slot = torch.cat([torch.zeros_like(depths[:, :1]), depths], dim=1)
+    node_has_row = child_slot < num_slots
+    slot = child_slot.clamp(max=num_slots - 1)
+    b_idx = torch.arange(bs, device=device)[:, None]
+    node_order = order[b_idx, slot, node_row]  # [bs, n, K]
+    node_q = torch.where(node_has_row[:, :, None], q_rank[b_idx, slot, node_row], 0.0)
+    node_cand = candidate_ids[b_idx[:, :, None], slot[:, :, None], node_order]
+    return SampledSelectorTree(
+        draft_tokens=draft_tokens,
+        parent_list=torch.cat(parent_blocks, dim=1),
+        selected_index=selected,
+        node_cand=node_cand,
+        node_q=node_q,
+        node_has_row=node_has_row,
+    )
+
+
+def dflash_tree_rrs_verify(
+    *,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    node_cand: torch.Tensor,
+    node_q: torch.Tensor,
+    node_has_row: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+) -> None:
+    """Speculative sampling over a sampled DFlash2 tree (see
+    build_selector_tree_sampled), filling predicts / accept_index /
+    accept_token_num like the greedy tree verify. Preserves the target
+    distribution: each node runs recursive rejection sampling without replacement
+    over its children, and the bonus is drawn from the last residual."""
+    from sglang.kernels.ops.speculative.dflash import dflash_tree_rrs
+
+    bs, n = draft_tokens.shape
+    with borrow_graph_pool(user="DFLASH tree verify probabilities"):
+        target_probs = build_dflash_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=n,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+        )
+        dflash_tree_rrs(
+            next_token=retrieve_next_token,
+            next_sibling=retrieve_next_sibling,
+            tokens=draft_tokens,
+            cand=node_cand,
+            has_row=node_has_row,
+            q=node_q,
+            det=greedy_mask,
+            target_probs=target_probs.view(bs, n, -1),
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_len=accept_token_num,
+        )
+        del target_probs

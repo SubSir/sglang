@@ -54,17 +54,21 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
-    build_selector_tree,
-    resolve_dflash_verify_mask_policy,
+    SampledSelectorTree,
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_selector_tree,
+    build_selector_tree_sampled,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dflash_tree_rrs_verify,
+    dflash_tree_sampling_verify,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    resolve_dflash_verify_mask_policy,
 )
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
@@ -268,6 +272,21 @@ class _SelectorDraftSampler:
             self.tree_selected = torch.empty(
                 (max_bs, gamma), dtype=torch.int64, device=device
             )
+            if sampling_enabled:
+                # Sampled tree: each node's ranked child draws, for the RRS verify.
+                n = self.block_size
+                self.tree_uniforms = torch.empty(
+                    (max_bs, gamma, top_k, top_k), dtype=torch.float32, device=device
+                )
+                self.tree_node_cand = torch.empty(
+                    (max_bs, n, top_k), dtype=torch.int64, device=device
+                )
+                self.tree_node_q = torch.empty(
+                    (max_bs, n, top_k), dtype=torch.float32, device=device
+                )
+                self.tree_node_has_row = torch.empty(
+                    (max_bs, n), dtype=torch.bool, device=device
+                )
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -315,7 +334,22 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
-        if self.tree_topk:
+        if self.tree_topk and self.sampling_enabled:
+            tree = build_selector_tree_sampled(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                anchor_ids=block_ids[:, 0],
+                topk=self.tree_topk,
+                num_verify_tokens=self.block_size,
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                uniforms=self.tree_uniforms[:bs].uniform_(),
+            )
+            tokens, parents, selected = tree[:3]
+            self.tree_node_cand[:bs].copy_(tree.node_cand)
+            self.tree_node_q[:bs].copy_(tree.node_q)
+            self.tree_node_has_row[:bs].copy_(tree.node_has_row)
+        elif self.tree_topk:
             tokens, parents, selected = build_selector_tree(
                 candidate_ids=candidate_ids,
                 scores=scores,
@@ -323,6 +357,7 @@ class _SelectorDraftSampler:
                 topk=self.tree_topk,
                 num_verify_tokens=self.block_size,
             )
+        if self.tree_topk:
             self.tree_tokens[:bs].copy_(tokens)
             self.tree_parents[:bs].copy_(parents)
             self.tree_selected[:bs].copy_(selected)
@@ -660,6 +695,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._tree_mask_buf: Optional[torch.Tensor] = None
         self._tree_mask_buf_swa: Optional[torch.Tensor] = None
         self._tree_eager = None
+        self._tree_nodes = None
         if self._tree_topk:
             if self.selector is None:
                 raise ValueError(
@@ -1457,14 +1493,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidate_ids, scores = _selector_lattice(
             draft_model, pred_hidden, anchor_token_ids
         )
-        if self._tree_topk:
-            self._tree_eager = build_selector_tree(
-                candidate_ids=candidate_ids,
-                scores=scores,
-                anchor_ids=anchor_token_ids,
-                topk=self._tree_topk,
-                num_verify_tokens=int(self.block_size),
-            )
         device = pred_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
@@ -1477,6 +1505,30 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not self._selector_sampling_enabled
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
+        if self._tree_topk and self._selector_sampling_enabled:
+            self._tree_eager = build_selector_tree_sampled(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                anchor_ids=anchor_token_ids,
+                topk=self._tree_topk,
+                num_verify_tokens=int(self.block_size),
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                uniforms=torch.rand(scores.shape, dtype=torch.float32, device=device),
+            )
+        elif self._tree_topk:
+            self._tree_eager = SampledSelectorTree(
+                *build_selector_tree(
+                    candidate_ids=candidate_ids,
+                    scores=scores,
+                    anchor_ids=anchor_token_ids,
+                    topk=self._tree_topk,
+                    num_verify_tokens=int(self.block_size),
+                ),
+                node_cand=None,
+                node_q=None,
+                node_has_row=None,
+            )
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
@@ -2236,19 +2288,31 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
 
-    def _tree_verify_input(self, *, bs: int, graph_ran: bool, batch) -> DFlashVerifyInput:
+    def _tree_verify_input(
+        self, *, bs: int, graph_ran: bool, batch
+    ) -> DFlashVerifyInput:
         """The draft tree the selector sampler built this step, as a verify input."""
-        if batch.has_grammar or not _is_all_greedy(batch.sampling_info):
+        if batch.has_grammar:
             raise NotImplementedError(
-                "DFLASH tree verify supports greedy requests without grammar only."
+                "DFLASH tree verify does not support grammar-constrained requests."
             )
         if graph_ran and self._draft_sampler is not None:
             ds = self._draft_sampler
             tokens = ds.tree_tokens[:bs]
             parents = ds.tree_parents[:bs]
             selected = ds.tree_selected[:bs]
+            self._tree_nodes = (
+                (ds.tree_node_cand[:bs], ds.tree_node_q[:bs], ds.tree_node_has_row[:bs])
+                if ds.sampling_enabled
+                else None
+            )
         else:
-            tokens, parents, selected = self._tree_eager
+            tokens, parents, selected, node_cand, node_q, node_has_row = (
+                self._tree_eager
+            )
+            self._tree_nodes = (
+                (node_cand, node_q, node_has_row) if node_cand is not None else None
+            )
         n = int(self.block_size)
         attn_name, _ = resolve_dflash_verify_mask_policy(
             self.target_worker.model_runner.attn_backend
@@ -2269,14 +2333,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         # Ancestor mask, one row per node over (prefix + tree). Sized for the
         # longest context once, so no step reads seq_lens back to size it.
-        need = n * bs * int(self.target_worker.model_runner.model_config.context_len + n)
+        need = (
+            n * bs * int(self.target_worker.model_runner.model_config.context_len + n)
+        )
         if self._tree_mask_buf is None or self._tree_mask_buf.numel() < need:
-            self._tree_mask_buf = torch.empty(need, dtype=torch.bool, device=self.device)
+            self._tree_mask_buf = torch.empty(
+                need, dtype=torch.bool, device=self.device
+            )
         window = self.target_worker.model_runner.sliding_window_size
         swa_window = int(window) if window is not None and window > 0 else None
         if swa_window is not None:
             need_swa = n * bs * (swa_window + n)
-            if self._tree_mask_buf_swa is None or self._tree_mask_buf_swa.numel() < need_swa:
+            if (
+                self._tree_mask_buf_swa is None
+                or self._tree_mask_buf_swa.numel() < need_swa
+            ):
                 self._tree_mask_buf_swa = torch.empty(
                     need_swa, dtype=torch.bool, device=self.device
                 )
@@ -2339,9 +2410,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         verify_out_cache_loc_2d: torch.Tensor,
         on_publish,
-        seq_lens_pre_verify: Optional[torch.Tensor] = None,
+        seq_lens_pre_verify: Optional[torch.Tensor],
+        draft_input: DFlashDraftInputV2,
     ) -> GenerationBatchResult:
-        """Greedy walk of the verified tree, then commit the accepted path: its KV is
+        """Walk the verified tree (greedy, or RRS for sampling), then commit the accepted path: its KV is
         moved to the front of the verify window (the tree scatters it; the next
         window must not overlap it) and its target hidden feeds the draft KV."""
         from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
@@ -2351,6 +2423,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         n = int(verify_input.draft_token_num)
         device = logits_output.next_token_logits.device
+        # The draft's chain sample (q rows) serves the chain accept only.
+        self._selector_sample = None
         candidates = verify_input.draft_token.view(bs, n)
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, n
@@ -2358,17 +2432,54 @@ class DFlashWorkerV2(BaseSpecWorker):
         predicts = torch.empty((bs * n,), dtype=torch.int32, device=device)
         accept_index = torch.full((bs, n), -1, dtype=torch.int32, device=device)
         accept_token_num = torch.zeros((bs,), dtype=torch.int32, device=device)
-        predicts, accept_index, accept_token_num = verify_tree_greedy_func(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=self._tree_topk,
-        )
+        if _is_all_greedy(batch.sampling_info):
+            predicts, accept_index, accept_token_num = verify_tree_greedy_func(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=self._tree_topk,
+            )
+        elif self._tree_nodes is not None:
+            # Lossless RRS over the sampled tree; greedy rows draw and accept by argmax.
+            node_cand, node_q, node_has_row = self._tree_nodes
+            dflash_tree_rrs_verify(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                draft_tokens=candidates,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                node_cand=node_cand,
+                node_q=node_q,
+                node_has_row=node_has_row,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=batch.sampling_info, device=device
+                ),
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=batch.sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+        else:
+            # Greedy rows of a mixed batch reduce to argmax through their top_k.
+            dflash_tree_sampling_verify(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=batch.sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
         commit_lens = accept_token_num + 1
         (
             accept_local,
@@ -2407,7 +2518,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         hidden = logits_output.hidden_states
         if hidden is None:
-            raise RuntimeError("DFLASH verify requires target hidden states, but got None.")
+            raise RuntimeError(
+                "DFLASH verify requires target hidden states, but got None."
+            )
         hidden = hidden.view(bs, n, -1)
         accepted_hidden = hidden.gather(
             1, accept_local[:, :, None].expand(-1, -1, hidden.shape[-1])
@@ -2994,6 +3107,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 on_publish=on_publish,
                 seq_lens_pre_verify=seq_lens_pre_verify,
+                draft_input=draft_input,
             )
 
         candidates = draft_tokens
