@@ -54,7 +54,7 @@ def _residual_sum(y_ptr, fcoef_ptr, fbase_ptr, res_ptr, rows, kk, mask,
 def _finish_norm_kernel(y_ptr, fcoef_ptr, fbase_ptr, res_ptr, nw_ptr, out_ptr, res_out_ptr, eps,
                         H: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr, WIDTH: tl.constexpr,
                         HAS_FINISH: tl.constexpr, HAS_RES: tl.constexpr):
-    # the GEMM after this (launched with PDL) may start and load its weights right away
+    # the GEMM after this (launched with PDL) may start launching right away
     tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     kk = tl.arange(0, WIDTH)
@@ -95,17 +95,13 @@ def _gemm_conv_kernel(u_ptr, w_ptr, pbase_ptr, x_ptr, coef_ptr, ws_ptr, cnt_ptr,
     j = tl.arange(0, 4 * GB)
     wrow = (j // GB) * G + gb * GB + (j % GB)
     acc = tl.zeros((BM, 4 * GB), tl.float32)
-    # the first weight tile does not depend on the norm kernel: load it before waiting on it
-    k = ks * KS + tl.arange(0, BK)
-    w_first = tl.load(w_ptr + wrow[None, :] * H + k[:, None])
+    # PDL overlaps only this program's launch with the norm kernel; loading a weight tile
+    # before the wait measured 0.2-0.4 us slower than leaving the loop to tl.range's pipeliner.
     tl.extra.cuda.gdc_wait()
     for k0 in tl.range(ks * KS, ks * KS + KS, BK):
         k = k0 + tl.arange(0, BK)
         a = tl.load(u_ptr + rows[:, None] * H + k[None, :], mask=rmask[:, None], other=0.0)
-        if BK == KS:
-            w = w_first
-        else:
-            w = tl.load(w_ptr + wrow[None, :] * H + k[:, None])
+        w = tl.load(w_ptr + wrow[None, :] * H + k[:, None])
         acc = tl.dot(a, w, acc)
 
     # the conv inputs, loaded before arriving so the last program only waits on the slots
