@@ -28,12 +28,6 @@ COMPILE_OPTIONS = "--enable-tvm-ffi"
 
 
 @dsl_user_op
-def _cluster_sync(*, loc=None, ip=None):
-    llvm.inline_asm(None, [], "barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;", "",
-                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
 def _elem_ptr(t: cute.Tensor, crd, *, loc=None, ip=None) -> cute.Pointer:
     return t.iterator + cute.crd2idx(crd, t.layout, loc=loc, ip=ip)
 
@@ -249,7 +243,8 @@ class GemmConvMmaKernel:
                 cute.gemm(tiled_mma, tCrC, tCrA[None, None, kb], tCrB[None, None, kb], tCrC)
         cute.autovec_copy(tCrC, tCsP)
 
-        _cluster_sync()
+        cute.arch.cluster_arrive(aligned=True)
+        cute.arch.cluster_wait()
         FIN_IT = -(-FIN // self.T)
         fin = []
         for it in cutlass.range_constexpr(FIN_IT):
@@ -277,7 +272,8 @@ class GemmConvMmaKernel:
                     g = c_q // 2
                     x = (pb0 + sD[c_r, g]) * cu + (pb1 + sD[c_r, GPR + g]) * cup * Float32(c_prev)
                     cute.local_tile(mX, (1, 8), (c_row, c_c8)).store(x.to(BFloat16))
-        _cluster_sync()
+        cute.arch.cluster_arrive(aligned=True)
+        cute.arch.cluster_wait()
 
 
 class FusedBoundaryKernel:
@@ -422,7 +418,8 @@ class FusedBoundaryKernel:
             sSq[s_r] = sq
 
         # 3. rstd from every rank's partial
-        _cluster_sync()
+        cute.arch.cluster_arrive(aligned=True)
+        cute.arch.cluster_wait()
         if tid < BMV:
             parts = [_ld_peer(_elem_ptr(sSq, (tid,)), q) for q in range(NSPLIT)]
             tot = Float32(0.0)
