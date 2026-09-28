@@ -1356,6 +1356,10 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Fold the DFlash2 draft's grouped convs into the sublayer boundaries: "triton" (two
+    # kernels) or "cute" (one CuTe cluster kernel for few rows, Triton/dense beyond its table).
+    SGLANG_DFLASH_FUSED_CONV = EnvBool(False)
+    SGLANG_DFLASH_FUSED_CONV_BACKEND = EnvStr("triton")
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
