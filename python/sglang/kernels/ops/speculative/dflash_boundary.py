@@ -31,7 +31,7 @@ GROUP = 16
 def _residual_sum(y_ptr, fcoef_ptr, fbase_ptr, res_ptr, rows, kk, mask,
                   H: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr,
                   HAS_FINISH: tl.constexpr, HAS_RES: tl.constexpr):
-    """s = residual + finish(y) at (rows, kk), bf16-rounded like the unfused path, as fp32."""
+    """s = residual + finish(y) at (rows, kk), in fp32."""
     off = rows * H + kk
     y0 = tl.load(y_ptr + off, mask=mask, other=0.0).to(tl.float32)
     if HAS_FINISH:
@@ -42,11 +42,11 @@ def _residual_sum(y_ptr, fcoef_ptr, fbase_ptr, res_ptr, rows, kk, mask,
               + tl.load(fcoef_ptr + rows * (4 * G) + 2 * G + g, mask=mask, other=0.0).to(tl.float32))
         c1 = (tl.load(fbase_ptr + H + kk).to(tl.float32)
               + tl.load(fcoef_ptr + rows * (4 * G) + 3 * G + g, mask=mask, other=0.0).to(tl.float32))
-        h = (c0 * y0 + tl.where(pm, c1 * y1, 0.0)).to(tl.bfloat16).to(tl.float32)
+        h = c0 * y0 + tl.where(pm, c1 * y1, 0.0)
     else:
         h = y0
     if HAS_RES:
-        h = (h + tl.load(res_ptr + off, mask=mask, other=0.0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        h = h + tl.load(res_ptr + off, mask=mask, other=0.0).to(tl.float32)
     return h
 
 
@@ -69,9 +69,8 @@ def _finish_norm_kernel(y_ptr, fcoef_ptr, fbase_ptr, res_ptr, nw_ptr, out_ptr, r
 @triton.jit
 def _gc_finish(tot, coef_ptr, x_ptr, ws_off, off3, rmask, m3, p3, u3, up3, pb0, pb1,
                BM: tl.constexpr, GB: tl.constexpr):
-    d = tot.to(tl.bfloat16)
-    tl.store(coef_ptr + ws_off, d, mask=rmask[:, None])
-    d4 = tl.permute(tl.reshape(d.to(tl.float32), (BM, 2, 2, GB)), (0, 3, 2, 1))  # [BM, GB, tap, side]
+    tl.store(coef_ptr + ws_off, tot.to(tl.bfloat16), mask=rmask[:, None])
+    d4 = tl.permute(tl.reshape(tot, (BM, 2, 2, GB)), (0, 3, 2, 1))  # [BM, GB, tap, side]
     side0, _ = tl.split(d4)
     c0, c1 = tl.split(side0)
     x = (pb0 + c0[:, :, None]) * u3 + tl.where(p3, (pb1 + c1[:, :, None]) * up3, 0.0)

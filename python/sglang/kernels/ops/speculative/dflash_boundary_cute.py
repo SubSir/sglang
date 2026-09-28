@@ -34,14 +34,6 @@ def _cluster_sync(*, loc=None, ip=None):
 
 
 @dsl_user_op
-def _bf16r(val: Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(llvm.inline_asm(
-        T.f32(), [Float32(val).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.f32.bf16 $0, h; }", "=f,f",
-        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT))
-
-
-@dsl_user_op
 def _elem_ptr(t: cute.Tensor, crd, *, loc=None, ip=None) -> cute.Pointer:
     return t.iterator + cute.crd2idx(crd, t.layout, loc=loc, ip=ip)
 
@@ -108,9 +100,9 @@ class FinishNormKernel:
             k0 = cute.local_tile(mFb, (1, 8), (0, tid)).load().to(Float32) + mFc[row, 2 * G + g].to(Float32)
             k1 = cute.local_tile(mFb, (1, 8), (1, tid)).load().to(Float32) + mFc[row, 3 * G + g].to(Float32)
             yp = cute.local_tile(mY, (1, 8), (row - has_prev, tid)).load().to(Float32)
-            h = (k0 * h + k1 * yp * Float32(has_prev)).to(BFloat16).to(Float32)
+            h = k0 * h + k1 * yp * Float32(has_prev)
         if cutlass.const_expr(self.has_res):
-            h = (h + cute.local_tile(mR, (1, 8), (row, tid)).load().to(Float32)).to(BFloat16).to(Float32)
+            h = h + cute.local_tile(mR, (1, 8), (row, tid)).load().to(Float32)
         nw = cute.local_tile(mNw2, (1, 8), (0, tid)).load().to(Float32)
         cute.local_tile(mRo, (1, 8), (row, tid)).store(h.to(BFloat16))
 
@@ -274,10 +266,9 @@ class GemmConvMmaKernel:
                 tot = Float32(0.0)
                 for q in cutlass.range_constexpr(NSPLIT):
                     tot = tot + parts[q]
-                d = _bf16r(tot)
-                sD[f_r, f_jl] = d
+                sD[f_r, f_jl] = tot
                 if row0 + f_r < M:
-                    mC[row0 + f_r, f_st * G + gb * GB + ks * GPR + f_g] = d.to(BFloat16)
+                    mC[row0 + f_r, f_st * G + gb * GB + ks * GPR + f_g] = tot.to(BFloat16)
         cute.arch.barrier()
         for it in cutlass.range_constexpr(CONV_IT):
             c_r, c_q, c_c8, c_row, c_prev, cu, cup, pb0, pb1 = conv_in[it]
@@ -339,7 +330,7 @@ class FusedBoundaryKernel:
 
     @cute.jit
     def residual_sum8(self, mY, mFc, mFb, mR, row, c8):
-        """s at channels 8*c8 .. 8*c8+7 of `row` (one conv group), bf16-rounded; branch-free."""
+        """s at channels 8*c8 .. 8*c8+7 of `row` (one conv group), in fp32; branch-free."""
         G = self.G
         h = cute.local_tile(mY, (1, 8), (row, c8)).load().to(Float32)
         if cutlass.const_expr(self.has_finish):
@@ -348,9 +339,9 @@ class FusedBoundaryKernel:
             k0 = cute.local_tile(mFb, (1, 8), (0, c8)).load().to(Float32) + mFc[row, 2 * G + g].to(Float32)
             k1 = cute.local_tile(mFb, (1, 8), (1, c8)).load().to(Float32) + mFc[row, 3 * G + g].to(Float32)
             yp = cute.local_tile(mY, (1, 8), (row - has_prev, c8)).load().to(Float32)
-            h = (k0 * h + k1 * yp * Float32(has_prev)).to(BFloat16).to(Float32)
+            h = k0 * h + k1 * yp * Float32(has_prev)
         if cutlass.const_expr(self.has_res):
-            h = (h + cute.local_tile(mR, (1, 8), (row, c8)).load().to(Float32)).to(BFloat16).to(Float32)
+            h = h + cute.local_tile(mR, (1, 8), (row, c8)).load().to(Float32)
         return h
 
     @cute.kernel
@@ -507,10 +498,9 @@ class FusedBoundaryKernel:
                 tot = Float32(0.0)
                 for q in cutlass.range_constexpr(NSPLIT):
                     tot = tot + sRecv[q, f_r, f_jl]
-                d = _bf16r(tot)
-                sD[f_r, f_jl] = d
+                sD[f_r, f_jl] = tot
                 if row0 + f_r < M:
-                    mC[row0 + f_r, f_st * G + gb * GB + ks * GPR + f_g] = d.to(BFloat16)
+                    mC[row0 + f_r, f_st * G + gb * GB + ks * GPR + f_g] = tot.to(BFloat16)
         cute.arch.barrier()
         for it in cutlass.range_constexpr(CONV_IT if self.phases & 4 else 0):
             c_r, c_q, c_c8, c_row, c_prev, cs, csp, nw8, pb0, pb1 = conv_in[it]
