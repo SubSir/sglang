@@ -24,6 +24,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 GROUP = 16
+SP_PAD = 8  # fp32 pad per row of the partial-sum tile
 COMPILE_OPTIONS = "--enable-tvm-ffi"
 
 
@@ -304,7 +305,7 @@ class FusedBoundaryKernel:
         return cute.tile_to_shape(atom, (rows, 64, self.CH), (0, 1, 2))
 
     def smem_bytes(self):
-        return (2 * (self.BM + self.BN) * self.KS + 4 * self.BM * self.BN + 4 * self.BMV * 4 * self.GPR
+        return (2 * (self.BM + self.BN) * self.KS + 4 * self.BM * (self.BN + SP_PAD) + 4 * self.BMV * 4 * self.GPR
                 + 4 * self.NSPLIT * self.BMV * 4 * self.GPR + 8 * self.BM + 1024)
 
     @cute.jit
@@ -363,7 +364,8 @@ class FusedBoundaryKernel:
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(BFloat16, sA_layout, byte_alignment=128)
         sB = smem.allocate_tensor(BFloat16, sB_layout, byte_alignment=128)
-        sP = smem.allocate_tensor(Float32, cute.make_layout((BM, BN), stride=(BN, 1)), byte_alignment=16)
+        # padded rows: the 8 rows an mma.sync C fragment stores would otherwise share banks
+        sP = smem.allocate_tensor(Float32, cute.make_layout((BM, BN), stride=(BN + SP_PAD, 1)), byte_alignment=16)
         sD = smem.allocate_tensor(Float32, cute.make_layout((BMV, 4 * GPR), stride=(4 * GPR, 1)), byte_alignment=16)
         sSq = smem.allocate_tensor(Float32, cute.make_layout((BMV,)), byte_alignment=16)
         sRstd = smem.allocate_tensor(Float32, cute.make_layout((BMV,)), byte_alignment=16)
