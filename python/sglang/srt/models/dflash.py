@@ -671,7 +671,8 @@ class DFlashDraftModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        # The fused kernels are written for 2-tap convs over groups of 16 channels.
+        # The fused kernels are written for 2-tap convs over groups of 16 channels. Triton's
+        # kernels use PDL (sm_90+); the CuTe cluster kernel and its tables are Blackwell-only.
         self._fused_boundary: Optional[DFlashBoundary] = None
         self._fused_cute = None
         if (
@@ -679,10 +680,16 @@ class DFlashDraftModel(nn.Module):
             and draft_config.conv_kernel_size == 2
             and draft_config.conv_group_size == 16
             and torch.cuda.is_available()
+            and torch.version.cuda is not None
+            and torch.cuda.get_device_capability()[0] >= 9
         ):
             device = torch.device("cuda", torch.cuda.current_device())
             self._fused_boundary = DFlashBoundary(hidden_size, device, block=self.block_size)
-            if envs.SGLANG_DFLASH_FUSED_CONV_BACKEND.get() == "cute" and hidden_size in CUTE_CONFIGS:
+            if (
+                envs.SGLANG_DFLASH_FUSED_CONV_BACKEND.get() == "cute"
+                and hidden_size in CUTE_CONFIGS
+                and torch.cuda.get_device_capability()[0] == 10
+            ):
                 from sglang.kernels.ops.speculative.dflash_boundary_cute import DFlashBoundaryCute
 
                 self._fused_cute = DFlashBoundaryCute(hidden_size, device, CUTE_CONFIGS[hidden_size],

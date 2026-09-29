@@ -150,19 +150,18 @@ _CONFIGS = {
 
 
 # CuTe configs per hidden size, for rows up to the key (measured like _CONFIGS):
-# ("fused", BM, GB, NSPLIT, atom_m, atom_n, BMV) is the one-launch cluster kernel,
-# ("split", BM, GB, NSPLIT, atom_m, atom_n) its norm + GEMM/conv pair.
+# (BM, GB, NSPLIT, atom_m, atom_n, BMV) for the one-launch cluster kernel.
 CUTE_CONFIGS = {
     2560: {
-        8: ("fused", 16, 16, 8, 1, 2, 8),
-        16: ("fused", 16, 16, 8, 1, 4, 16),
-        24: ("fused", 16, 16, 4, 1, 4, 8),
-        48: ("fused", 16, 32, 8, 1, 4, 16),
-        64: ("fused", 32, 32, 8, 2, 4, 32),
+        8: (16, 16, 8, 1, 2, 8),
+        16: (16, 16, 8, 1, 4, 16),
+        24: (16, 16, 4, 1, 4, 8),
+        48: (16, 32, 8, 1, 4, 16),
+        64: (32, 32, 8, 2, 4, 32),
     },
     5120: {
-        8: ("fused", 16, 32, 8, 1, 4, 8),
-        16: ("fused", 16, 16, 16, 1, 4, 16),
+        8: (16, 32, 8, 1, 4, 8),
+        16: (16, 16, 16, 1, 4, 16),
     },
 }
 
