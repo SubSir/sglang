@@ -40,15 +40,16 @@ def _ld_peer(ptr: cute.Pointer, rank: Int32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def _push_f32(val: Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, rank: Int32, *, loc=None, ip=None):
-    """st.async a float to the same shared-memory offset in CTA `rank`, completing on that CTA's mbarrier."""
+def _push_f32x4(vals, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, rank: Int32, *, loc=None, ip=None):
+    """st.async 4 floats to the same (16-byte aligned) shared-memory offset in CTA `rank`,
+    completing 16 bytes on that CTA's mbarrier."""
     llvm.inline_asm(
         None,
-        [smem_ptr.toint(loc=loc, ip=ip).ir_value(), Float32(val).ir_value(loc=loc, ip=ip),
-         mbar_ptr.toint(loc=loc, ip=ip).ir_value(), Int32(rank).ir_value(loc=loc, ip=ip)],
-        "{ .reg .u32 ra, rb; mapa.shared::cluster.u32 ra, $0, $3; mapa.shared::cluster.u32 rb, $2, $3; "
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [ra], $1, [rb]; }",
-        "r,f,r,r", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+        [smem_ptr.toint(loc=loc, ip=ip).ir_value()] + [Float32(v).ir_value(loc=loc, ip=ip) for v in vals]
+        + [mbar_ptr.toint(loc=loc, ip=ip).ir_value(), Int32(rank).ir_value(loc=loc, ip=ip)],
+        "{ .reg .u32 ra, rb; mapa.shared::cluster.u32 ra, $0, $6; mapa.shared::cluster.u32 rb, $5, $6; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [ra], {$1, $2, $3, $4}, [rb]; }",
+        "r,f,f,f,f,r,r", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
 
 
 class FusedBoundaryKernel:
@@ -253,16 +254,18 @@ class FusedBoundaryKernel:
 
         # 5. push each rank the partials of the groups it finishes (the first cluster barrier
         # published every mbarrier), then finish this rank's GPR groups from local memory
-        PUSH_IT = -(-(NSPLIT * FIN) // T)
+        # 4 consecutive coefficients of a row per st.async (a row holds 4 * GPR of them)
+        PUSH = NSPLIT * FIN // 4
+        PUSH_IT = -(-PUSH // T)
         for it in cutlass.range_constexpr(PUSH_IT):
             idx = tid + it * T
-            if idx < NSPLIT * FIN:
-                q = idx // FIN
-                rem = idx % FIN
-                p_r = rem // (4 * GPR)
-                p_jl = rem % (4 * GPR)
-                val = sP[p_r, (p_jl // GPR) * GB + q * GPR + p_jl % GPR]
-                _push_f32(val, _elem_ptr(sRecv, (ks, p_r, p_jl)), mbar, q)
+            if idx < PUSH:
+                q = idx // (FIN // 4)
+                rem = idx % (FIN // 4)
+                p_r = rem // GPR
+                jl0 = (rem % GPR) * 4
+                vals = [sP[p_r, ((jl0 + j) // GPR) * GB + q * GPR + (jl0 + j) % GPR] for j in range(4)]
+                _push_f32x4(vals, _elem_ptr(sRecv, (ks, p_r, jl0)), mbar, q)
         cute.arch.mbarrier_wait(mbar, 0)
         for it in cutlass.range_constexpr(FIN_IT):
             fidx = tid + it * T

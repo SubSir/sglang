@@ -15,8 +15,10 @@ coefficient GEMM (cuBLAS split-K + reduce) and the prepare conv. Here:
 t is the position inside the draft block, fc/d are per (row, conv group of 16 channels)
 coefficient pairs (the kernel_projection output), fb/pb per-channel base taps. The
 arrival counters are reset by the last program, so both kernels replay in CUDA graphs.
-For many rows the GEMM is left to the dense path (finish_norm + the module's own
-projection and convolution), which measured faster there.
+On Blackwell, rows the fused kernels do not take go to the dense path: finish_norm, TGV
+with split-K (K cut into L slices run as L batches of strided views, fp32 partials out), and
+dense_conv, which sums the partials, writes the coefficients and runs the prepare conv.
+Elsewhere the dense path is finish_norm + the module's own projection and convolution.
 """
 import functools
 
@@ -141,8 +143,38 @@ def finish_norm(y, res, norm_weight, eps, out, res_out, fcoef=None, fbase=None, 
         WIDTH=triton.next_power_of_2(H), HAS_FINISH=has_finish, HAS_RES=has_res, num_warps=8)
 
 
+@triton.jit
+def _dense_conv_kernel(u_ptr, part_ptr, pbase_ptr, x_ptr, coef_ptr, M,
+                       H: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr, BR: tl.constexpr,
+                       GB: tl.constexpr, L: tl.constexpr):
+    """coef = sum of the L split-K partials [L, M, 4G]; x = prepare conv of u with it."""
+    rows = tl.program_id(0) * BR + tl.arange(0, BR)
+    gg = tl.program_id(1) * GB + tl.arange(0, GB)
+    ch = gg[:, None] * 16 + tl.arange(0, 16)[None, :]
+    rmask = rows < M
+    pm = rmask & (rows % BLOCK != 0)
+    pb0 = tl.load(pbase_ptr + ch).to(tl.float32)[None, :, :]
+    pb1 = tl.load(pbase_ptr + H + ch).to(tl.float32)[None, :, :]
+    # launched with PDL behind the GEMM: everything below reads what it or finish_norm wrote
+    tl.extra.cuda.gdc_wait()
+    off3 = rows[:, None, None] * H + ch[None, :, :]
+    u = tl.load(u_ptr + off3, mask=rmask[:, None, None], other=0.0).to(tl.float32)
+    up = tl.load(u_ptr + off3 - H, mask=pm[:, None, None], other=0.0).to(tl.float32)
+    st = tl.arange(0, 4)
+    offc = rows[:, None, None] * (4 * G) + st[None, :, None] * G + gg[None, None, :]
+    d = tl.zeros((BR, 4, GB), tl.float32)
+    for q in tl.static_range(L):
+        d += tl.load(part_ptr + q * M * 4 * G + offc, mask=rmask[:, None, None], other=0.0)
+    tl.store(coef_ptr + offc, d.to(tl.bfloat16), mask=rmask[:, None, None])
+    d0 = tl.sum(tl.where(st[None, :, None] == 0, d, 0.0), axis=1)
+    d1 = tl.sum(tl.where(st[None, :, None] == 1, d, 0.0), axis=1)
+    x = (pb0 + d0[:, :, None]) * u + (pb1 + d1[:, :, None]) * up
+    tl.store(x_ptr + off3, x.to(tl.bfloat16), mask=rmask[:, None, None])
+
+
 # (BM, GB, NSPLIT, BK, warps) per hidden size, for rows up to the key; None where the dense
-# path (finish_norm + TGV GEMM + conv) measured faster. Measured on GB300 (inco/final_bench.py).
+# path measured faster. Used off Blackwell only: on it the split-K dense path beats this at
+# every row count. Measured on GB300 (inco/final_bench.py).
 _CONFIGS = {
     2560: {8: (16, 4, 4, 128, 4), 16: (16, 4, 4, 128, 4), 32: (16, 16, 5, 128, 8)},
     5120: {8: None, 16: (16, 16, 5, 128, 8)},
@@ -157,12 +189,22 @@ CUTE_CONFIGS = {
         16: (16, 16, 8, 1, 4, 16),
         24: (16, 16, 4, 1, 4, 8),
         48: (16, 32, 8, 1, 4, 16),
-        64: (32, 32, 8, 2, 4, 32),
     },
     5120: {
         8: (16, 32, 8, 1, 4, 8),
-        16: (16, 16, 16, 1, 4, 16),
     },
+}
+
+# Blackwell dense path per hidden size, for rows up to the key: (L, TGV tactic as
+# (cta_m, cta_n, stages, 2cta)), the fastest whole boundary (finish_norm + split-K TGV +
+# dense_conv) over L in {1, 2, 4} and every tactic that fits one wave. GB300, inco/dense_tune.py.
+_T16, _T17, _T19, _T20 = (64, 16, 6, True), (64, 16, 8, True), (64, 32, 6, True), (64, 32, 8, True)
+_T22, _T23, _T24 = (64, 64, 6, True), (64, 64, 9, True), (64, 128, 7, True)
+DENSE_CONFIGS = {
+    2560: {8: (4, _T16), 16: (4, _T17), 24: (4, _T19), 32: (4, _T17), 48: (4, _T19), 64: (4, _T22),
+           96: (4, _T22), 128: (4, _T24), 192: (2, _T23), 256: (4, _T24)},
+    5120: {8: (4, _T17), 16: (4, _T17), 24: (4, _T20), 32: (4, _T20), 48: (4, _T23), 64: (4, _T23),
+           96: (4, _T24), 128: (4, _T24), 192: (2, _T22), 256: (2, _T24)},
 }
 
 
@@ -198,12 +240,37 @@ def coef_gemm(u, weight):
     return torch.nn.functional.linear(u, weight)
 
 
+@functools.cache
+def _tgv():
+    from sglang.kernels.ops.gemm import cutedsl_bf16_gemm
+
+    return cutedsl_bf16_gemm
+
+
+@functools.cache
+def _dense_plan(H, M, N, sms):
+    """(L, TGV tactic index) from DENSE_CONFIGS; the table was tuned on a 152-SM part, so an
+    entry whose grid would spill into a second wave here falls back to L=1 and TGV's pick."""
+    tg = _tgv()
+    for rows in sorted(DENSE_CONFIGS[H]):
+        if M <= rows:
+            L, cfg = DENSE_CONFIGS[H][rows]
+            cta_m, cta_n, _, two = cfg
+            if L * tg._grid_ctas(M, N, cta_m, cta_n, 2 if two else 1) <= sms:
+                return L, tg._TGV_CUTE_EXT_TACTIC_CONFIGS.index(cfg)
+            break
+    return 1, tg._pick_tactic(M, N, H)
+
+
 class DFlashBoundary:
     """One per draft model. Owns the per-split fp32 slots (overwritten on every call) and
     the arrival counters (reset by the last program), sized for up to max_m rows."""
 
     def __init__(self, H: int, device, max_m: int = 64, block: int = 8):
         self.H, self.G, self.block, self.max_m, self.device = H, H // GROUP, block, max_m, device
+        props = torch.cuda.get_device_properties(device)
+        self.dense = props.major == 10 and H in DENSE_CONFIGS
+        self.sms = props.multi_processor_count
         self.cnt = torch.zeros(max_m * self.G, device=device, dtype=torch.int32)
         # allocated up front: a buffer created inside a CUDA graph capture would belong to it
         self._ws = {}
@@ -226,3 +293,16 @@ class DFlashBoundary:
             u, weight, pbase, x, coef, self._workspace(NSPLIT), self.cnt, M,
             H=self.H, G=self.G, BLOCK=self.block, BM=BM, GB=GB, NSPLIT=NSPLIT, BK=BK, MAX_M=self.max_m,
             num_warps=warps, launch_pdl=True)
+
+    def dense_gemm_conv(self, u, weight, pbase, x, coef):
+        """Blackwell dense path: split-K TGV into fp32 partials, then dense_conv."""
+        M, H = u.shape
+        N = weight.shape[0]
+        L, tactic = _dense_plan(H, M, N, self.sms)
+        part = torch.empty(L, M, N, device=u.device, dtype=torch.float32)
+        # batch q is the q-th K slice of u and of the weight: strided views, no copies
+        _tgv()._run_tgv(u.view(M, L, H // L).permute(1, 0, 2), weight.view(N, L, H // L).permute(1, 2, 0),
+                        None, part, pdl=True, tactic=tactic)
+        _dense_conv_kernel[(triton.cdiv(M, 8), self.G // 16)](
+            u, part, pbase, x, coef, M, H=H, G=self.G, BLOCK=self.block, BR=8, GB=16, L=L,
+            num_warps=4, launch_pdl=True)

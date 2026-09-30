@@ -587,7 +587,11 @@ class DFlashDecoderLayer(nn.Module):
         res_out = torch.empty_like(y)
         finish_norm(y, residual, norm.weight, norm.variance_epsilon, u, res_out,
                     fcoef, fbase, block=conv.block_size)
-        if boundary.fused_rows(M):
+        if boundary.dense:
+            x = torch.empty_like(y)
+            coef = torch.empty((M, weight.shape[0]), dtype=y.dtype, device=y.device)
+            boundary.dense_gemm_conv(u, weight, base[0], x, coef)
+        elif boundary.fused_rows(M):
             x = torch.empty_like(y)
             coef = torch.empty((M, weight.shape[0]), dtype=y.dtype, device=y.device)
             boundary.gemm_conv(u, weight, base[0], x, coef)
