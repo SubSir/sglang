@@ -304,10 +304,10 @@ def _const(shape):
 
 
 @functools.cache
-def _k_fused(H, BM, GB, NSPLIT, atom_m, atom_n, has_finish, has_res, BMV=0):
+def _k_fused(H, BM, GB, NSPLIT, atom_m, atom_n, has_finish, has_res, BMV, block):
     G = H // GROUP
     m = cute.sym_int()
-    kern = FusedBoundaryKernel(H, BM, GB, NSPLIT, atom_m, atom_n, has_finish, has_res, BMV=BMV)
+    kern = FusedBoundaryKernel(H, BM, GB, NSPLIT, atom_m, atom_n, has_finish, has_res, block=block, BMV=BMV)
     return cute.compile(kern, _act(m, H), _act(m, 4 * G), _const((2, H)), _act(m, H), _const((H,)),
                         _const((4 * G, H)), _const((2, H)), _act(m, H), _act(m, H), _act(m, 4 * G),
                         Int32(8), Float32(1e-6), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -333,9 +333,12 @@ class DFlashBoundaryCute:
         self._perm = {}
 
     def config(self, M):
+        """The table entry for M rows, or None (dense path) when there is none or its row
+        block (BMV) cannot hold whole draft blocks: the prepare conv reads the previous row."""
         for rows in sorted(self.configs):
             if M <= rows:
-                return self.configs[rows]
+                cfg = self.configs[rows]
+                return cfg if cfg[5] % self.block == 0 else None
         return None
 
     def prepare_weight(self, weight):
@@ -351,5 +354,5 @@ class DFlashBoundaryCute:
         wp = self._perm[(weight.data_ptr(), GB)]
         has_finish, has_res = fcoef is not None, res is not None
         args = (fcoef if has_finish else coef, fbase if has_finish else pbase, res if has_res else y)
-        _k_fused(self.H, BM, GB, NSPLIT, atom_m, atom_n, has_finish, has_res, BMV=BMV)(
+        _k_fused(self.H, BM, GB, NSPLIT, atom_m, atom_n, has_finish, has_res, BMV, self.block)(
             y, *args, norm_w, wp, pbase, x, res_out, coef, M, eps)
