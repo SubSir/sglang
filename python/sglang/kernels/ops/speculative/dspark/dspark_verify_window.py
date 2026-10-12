@@ -426,6 +426,7 @@ def _compact_verify_ids_gather_kernel(
     out_ptr,
     bs,
     gamma,
+    block_cols,
     n,
     BLOCK: tl.constexpr,
 ):
@@ -436,7 +437,8 @@ def _compact_verify_ids_gather_kernel(
     within = tl.load(within_ptr + offs, mask=mask, other=0)
     valid = req < bs
     safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
+    # The anchor row is gamma wide for DSpark but gamma + 1 for DFLASH (anchor + drafts).
+    anchor = tl.load(draft_block_ids_ptr + safe_req * block_cols, mask=mask, other=0)
     wcol = tl.maximum(within - 1, 0)
     draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
     v = tl.where(within == 0, anchor, draft)
@@ -465,7 +467,8 @@ def compact_verify_ids_triton(
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
+        req, within, draft_block_ids, draft_tokens, out, bs, gamma,
+        draft_block_ids.shape[1], n, BLOCK=BLOCK
     )
     return out
 
