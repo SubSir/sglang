@@ -622,7 +622,7 @@ class TestDSparkEntropySource(CustomTestCase):
         tx = np.minimum.accumulate(np.cumprod(rng.uniform(0, 1, (1000, 4)), 1), 1)
         cal = EntropyCalibrator(table=_export_table(tx, tx), gamma=4, device="cpu")
         w._confidence_selector = types.SimpleNamespace(
-            uses_entropy=True, calibrator=cal, source=ConfidenceSource.ENTROPY
+            uses_entropy=True, uses_draft_prob=False, calibrator=cal, source=ConfidenceSource.ENTROPY
         )
         block = types.SimpleNamespace(
             corrected_logits=corrected, temperatures=torch.ones(2)
