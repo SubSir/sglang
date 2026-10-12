@@ -5290,6 +5290,7 @@ class Scheduler(
                 "spec_confidence_source",
                 "spec_entropy_table_path",
                 "spec_fixed_verify_len",
+                "spec_budget_policy",
             ]
         )
 
@@ -5311,6 +5312,7 @@ class Scheduler(
                 "spec_confidence_source",
                 "spec_entropy_table_path",
                 "spec_fixed_verify_len",
+                "spec_budget_policy",
             ):
                 if not self.spec_algorithm.is_dflash_family():
                     logging.warning(f"{k} requires a DSpark or DFLASH draft worker.")
@@ -5384,6 +5386,10 @@ class Scheduler(
             if "spec_confidence_source" in remaining:
                 self.draft_worker.set_spec_confidence_source(
                     remaining.pop("spec_confidence_source")
+                )
+            if "spec_budget_policy" in remaining:
+                self.draft_worker.set_spec_budget_policy(
+                    remaining.pop("spec_budget_policy")
                 )
             if "spec_fixed_verify_len" in remaining:
                 fixed = remaining.pop("spec_fixed_verify_len")

@@ -27,7 +27,10 @@ from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     DSparkVerifyPlanner,
+    compute_verify_token_budget,
+    ratio_policy_budgets,
 )
+from sglang.srt.speculative.dspark_components.dspark_sps import SpsCostTable
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_confidence import (
@@ -35,9 +38,12 @@ from sglang.srt.speculative.spec_confidence import (
     EntropyCalibrationTable,
     EntropyCalibrator,
     conditional_from_survival,
+    drawn_prob_from_candidates,
+    drawn_prob_from_logits,
     entropy_confidence,
     entropy_from_logits,
     raw_survival_chain,
+    shifted_draft_prob,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -199,6 +205,61 @@ class TestBudgetFromEntropy(CustomTestCase):
         self.assertGreaterEqual(float(surv[chosen].min()), float(surv[~chosen].max()))
 
 
+class TestDcutSignalAndPolicy(CustomTestCase):
+    """D-cut (arXiv 2607.14647): shifted draft-prob score and the ratio policy."""
+
+    def test_shifted_score_never_reads_the_slot_own_token(self):
+        """Slot k's survival is prod_{t<k} q(z_t): changing the token drawn at k
+        must not move slot k's survival (App. B; otherwise RS is biased)."""
+        q = torch.tensor([[0.9, 0.5, 0.8, 0.3]])
+        surv = torch.cumprod(shifted_draft_prob(q), 1)
+        torch.testing.assert_close(surv, torch.tensor([[1.0, 0.9, 0.45, 0.36]]))
+        q2 = q.clone()
+        q2[0, 2] = 0.01  # a different token drawn at slot 3
+        surv2 = torch.cumprod(shifted_draft_prob(q2), 1)
+        torch.testing.assert_close(surv2[:, :3], surv[:, :3])
+
+    def test_drawn_prob_gathers(self):
+        logits = torch.tensor([[[0.0, 1.0, 2.0], [2.0, 0.0, 0.0]]])
+        tokens = torch.tensor([[2, 0]])
+        q = torch.softmax(logits, -1)
+        torch.testing.assert_close(
+            drawn_prob_from_logits(logits, None, tokens), torch.stack([q[0, 0, 2], q[0, 1, 0]])[None]
+        )
+        cand = torch.tensor([[[5, 7, 9], [3, 4, 6]]])
+        q_rows = torch.tensor([[[0.2, 0.5, 0.3], [0.6, 0.3, 0.1]]])
+        got = drawn_prob_from_candidates(q_rows=q_rows, candidate_ids=cand, tokens=torch.tensor([[7, 6]]))
+        torch.testing.assert_close(got, torch.tensor([[0.5, 0.1]]))
+
+    def test_ratio_budgets_follow_k_rho(self):
+        """K_rho = max(B, ceil(rho * B * (D + 1))); budget = K_rho - B (anchors free)."""
+        # B = 3 requests, D + 1 = 8: K = max(3, ceil(.25*24)=6) .. 24 -> budgets 3, 9, 15, 21.
+        self.assertEqual(ratio_policy_budgets(num_requests=3, max_verify_len=8, num_candidates=21), [3, 9, 15, 21])
+        # B = 1, D + 1 = 2: rho 0.25 gives ceil(0.5) = 1 = B -> budget 0.
+        self.assertEqual(ratio_policy_budgets(num_requests=1, max_verify_len=2, num_candidates=1), [0, 1])
+        self.assertEqual(ratio_policy_budgets(num_requests=3, max_verify_len=8, num_candidates=10), [3, 9, 10])
+
+    def test_ratio_policy_is_argmax_over_the_four_points(self):
+        torch.manual_seed(0)
+        surv = torch.cumprod(torch.rand(4, 7) * 0.5 + 0.5, 1)
+        table = SpsCostTable(sample_batch_tokens=[4, 8, 16, 24, 32], sample_steps_per_sec=[100.0, 95.0, 70.0, 50.0, 40.0], max_batch_tokens=32)
+        marg = compute_verify_token_budget(history_survival_probs=surv, sps_table=table, cfg=DSparkScheduleConfig(gamma=7))
+        ratio = compute_verify_token_budget(
+            history_survival_probs=surv, sps_table=table, cfg=DSparkScheduleConfig(gamma=7, budget_policy="ratio")
+        )
+        allowed = ratio_policy_budgets(num_requests=4, max_verify_len=8, num_candidates=28)
+        self.assertIn(ratio.budget, allowed)
+        vals = torch.sort(surv.flatten(), descending=True).values
+        tau = lambda b: 4 + float(vals[:b].sum())
+        sps = lambda n: [100.0, 95.0, 70.0, 50.0, 40.0][max(i for i, p in enumerate([4, 8, 16, 24, 32]) if p <= n)]
+        self.assertEqual(ratio.budget, max(allowed, key=lambda b: tau(b) * sps(4 + b)))
+        self.assertGreaterEqual(marg.predicted_theta, ratio.predicted_theta - 1e-9)
+
+    def test_bad_policy_rejected(self):
+        with self.assertRaises(ValueError):
+            DSparkScheduleConfig(gamma=7, budget_policy="dcut").validate()
+
+
 class TestFixedVerifyLen(CustomTestCase):
     def _planner(self, block=8):
         p = object.__new__(DSparkVerifyPlanner)
@@ -351,7 +412,7 @@ class TestStaticPathUnchanged(CustomTestCase):
         self.assertFalse(w.carries_confidence)
         self.assertIsNone(w.get_confidence_budget_prepare())
         w._selector_step_q = (torch.zeros(2, 7, 16, dtype=torch.int64), torch.rand(2, 7, 16))
-        self.assertEqual(w._step_confidence(), (None, None))
+        self.assertEqual(w._step_confidence(drafted=torch.zeros(2, 7)), (None, None))
         self.assertEqual(
             w._plan_verify(batch=None, draft_input=None, confidence=None, prefix_lens=None),
             (None, None),

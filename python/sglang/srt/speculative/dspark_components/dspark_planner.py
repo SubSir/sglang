@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Union
 
 import msgspec
@@ -135,7 +136,10 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma, budget_policy=envs.SGLANG_SPEC_BUDGET_POLICY.get()
+        )
+        self._schedule_cfg.validate()
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
@@ -218,6 +222,11 @@ class DSparkVerifyPlanner:
     @property
     def fixed_verify_len(self) -> Optional[int]:
         return self._fixed_verify_len
+
+    def set_budget_policy(self, policy: str) -> None:
+        cfg = msgspec.structs.replace(self._schedule_cfg, budget_policy=policy)
+        cfg.validate()
+        self._schedule_cfg.budget_policy = policy
 
     def set_fixed_verify_len(self, verify_len: Optional[int]) -> None:
         """Pin every request's verify length (anchor included) for the fixed-k
@@ -935,11 +944,18 @@ def compute_confidence(
     return confidence
 
 
+# D-cut's capacity ratios (arXiv 2607.14647, Sec. 3): K = max(B, ceil(rho * B * (D + 1))).
+DCUT_RATIOS = (0.25, 0.5, 0.75, 1.0)
+
+
 class DSparkScheduleConfig(msgspec.Struct):
     gamma: int
     min_verify_len: int = 1
     max_verify_len: int = 0
     survival_eps: float = 1e-6
+    # "marginal": every budget B is a candidate (DSpark). "ratio": only D-cut's
+    # four capacity points; same objective (B + sum of survivals) * steps/s.
+    budget_policy: str = "marginal"
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -955,6 +971,10 @@ class DSparkScheduleConfig(msgspec.Struct):
             )
         if self.survival_eps < 0:
             raise ValueError(f"survival_eps must be >= 0, got {self.survival_eps}.")
+        if self.budget_policy not in ("marginal", "ratio"):
+            raise ValueError(
+                f"budget_policy must be 'marginal' or 'ratio', got {self.budget_policy!r}."
+            )
 
 
 class VerifyBudgetDecision(msgspec.Struct):
@@ -987,13 +1007,13 @@ def compute_verify_token_budget(
             num_budgets=int(tau_star.numel()),
         )
         theta = tau_star / step_time
-        idx = int(torch.argmax(theta))
+        idx = _argmax_under_policy(theta=theta, num_requests=int(num_requests), cfg=cfg)
         predicted_step_seconds = float(step_time[idx])
     else:
         batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
         theta = tau_star * sps
-        idx = int(torch.argmax(theta))
+        idx = _argmax_under_policy(theta=theta, num_requests=int(num_requests), cfg=cfg)
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
@@ -1001,6 +1021,32 @@ def compute_verify_token_budget(
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
     )
+
+
+def ratio_policy_budgets(
+    *, num_requests: int, max_verify_len: int, num_candidates: int
+) -> list[int]:
+    """Budgets (draft tokens above the per-request anchor) at D-cut's capacity
+    points: K_rho = max(B, ceil(rho * B * (D + 1))), D + 1 = max_verify_len, so the
+    budget is K_rho - B, capped at the drafts that carry any survival."""
+    out = []
+    for rho in DCUT_RATIOS:
+        k = max(num_requests, math.ceil(rho * num_requests * max_verify_len))
+        out.append(min(k - num_requests, num_candidates))
+    return sorted(set(out))
+
+
+def _argmax_under_policy(
+    *, theta: torch.Tensor, num_requests: int, cfg: DSparkScheduleConfig
+) -> int:
+    if cfg.budget_policy != "ratio":
+        return int(torch.argmax(theta))
+    allowed = ratio_policy_budgets(
+        num_requests=num_requests,
+        max_verify_len=cfg.resolved_max_verify_len(),
+        num_candidates=int(theta.numel()) - 1,
+    )
+    return max(allowed, key=lambda b: float(theta[b]))
 
 
 def _lookup_sps_tensor(
