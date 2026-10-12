@@ -378,6 +378,32 @@ class TestSparseQAcceptCutoffIsLossless(CustomTestCase):
                 self.assertLess(tv, 0.002 + 4 * floor, f"v={v} pos={pos} TV={tv:.4f} noise={floor:.4f}")
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "compact_verify_ids_triton is a Triton kernel")
+class TestCompactVerifyIdsAnchorStride(CustomTestCase):
+    """The compact verify window takes each request's anchor from column 0 of its
+    draft_block_ids row. DFLASH passes rows of gamma + 1 (anchor + drafts), DSpark rows
+    of gamma; every request after the first must get its own anchor either way."""
+
+    def test_triton_matches_torch_for_both_row_widths(self):
+        from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+            compact_verify_ids,
+            compact_verify_ids_triton,
+        )
+
+        torch.manual_seed(0)
+        bs, gamma = 5, 7
+        # 22 real tokens padded to a 24-token tier: the pad rows must come back as 0.
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 3, 1, 6, 4], device="cuda", grid=[24]
+        )
+        for cols in (gamma, gamma + 1):
+            block = torch.randint(1000, (bs, cols), device="cuda")
+            drafts = torch.randint(1000, (bs, gamma), device="cuda")
+            ref = compact_verify_ids(draft_block_ids=block, draft_tokens=drafts, layout=layout, device="cuda")
+            got = compact_verify_ids_triton(draft_block_ids=block, draft_tokens=drafts, layout=layout, device="cuda")
+            torch.testing.assert_close(got, ref, msg=f"row width {cols}")
+
+
 class TestDraftDependentCutoffIsLossless(CustomTestCase):
     """T=1 rejection sampling with the served cutoff rule: survivals from the walk's q
     rows, K from a lagged step, per-request top-K admission. Every emitted position
