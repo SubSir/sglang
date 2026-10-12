@@ -7,6 +7,7 @@ without it.
 
 import importlib.util
 import os
+import sys
 import types
 import unittest
 
@@ -105,6 +106,7 @@ def _load_base(module_name: str, rel_path: str):
         module_name, os.path.join(base, rel_path)
     )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module  # dataclasses resolve fields through it
     spec.loader.exec_module(module)
     return module
 
