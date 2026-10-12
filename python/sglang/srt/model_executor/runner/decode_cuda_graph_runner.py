@@ -371,6 +371,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "tier); disable SGLANG_RAGGED_VERIFY_MODE or the conflicting "
                 "feature."
             )
+        if self.ragged_verify_mode and not self.attn_backend.supports_ragged_verify_graph:
+            # Capture would run the backend on a ragged layout it does not index
+            # (an illegal memory access at capture time, e.g. triton on Qwen3.5).
+            raise ValueError(
+                f"Compact ragged verify graphs need a ragged-capable attention backend; "
+                f"{type(self.attn_backend).__name__} is not one. Use e.g. "
+                "--attention-backend trtllm_mha / fa3 / fa4, or --disable-cuda-graph."
+            )
 
         # Attention backend
         self.max_num_token = (
