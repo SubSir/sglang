@@ -12,6 +12,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_backend import (
+    ragged_verify_dense_scatter_indices,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
@@ -516,6 +519,9 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    # The verify kernel is varlen and the conv path scatters ragged tokens to its
+    # dense layout (see forward_extend), so ragged verify graphs are supported.
+    supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
@@ -1040,11 +1046,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            dense_token_indices = None
+            # getattr: verify inputs without the ragged field are dense.
+            if getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None:
+                batch_size = seq_len // draft_token_num
+                mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+            else:
+                # Compact verify packs a variable number of tokens per request; the
+                # conv update and its per-step scratch want the dense layout, as in
+                # KDAAttnBackend: scatter to step slots, gather back after.
+                batch_size = query_start_loc.shape[0] - 1
+                num_dense_tokens = batch_size * draft_token_num
+                dense_token_indices = ragged_verify_dense_scatter_indices(
+                    query_start_loc=query_start_loc,
+                    seq_len=seq_len,
+                    draft_token_num=draft_token_num,
+                )
+                dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+                dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                mixed_qkv_dense = dense[:num_dense_tokens].view(
+                    batch_size, draft_token_num, -1
+                )
+            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -1058,7 +1082,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                batch_size * draft_token_num, -1
+            )
+            if dense_token_indices is None:
+                mixed_qkv = mixed_qkv_flat
+            else:
+                # Ghost row (zeros) so uncovered tier-leftover tokens gather finite values.
+                padded_flat = mixed_qkv_flat.new_zeros(
+                    batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+                )
+                padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
+                mixed_qkv = padded_flat[dense_token_indices]
         else:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
