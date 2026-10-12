@@ -6,6 +6,7 @@ without it.
 """
 
 import importlib.util
+import math
 import os
 import sys
 import types
@@ -371,7 +372,10 @@ class TestSparseQAcceptCutoffIsLossless(CustomTestCase):
                 emitted = correct >= pos
                 hist = torch.bincount(out[emitted, pos], minlength=vocab).float()
                 tv = 0.5 * (hist / hist.sum() - p[pos]).abs().sum().item()
-                self.assertLess(tv, 0.01, f"v={v} pos={pos} TV={tv:.4f}")
+                # Deeper positions see only the draws accepted so far (~10k at pos 1, ~200 at
+                # pos 3 here), so the bound scales with the multinomial noise of that count.
+                floor = 0.5 * (2 * p[pos] * (1 - p[pos]) / (math.pi * hist.sum())).sqrt().sum().item()
+                self.assertLess(tv, 0.002 + 4 * floor, f"v={v} pos={pos} TV={tv:.4f} noise={floor:.4f}")
 
 
 class TestDraftDependentCutoffIsLossless(CustomTestCase):
