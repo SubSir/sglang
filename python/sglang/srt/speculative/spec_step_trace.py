@@ -61,7 +61,10 @@ class SpecStepTrace:
         entropy: Optional[torch.Tensor] = None,
         confidence: Optional[torch.Tensor] = None,
         alpha: Optional[torch.Tensor] = None,
+        signals: Optional[dict[str, Optional[torch.Tensor]]] = None,
     ) -> None:
+        """``signals`` adds named [bs, gamma] rows, e.g. both the head and the
+        entropy confidence of a step, so one trace replays every policy."""
         if self._file is None:
             return
 
@@ -82,4 +85,6 @@ class SpecStepTrace:
             "confidence": rows(confidence),
             "alpha": rows(alpha),
         }
+        for name, value in (signals or {}).items():
+            rec[name] = rows(value)
         self._file.write(json.dumps(rec) + "\n")
