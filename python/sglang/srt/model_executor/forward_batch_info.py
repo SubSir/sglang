@@ -484,7 +484,6 @@ class NgramEmbeddingInfo:
         )
 
 
-@dataclass
 
 def _spec_mrope_token_deltas(
     *, deltas: torch.Tensor, num_tokens: int, ragged_layout
@@ -497,6 +496,8 @@ def _spec_mrope_token_deltas(
     per_token = deltas.repeat_interleave(ragged_layout.verify_lens.to(torch.int64))
     return torch.nn.functional.pad(per_token, (0, num_tokens - per_token.numel()))
 
+
+@dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
 
