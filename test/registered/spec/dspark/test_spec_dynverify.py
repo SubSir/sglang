@@ -17,6 +17,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptGreedy
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
+    schedule_verify_lens_topk_from_survival,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import (
@@ -42,6 +43,7 @@ from sglang.srt.speculative.spec_confidence import (
     drawn_prob_from_logits,
     entropy_confidence,
     entropy_from_logits,
+    entropy_from_probs,
     raw_survival_chain,
     shifted_draft_prob,
 )
@@ -370,6 +372,115 @@ class TestSparseQAcceptCutoffIsLossless(CustomTestCase):
                 hist = torch.bincount(out[emitted, pos], minlength=vocab).float()
                 tv = 0.5 * (hist / hist.sum() - p[pos]).abs().sum().item()
                 self.assertLess(tv, 0.01, f"v={v} pos={pos} TV={tv:.4f}")
+
+
+class TestDraftDependentCutoffIsLossless(CustomTestCase):
+    """T=1 rejection sampling with the served cutoff rule: survivals from the walk's q
+    rows, K from a lagged step, per-request top-K admission. Every emitted position
+    must follow the target. K taken in-step from the current block's scores reads the
+    slot's own token through its descendants' entropy (D-cut App. B) and must not."""
+
+    B, GAMMA, V = 2, 3, 4
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.q0 = torch.tensor([0.4, 0.2, 0.2, 0.2])
+        # Near-certain after token 0, uniform elsewhere: slot k+1's entropy depends on x_k.
+        self.trans = torch.full((self.V, self.V), 1.0 / self.V)
+        self.trans[0] = torch.tensor([0.97, 0.01, 0.01, 0.01])
+        self.p = torch.tensor([0.1, 0.3, 0.3, 0.3])  # every target row, prefix-independent
+        # A step SPS table: past the first edge every slot is free, so K jumps from 0
+        # to all slots on the batch's total survival, the case where in-step K leaks.
+        table = SpsCostTable(
+            sample_batch_tokens=[self.B, self.B + 1],
+            sample_steps_per_sec=[1.0, 0.7],
+            max_batch_tokens=self.B * (self.GAMMA + 1),
+        )
+        cfg = DSparkScheduleConfig(gamma=self.GAMMA)
+        # A request's survivals depend on its walk prefix (x_0 .. x_{gamma-2}) only,
+        # so the real planner is tabulated over every prefix of every request.
+        prefixes = torch.cartesian_prod(*[torch.arange(self.V)] * (self.GAMMA - 1))
+        surv = raw_survival_chain(torch.exp(-entropy_from_probs(self._q_rows(prefixes))))
+        n_pre, n_k = len(prefixes), self.B * self.GAMMA + 1
+        self.k_tab = torch.empty(n_pre, n_pre, dtype=torch.long)
+        self.len_tab = torch.empty(n_pre, n_pre, n_k, self.B, dtype=torch.long)
+        for a in range(n_pre):
+            for b in range(n_pre):
+                s = surv[[a, b]]
+                self.k_tab[a, b] = compute_verify_token_budget(
+                    history_survival_probs=s, sps_table=table, cfg=cfg
+                ).budget
+                for k in range(n_k):
+                    self.len_tab[a, b, k] = schedule_verify_lens_topk_from_survival(
+                        survival_probs=s, budget=k, cfg=cfg
+                    )
+
+    def _q_rows(self, prefix):
+        return torch.stack(
+            [self.q0.expand(len(prefix), -1)] + [self.trans[prefix[:, j]] for j in range(self.GAMMA - 1)], 1
+        )
+
+    def _walk(self, m):
+        x = torch.empty(m, self.GAMMA, dtype=torch.long)
+        q = self.q0.expand(m, -1)
+        for j in range(self.GAMMA):
+            x[:, j] = torch.multinomial(q, 1)[:, 0]
+            q = self.trans[x[:, j]]
+        return x
+
+    def _prefix_id(self, x):
+        idx = torch.zeros(len(x), dtype=torch.long)
+        for j in range(self.GAMMA - 1):
+            idx = idx * self.V + x[:, j]
+        return idx
+
+    def _emit(self, x, lens):
+        """Chain rejection sampling with verify_len = lens (anchor included)."""
+        m = len(x)
+        q = self._q_rows(x)
+        p = self.p.expand(m, -1)
+        out = torch.zeros(m, self.GAMMA + 1, dtype=torch.long)
+        num_out = torch.zeros(m, dtype=torch.long)
+        alive = torch.ones(m, dtype=torch.bool)
+        for j in range(self.GAMMA + 1):
+            drafted = alive & (j < lens - 1)
+            emitted = drafted | (alive & (j == lens - 1))
+            tok = torch.multinomial(p, 1)[:, 0]  # bonus
+            if j < self.GAMMA:
+                xj, qj = x[:, j], q[:, j]
+                accept = torch.rand(m) < (self.p[xj] / qj.gather(1, xj[:, None])[:, 0]).clamp(max=1)
+                residual = torch.multinomial((p - qj).clamp(min=0), 1)[:, 0]
+                tok = torch.where(drafted, torch.where(accept, xj, residual), tok)
+                alive = drafted & accept
+            out[:, j] = torch.where(emitted, tok, out[:, j])
+            num_out += emitted.long()
+        return out, num_out
+
+    def _tv_per_position(self, k_rule):
+        n = 100_000
+        x = self._walk(n * self.B)
+        pre = self._prefix_id(x).view(n, self.B)
+        if k_rule == "verify_all":
+            lens = torch.full((n * self.B,), self.GAMMA + 1)
+        else:
+            src = pre if k_rule == "in_step" else self._prefix_id(self._walk(n * self.B)).view(n, self.B)
+            k = self.k_tab[src[:, 0], src[:, 1]]
+            lens = self.len_tab[pre[:, 0], pre[:, 1], k].view(-1)
+        out, num_out = self._emit(x, lens)
+        tv = []
+        for j in range(self.GAMMA + 1):
+            sel = num_out > j
+            if int(sel.sum()) >= 10_000:
+                hist = torch.bincount(out[sel, j], minlength=self.V).float()
+                tv.append(0.5 * float((hist / hist.sum() - self.p).abs().sum()))
+        return tv
+
+    def test_lagged_k_is_lossless_and_in_step_k_is_not(self):
+        for rule in ("verify_all", "lagged"):
+            tv = self._tv_per_position(rule)
+            self.assertLess(max(tv), 0.01, f"{rule}: TV per position {tv}")
+        tv = self._tv_per_position("in_step")
+        self.assertGreater(max(tv), 0.025, f"in-step K should leak: TV per position {tv}")
 
 
 class TestSpecMropeRagged(CustomTestCase):
