@@ -5287,6 +5287,9 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "spec_confidence_source",
+                "spec_entropy_table_path",
+                "spec_fixed_verify_len",
             ]
         )
 
@@ -5304,8 +5307,17 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k in (
+                "spec_confidence_source",
+                "spec_entropy_table_path",
+                "spec_fixed_verify_len",
+            ):
+                if not self.spec_algorithm.is_dflash_family():
+                    logging.warning(f"{k} requires a DSpark or DFLASH draft worker.")
+                    if_success = False
+                    break
             elif k == "dspark_force_budget_frac":
-                if not self.spec_algorithm.is_dspark() or not hasattr(
+                if not self.spec_algorithm.is_dflash_family() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"
                 ):
                     logging.warning(
@@ -5352,11 +5364,36 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            if not self._apply_spec_confidence_knobs(remaining):
+                if_success = False
             if remaining:
                 get_context().override(source="update_server_args", **remaining)
             logger.info(f"Config updated via context override: {remaining}")
 
         return SetInternalStateReqOutput(updated=if_success)
+
+    def _apply_spec_confidence_knobs(self, remaining: dict) -> bool:
+        """Pop and apply the dynamic-verify knobs; a rejected value is reported,
+        not raised, so a bad request cannot take down the scheduler."""
+        try:
+            # Order matters: a new table must load before switching to entropy.
+            if "spec_entropy_table_path" in remaining:
+                self.draft_worker.set_spec_entropy_table_path(
+                    remaining.pop("spec_entropy_table_path")
+                )
+            if "spec_confidence_source" in remaining:
+                self.draft_worker.set_spec_confidence_source(
+                    remaining.pop("spec_confidence_source")
+                )
+            if "spec_fixed_verify_len" in remaining:
+                fixed = remaining.pop("spec_fixed_verify_len")
+                self.draft_worker.set_spec_fixed_verify_len(
+                    None if fixed is None else int(fixed)
+                )
+        except (ValueError, OSError) as e:
+            logging.warning(f"spec confidence knob rejected: {e}")
+            return False
+        return True
 
     def save_remote_model(self, **kwargs):
         self.weight_updater.save_remote_model(kwargs)

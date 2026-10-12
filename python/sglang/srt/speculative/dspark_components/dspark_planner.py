@@ -78,8 +78,13 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
+        external_confidence: bool = False,
     ) -> None:
         self.draft_model = draft_model
+        # True when the worker computes confidence itself (draft entropy),
+        # so a head-less draft may still schedule a verify budget.
+        self._external_confidence = external_confidence
+        self._fixed_verify_len: Optional[int] = None
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
@@ -137,7 +142,7 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if self._confidence_head is None and not self._external_confidence:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
                     f"schedules per-request verify lengths from the draft confidence "
@@ -208,7 +213,23 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._confidence_head is not None or self._external_confidence
+
+    @property
+    def fixed_verify_len(self) -> Optional[int]:
+        return self._fixed_verify_len
+
+    def set_fixed_verify_len(self, verify_len: Optional[int]) -> None:
+        """Pin every request's verify length (anchor included) for the fixed-k
+        arm; None restores the confidence-driven schedule."""
+        if verify_len is not None and not (
+            1 <= int(verify_len) <= self.verify_num_draft_tokens
+        ):
+            raise ValueError(
+                f"fixed verify len must be in [1, {self.verify_num_draft_tokens}], "
+                f"got {verify_len}"
+            )
+        self._fixed_verify_len = None if verify_len is None else int(verify_len)
 
     @property
     def last_confidence_raw(self) -> Optional[torch.Tensor]:
@@ -393,6 +414,8 @@ class DSparkVerifyPlanner:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
             return None
+        if self._fixed_verify_len is not None:
+            return self._fixed_budget(num_reqs=int(req_pool_indices_cpu.shape[0]))
         current_generation = self.model_runner.req_to_token_pool.req_generation[
             req_pool_indices_cpu.to(torch.int64)
         ]
@@ -404,6 +427,10 @@ class DSparkVerifyPlanner:
                 req_pool_indices_cpu=req_pool_indices_cpu,
             )
         )
+
+    def _fixed_budget(self, *, num_reqs: int) -> int:
+        floor = max(self._schedule_cfg.min_verify_len, 1)
+        return num_reqs * max(self._fixed_verify_len - floor, 0)
 
     def schedule_layout(
         self,
@@ -574,6 +601,13 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        if self._fixed_verify_len is not None:
+            return torch.full(
+                (int(req_pool_indices.shape[0]),),
+                self._fixed_verify_len,
+                dtype=torch.int32,
+                device=device,
+            )
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,

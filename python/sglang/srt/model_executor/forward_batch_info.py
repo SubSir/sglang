@@ -485,6 +485,18 @@ class NgramEmbeddingInfo:
 
 
 @dataclass
+
+def _spec_mrope_token_deltas(
+    *, deltas: torch.Tensor, num_tokens: int, ragged_layout
+) -> torch.Tensor:
+    """Per-token mRoPE delta for a spec forward: uniform width splits evenly;
+    a ragged verify gives request i its verify_lens[i] rows, then graph padding
+    rows (delta 0)."""
+    if ragged_layout is None:
+        return deltas.repeat_interleave(num_tokens // deltas.numel())
+    per_token = deltas.repeat_interleave(ragged_layout.verify_lens.to(torch.int64))
+    return torch.nn.functional.pad(per_token, (0, num_tokens - per_token.numel()))
+
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
 
@@ -1346,14 +1358,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # target_verify / draft_decode read spec_info.positions; draft_extend
         # passes its own positions (uniform num_draft_tokens per request).
+        ragged_layout = None
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+            ragged_layout = batch.spec_info.ragged_verify_layout
+        seq_positions = seq_positions.reshape(-1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
-            )
+            next_input_positions = seq_positions.unsqueeze(0).repeat(3, 1)
         else:
             mrope_deltas = [
                 (
@@ -1363,10 +1375,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-        )
+            deltas = torch.cat(mrope_deltas, dim=0).to(device=device)
+            next_input_positions = (
+                seq_positions
+                + _spec_mrope_token_deltas(
+                    deltas=deltas,
+                    num_tokens=seq_positions.numel(),
+                    ragged_layout=ragged_layout,
+                )
+            ).unsqueeze(0).repeat(3, 1)
 
         self.mrope_positions = next_input_positions
 

@@ -3,6 +3,7 @@ import math
 import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -15,6 +16,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    AcceptGreedy,
     accept_sampling,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -74,6 +76,24 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyPlanner,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    TargetVerifyExecutor,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
+from sglang.srt.speculative.spec_confidence import (
+    ConfidenceSource,
+    DraftConfidenceSelector,
+    entropy_confidence,
+    entropy_from_probs,
+)
+from sglang.srt.speculative.spec_step_trace import SpecStepTrace, selector_alpha
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -186,6 +206,13 @@ class _DflashDraftSampler:
         selected = self.selected_ids[:, :n]
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
+
+
+class _VerifyOut(msgspec.Struct):
+    logits_output: object
+    can_run_cuda_graph: bool
+    routed_experts_output: object = None
+    indexer_topk_output: object = None
 
 
 def _commit_accept(candidates, accept_len, bonus_tokens):
@@ -568,6 +595,86 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._init_dynamic_verify()
+
+    def _init_dynamic_verify(self) -> None:
+        """Batch-shared ragged verify, reusing DSpark's planner and target-verify
+        executor; the confidence is the selector's calibrated q entropy."""
+        # (candidate_ids, q_rows) of the current step, [bs, gamma, top_k] each.
+        self._selector_step_q: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._step_trace = SpecStepTrace(tp_rank=self.model_runner.tp_rank, tag="dflash")
+        self._verify_planner: Optional[DSparkVerifyPlanner] = None
+        self._verify_executor: Optional[TargetVerifyExecutor] = None
+        self._confidence_selector: Optional[DraftConfidenceSelector] = None
+        if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+            return
+        if self.selector is None:
+            raise ValueError(
+                "DFLASH ragged verify needs a selector draft (DFlash2): its budget "
+                "reads the entropy of the selector's q over the top-k candidates."
+            )
+        gamma = int(self.block_size) - 1
+        self._confidence_selector = DraftConfidenceSelector(
+            gamma=gamma,
+            device=self.device,
+            default_source=ConfidenceSource.ENTROPY,
+            has_head=False,
+        )
+        self._verify_planner = DSparkVerifyPlanner(
+            draft_model=self.draft_model,
+            gamma=gamma,
+            model_runner=self.model_runner,
+            device=self.device,
+            tp_rank=self.model_runner.tp_rank,
+            verify_num_draft_tokens=int(self.block_size),
+            tp_sync=self._tp_sync,
+            external_confidence=True,
+        )
+        self._verify_executor = TargetVerifyExecutor(
+            target_worker=self._target_worker,
+            gamma=gamma,
+            verify_num_draft_tokens=int(self.block_size),
+            model_runner=self.model_runner,
+            kv_injector=None,
+            tp_sync=self._tp_sync,
+        )
+
+    @property
+    def carries_confidence(self) -> bool:
+        return self._verify_planner is not None
+
+    def get_confidence_budget_prepare(self):
+        if self._verify_planner is None:
+            return None
+        return self._verify_planner.confidence_budget_prepare()
+
+    def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        if self._verify_planner is not None:
+            self._verify_planner.set_forced_budget_frac(frac)
+
+    def set_spec_confidence_source(self, name: str) -> None:
+        if self._confidence_selector is None:
+            raise ValueError("DFLASH ragged verify is off (SGLANG_RAGGED_VERIFY_MODE)")
+        self._confidence_selector.set_source(name)
+
+    def set_spec_entropy_table_path(self, path: str) -> None:
+        if self._confidence_selector is None:
+            raise ValueError("DFLASH ragged verify is off (SGLANG_RAGGED_VERIFY_MODE)")
+        self._confidence_selector.load_table(path)
+
+    def set_spec_fixed_verify_len(self, verify_len: Optional[int]) -> None:
+        if self._verify_planner is None:
+            raise ValueError("DFLASH ragged verify is off (SGLANG_RAGGED_VERIFY_MODE)")
+        self._verify_planner.set_fixed_verify_len(verify_len)
+
+    def dump_info_records(self) -> Optional[dict]:
+        return None
+
+    def clear_info_records(self) -> None:
+        return None
+
+    def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        return None
 
     @property
     def draft_worker(self):
@@ -1431,6 +1538,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
+        self._selector_step_q = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
 
     def _selector_sampling_accept(
@@ -1442,7 +1550,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cutoff_verify_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
         gamma = block - 1
@@ -1458,7 +1567,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
+            accept_len, bonus, cap_trim_lens = accept_sampling(
                 candidates=candidates,
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
@@ -1466,14 +1575,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
                 gamma=gamma,
                 verify_num_draft_tokens=block,
-                cutoff_verify_lens=None,
+                cutoff_verify_lens=cutoff_verify_lens,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
-        return accept_len.to(torch.int32), bonus.to(torch.int64)
+        return accept_len.to(torch.int32), bonus.to(torch.int64), cap_trim_lens
 
     def _greedy_sample_from_quantized_head(
         self,
@@ -2094,22 +2203,44 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        cutoff_verify_lens: Optional[torch.Tensor] = None,
     ):
+        """Returns (correct drafts, commit lens, bonus, out tokens, new seq lens or
+        None, target argmax or None, cap-trim lens or None). With a cutoff, a
+        request accepts at most verify_len - 1 drafts and its bonus comes from
+        the last verified row."""
         new_seq_lens = None
         target_predict = None
+        cap_trim_lens = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
+            accept_len, bonus, cap_trim_lens = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                cutoff_verify_lens=cutoff_verify_lens,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif cutoff_verify_lens is not None and _is_all_greedy(sampling_info):
+            accept_len, bonus, cap_trim_lens = AcceptGreedy.execute(
+                candidates=candidates,
+                target_logits=next_token_logits,
+                verify_num_draft_tokens=int(self.block_size),
+                cutoff_verify_lens=cutoff_verify_lens,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, bonus)
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif cutoff_verify_lens is not None:
+            raise RuntimeError(
+                "DFLASH ragged verify with sampling needs the selector's q "
+                "(a DFlash2 draft with selector sampling enabled)."
+            )
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -2166,7 +2297,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        return (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+            cap_trim_lens,
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2519,6 +2658,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None:
             self._selector_sample = None
+            self._selector_step_q = None
             if self._draft_sampler is not None:
                 # Consumed by the in-graph sample; must be staged before the replay.
                 self._draft_sampler.stage_sampling_params(
@@ -2579,15 +2719,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            if self.selector is not None:
+                self._selector_step_q = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
                 and self._selector_sampling_enabled
             ):
-                self._selector_sample = (
-                    self._draft_sampler.candidate_out[:bs],
-                    self._draft_sampler.q_out[:bs],
-                )
+                self._selector_sample = self._selector_step_q
         elif self.selector is not None:
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group,
@@ -2619,6 +2761,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+
+        draft_entropy, confidence = self._step_confidence()
+        verify_token_budget, layout = self._plan_verify(
+            batch=batch,
+            draft_input=draft_input,
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+        )
+        run_compact = self._verify_planner is not None and (
+            self._verify_planner.should_run_compact(layout=layout)
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2655,6 +2808,100 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
+        if run_compact:
+            # The compact executor adds each request's own verify length to the
+            # committed host lengths, not the full block.
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+            target_out = self._run_compact_verify(
+                batch=batch,
+                layout=layout,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                sampling_info=sampling_info,
+            )
+        else:
+            target_out = self._run_full_verify(
+                batch=batch,
+                verify_input=verify_input,
+                draft_input=draft_input,
+                sampling_info=sampling_info,
+                seq_lens_cpu_backup=seq_lens_cpu_backup,
+                seq_lens_sum_backup=seq_lens_sum_backup,
+            )
+        logits_output = target_out.logits_output
+        can_run_cuda_graph = target_out.can_run_cuda_graph
+
+        grammar_mask = None
+        if batch.has_grammar:
+            grammar_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                tree=grammar_tree,
+                sampling_info=batch.sampling_info,
+                device=logits_output.next_token_logits.device,
+                barrier=grammar_barrier,
+            )
+
+        # Constrain every chain position before accept picks from it.
+        if grammar_mask is not None:
+            grammar_mask.apply(logits_output.next_token_logits)
+
+        candidates = draft_tokens
+        (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+            cap_trim_lens,
+        ) = self._accept_block(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            prefix_lens=prefix_lens,
+            bs=bs,
+            cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        )
+        return self._finish_verify_step(
+            batch=batch,
+            on_publish=on_publish,
+            bs=bs,
+            block_size=block_size,
+            prefix_lens=prefix_lens,
+            seq_lens_pre_verify=seq_lens_pre_verify,
+            positions=positions,
+            verify_out_cache_loc=verify_out_cache_loc,
+            verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+            target_out=target_out,
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+            candidates=candidates,
+            accept_len=accept_len,
+            commit_lens=commit_lens,
+            bonus=bonus,
+            out_tokens=out_tokens,
+            new_seq_lens=new_seq_lens,
+            target_predict=target_predict,
+            cap_trim_lens=cap_trim_lens,
+            layout=layout,
+            verify_token_budget=verify_token_budget,
+            draft_entropy=draft_entropy,
+            confidence=confidence,
+            sampling_info=sampling_info,
+        )
+
+    def _run_full_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        draft_input: DFlashDraftInputV2,
+        sampling_info,
+        seq_lens_cpu_backup,
+        seq_lens_sum_backup,
+    ):
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -2684,47 +2931,117 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
-        logits_output = target_out.logits_output
-        can_run_cuda_graph = target_out.can_run_cuda_graph
-
-        grammar_mask = None
-        if batch.has_grammar:
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=batch.sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
-            )
-
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=target_out.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
-
-        # Constrain every chain position before accept picks from it.
-        if grammar_mask is not None:
-            grammar_mask.apply(logits_output.next_token_logits)
-
-        candidates = draft_tokens
-        (
-            accept_len,
-            commit_lens,
-            bonus,
-            out_tokens,
-            new_seq_lens,
-            target_predict,
-        ) = self._accept_block(
-            candidates=candidates,
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            prefix_lens=prefix_lens,
-            bs=bs,
+        return _VerifyOut(
+            logits_output=target_out.logits_output,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
+            routed_experts_output=target_out.routed_experts_output,
+            indexer_topk_output=target_out.indexer_topk_output,
         )
 
+    def _run_compact_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        layout: RaggedVerifyLayout,
+        draft_tokens: torch.Tensor,
+        bs: int,
+        sampling_info,
+    ):
+        """DSpark's compact verify: only verify_lens[i] rows per request reach the
+        target; logits and hidden come back scattered to [bs * block] with zero
+        rows past each request's cutoff."""
+        target_verify, _ = self._verify_executor.run_compact(
+            batch=batch,
+            layout=layout,
+            draft_block_ids=draft_tokens,
+            draft_tokens=draft_tokens[:, 1:],
+            bs=bs,
+            device=self.device,
+            sampling_info=sampling_info,
+        )
+        return _VerifyOut(
+            logits_output=target_verify.logits_output,
+            can_run_cuda_graph=target_verify.can_run_cuda_graph,
+        )
+
+    def _step_confidence(
+        self,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """(selector q entropy, budget confidence), each [bs, gamma] or None."""
+        needs_entropy = self._step_trace.enabled or (
+            self._confidence_selector is not None
+            and self._confidence_selector.uses_entropy
+        )
+        if not needs_entropy or self._selector_step_q is None:
+            return None, None
+        draft_entropy = entropy_from_probs(self._selector_step_q[1])
+        if self._verify_planner is None:
+            return draft_entropy, None
+        confidence = entropy_confidence(
+            entropy=draft_entropy, calibrator=self._confidence_selector.calibrator
+        )
+        return draft_entropy, confidence
+
+    def _plan_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        confidence: Optional[torch.Tensor],
+        prefix_lens: torch.Tensor,
+    ) -> Tuple[Optional[int], Optional[RaggedVerifyLayout]]:
+        if self._verify_planner is None:
+            return None, None
+        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+            draft_input=draft_input,
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
+        )
+        layout = self._verify_planner.schedule_layout(
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=prefix_lens,
+            device=self.device,
+            confidence=confidence,
+            budget=verify_token_budget,
+        )
+        return verify_token_budget, layout
+
+    def _finish_verify_step(
+        self,
+        *,
+        batch: ScheduleBatch,
+        on_publish,
+        bs: int,
+        block_size: int,
+        prefix_lens: torch.Tensor,
+        seq_lens_pre_verify: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        verify_out_cache_loc: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+        target_out: "_VerifyOut",
+        logits_output,
+        can_run_cuda_graph: bool,
+        candidates: torch.Tensor,
+        accept_len: torch.Tensor,
+        commit_lens: torch.Tensor,
+        bonus: torch.Tensor,
+        out_tokens: torch.Tensor,
+        new_seq_lens: Optional[torch.Tensor],
+        target_predict: Optional[torch.Tensor],
+        cap_trim_lens: Optional[torch.Tensor],
+        layout: Optional[RaggedVerifyLayout],
+        verify_token_budget: Optional[int],
+        draft_entropy: Optional[torch.Tensor],
+        confidence: Optional[torch.Tensor],
+        sampling_info,
+    ) -> GenerationBatchResult:
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
                 raise ValueError(
@@ -2775,7 +3092,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
-            on_publish(new_seq_lens)
+            if confidence is not None:
+                on_publish(new_seq_lens, confidence=confidence)
+            else:
+                on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
@@ -2796,6 +3116,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
+        if self._step_trace.enabled:
+            self._write_step_trace(
+                batch=batch,
+                logits_output=logits_output,
+                verify_token_budget=verify_token_budget,
+                layout=layout,
+                commit_lens=commit_lens,
+                cap_trim_lens=cap_trim_lens,
+                draft_entropy=draft_entropy,
+                confidence=confidence,
+                sampling_info=sampling_info,
+            )
+
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
@@ -2811,6 +3144,54 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            block_accept_lens=(
+                None if cap_trim_lens is None else commit_lens + cap_trim_lens
+            ),
+            cap_lens=None if layout is None else layout.verify_lens.to(torch.int32),
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+        )
+
+    def _write_step_trace(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        verify_token_budget: Optional[int],
+        layout: Optional[RaggedVerifyLayout],
+        commit_lens: torch.Tensor,
+        cap_trim_lens: Optional[torch.Tensor],
+        draft_entropy: Optional[torch.Tensor],
+        confidence: Optional[torch.Tensor],
+        sampling_info,
+    ) -> None:
+        # alpha needs the full-width target rows: exact only when every slot was
+        # verified (static or cap-accept), which is how calibration data is taken.
+        alpha = None
+        if self._selector_step_q is not None and (
+            layout is None or not self._verify_planner.is_compact_mode
+        ):
+            candidate_ids, q_rows = self._selector_step_q
+            alpha = selector_alpha(
+                q_rows=q_rows,
+                candidate_ids=candidate_ids,
+                target_logits=logits_output.next_token_logits,
+                temperatures=(
+                    None if sampling_info is None else sampling_info.temperatures
+                ),
+            )
+        self._step_trace.write(
+            rids=[req.rid for req in batch.reqs],
+            budget=verify_token_budget,
+            verify_lens=None if layout is None else layout.verify_lens,
+            commit_lens=commit_lens,
+            cap_trim_lens=cap_trim_lens,
+            source=(
+                "static"
+                if self._confidence_selector is None
+                else self._confidence_selector.source.value
+            ),
+            entropy=draft_entropy,
+            confidence=confidence,
+            alpha=alpha,
         )

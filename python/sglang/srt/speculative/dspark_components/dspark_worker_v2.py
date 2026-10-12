@@ -69,6 +69,13 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.spec_confidence import (
+    ConfidenceSource,
+    DraftConfidenceSelector,
+    entropy_confidence,
+    entropy_from_logits,
+)
+from sglang.srt.speculative.spec_step_trace import SpecStepTrace
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -274,6 +281,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._target_hidden_projection_enabled = False
 
+        has_head = getattr(self.draft_model, "confidence_head", None) is not None
+        self._confidence_selector = (
+            DraftConfidenceSelector(
+                gamma=self.gamma,
+                device=self.device,
+                default_source=(
+                    ConfidenceSource.HEAD if has_head else ConfidenceSource.ENTROPY
+                ),
+                has_head=has_head,
+            )
+            if has_head or envs.SGLANG_SPEC_ENTROPY_TABLE_PATH.get()
+            else None
+        )
+        self._step_trace = SpecStepTrace(
+            tp_rank=self.model_runner.tp_rank, tag="dspark"
+        )
+
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -282,6 +306,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.model_runner.tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
+            external_confidence=(
+                self._confidence_selector is not None
+                and self._confidence_selector.entropy_ready
+            ),
         )
         if (
             get_parallel().enable_dp_attention
@@ -531,6 +559,51 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
+
+    def set_spec_confidence_source(self, name: str) -> None:
+        if not self._hosts_draft:
+            return
+        if self._confidence_selector is None:
+            raise ValueError("this DSpark draft has no confidence source to switch")
+        self._confidence_selector.set_source(name)
+
+    def set_spec_entropy_table_path(self, path: str) -> None:
+        if not self._hosts_draft:
+            return
+        if self._confidence_selector is None:
+            raise ValueError("this DSpark draft has no confidence source to switch")
+        self._confidence_selector.load_table(path)
+
+    def set_spec_fixed_verify_len(self, verify_len: Optional[int]) -> None:
+        if not self._hosts_draft:
+            return
+        self._verify_planner.set_fixed_verify_len(verify_len)
+
+    def _confidence_for_budget(self, *, proposal, draft_block_ids, draft_tokens):
+        """Head confidence by default; draft entropy through the calibration
+        table when the selector says so. Returns (confidence, entropy)."""
+        selector = self._confidence_selector
+        if selector is not None and selector.uses_entropy:
+            corrected = proposal.draft_block.corrected_logits
+            if corrected is None:
+                raise RuntimeError(
+                    "entropy confidence needs the draft logits; the greedy folded "
+                    "proposal does not keep them (set SGLANG_DSPARK_FOLDED_PROPOSAL=0)."
+                )
+            entropy = entropy_from_logits(corrected, proposal.draft_block.temperatures)
+            return (
+                entropy_confidence(entropy=entropy, calibrator=selector.calibrator),
+                entropy,
+            )
+        confidence = proposal.confidence
+        if confidence is None:
+            confidence = self._verify_planner.compute_confidence_tensor(
+                draft_hidden=proposal.draft_hidden,
+                anchor_tokens=draft_block_ids[:, 0],
+                draft_tokens=draft_tokens,
+                confidence_tap=proposal.confidence_tap,
+            )
+        return confidence, None
 
     def dump_info_records(self) -> Optional[dict]:
         if not self._hosts_draft:
@@ -786,14 +859,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
-        confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
-            )
+        confidence, draft_entropy = self._confidence_for_budget(
+            proposal=proposal, draft_block_ids=draft_block_ids, draft_tokens=draft_tokens
+        )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -964,6 +1032,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+
+        if self._step_trace.enabled:
+            self._step_trace.write(
+                rids=[req.rid for req in batch.reqs],
+                budget=verify_token_budget,
+                verify_lens=None if layout is None else layout.verify_lens,
+                commit_lens=accept.commit_lens,
+                cap_trim_lens=accept.cap_trim_lens,
+                source=(
+                    "static"
+                    if self._confidence_selector is None
+                    else self._confidence_selector.source.value
+                ),
+                entropy=draft_entropy,
+                confidence=confidence,
+            )
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
