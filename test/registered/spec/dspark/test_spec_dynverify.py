@@ -325,6 +325,53 @@ class TestGreedyAcceptCutoff(CustomTestCase):
         self.assertEqual(bonus.tolist(), expect_bonus)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "accept_sampling is a Triton kernel")
+class TestSparseQAcceptCutoffIsLossless(CustomTestCase):
+    """DFlash2 at T=1: the selector's q lives on top-k candidates, scattered into a
+    dense [bs, gamma, V] buffer for DSpark's accept_sampling. With a per-request cutoff
+    every emitted position must still be distributed exactly as the target p of its row
+    (the target rows here do not depend on the prefix, so each row's p is fixed)."""
+
+    def test_emitted_positions_follow_target(self):
+        from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
+
+        torch.manual_seed(0)
+        dev, n, gamma, vocab, k = "cuda", 200_000, 3, 12, 4
+        block = gamma + 1
+        p_logits = torch.randn(block, vocab, device=dev) * 1.5
+        p = torch.softmax(p_logits, -1)
+        cand = torch.stack([torch.randperm(vocab, device=dev)[:k] for _ in range(gamma)])  # [gamma, K]
+        q_sparse = torch.softmax(torch.randn(gamma, k, device=dev), -1)
+        dense_q = torch.zeros(gamma, vocab, device=dev)
+        dense_q.scatter_(1, cand, q_sparse)
+        draws = torch.multinomial(q_sparse, n, replacement=True).T  # [n, gamma]
+        drafts = torch.gather(cand.unsqueeze(0).expand(n, -1, -1), 2, draws.unsqueeze(-1)).squeeze(-1)
+        candidates = torch.cat([torch.zeros(n, 1, dtype=torch.int64, device=dev), drafts], 1)
+        info = types.SimpleNamespace(
+            temperatures=torch.ones(n, 1, device=dev),
+            need_top_k_sampling=False, need_top_p_sampling=False,
+        )
+        for v in (1, 2, 3, 4):
+            correct, bonus, _ = accept_sampling(
+                candidates=candidates,
+                target_logits=p_logits.repeat(n, 1),
+                draft_probs=dense_q.unsqueeze(0).expand(n, -1, -1).contiguous(),
+                sampling_info=info,
+                draft_input=types.SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
+                gamma=gamma,
+                verify_num_draft_tokens=block,
+                cutoff_verify_lens=torch.full((n,), v, device=dev, dtype=torch.int32),
+            )
+            self.assertLessEqual(int(correct.max()), v - 1)
+            out = torch.cat([drafts, torch.zeros(n, 1, dtype=torch.int64, device=dev)], 1)
+            out.scatter_(1, correct.long().view(-1, 1), bonus.view(-1, 1))
+            for pos in range(v):  # every emitted position up to the bonus
+                emitted = correct >= pos
+                hist = torch.bincount(out[emitted, pos], minlength=vocab).float()
+                tv = 0.5 * (hist / hist.sum() - p[pos]).abs().sum().item()
+                self.assertLess(tv, 0.01, f"v={v} pos={pos} TV={tv:.4f}")
+
+
 class TestSpecMropeRagged(CustomTestCase):
     def _fb(self, bs):
         fb = object.__new__(ForwardBatch)
