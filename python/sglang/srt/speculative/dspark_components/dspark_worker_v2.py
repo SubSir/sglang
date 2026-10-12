@@ -605,6 +605,38 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         return confidence, None
 
+    def _trace_signals(
+        self, *, proposal, draft_block_ids, draft_tokens, confidence, draft_entropy
+    ) -> dict:
+        """Both candidate budget signals of this step on identical drafts, whatever
+        the active source (trace only: the extra work forces syncs anyway)."""
+        selector = self._confidence_selector
+        if selector is None:
+            return {}
+        out = {}
+        if selector.has_head:
+            out["confidence_head"] = (
+                confidence
+                if not selector.uses_entropy
+                else self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_tokens=draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
+            )
+        corrected = proposal.draft_block.corrected_logits
+        if draft_entropy is None and corrected is not None:
+            draft_entropy = entropy_from_logits(
+                corrected, proposal.draft_block.temperatures
+            )
+            out["entropy"] = draft_entropy
+        if draft_entropy is not None and selector.entropy_ready:
+            out["confidence_entropy"] = entropy_confidence(
+                entropy=draft_entropy, calibrator=selector.calibrator
+            )
+        return out
+
     def dump_info_records(self) -> Optional[dict]:
         if not self._hosts_draft:
             return None
@@ -1047,6 +1079,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 entropy=draft_entropy,
                 confidence=confidence,
+                signals=self._trace_signals(
+                    proposal=proposal,
+                    draft_block_ids=draft_block_ids,
+                    draft_tokens=draft_tokens,
+                    confidence=confidence,
+                    draft_entropy=draft_entropy,
+                ),
             )
 
         next_draft_input = make_next_draft_input(
