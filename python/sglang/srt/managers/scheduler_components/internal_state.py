@@ -324,6 +324,7 @@ _SPEC_CONFIDENCE_KNOBS = (
     "spec_confidence_source",
     "spec_entropy_table_path",
     "spec_fixed_verify_len",
+    "spec_budget_policy",
 )
 
 

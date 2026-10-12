@@ -76,8 +76,10 @@ from sglang.srt.speculative.spec_sampling_mask import (
 from sglang.srt.speculative.spec_confidence import (
     ConfidenceSource,
     DraftConfidenceSelector,
+    drawn_prob_from_logits,
     entropy_confidence,
     entropy_from_logits,
+    shifted_draft_prob,
 )
 from sglang.srt.speculative.spec_step_trace import SpecStepTrace
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -600,10 +602,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._verify_planner.set_fixed_verify_len(verify_len)
 
+    def set_spec_budget_policy(self, policy: str) -> None:
+        if not self._hosts_draft:
+            return
+        self._verify_planner.set_budget_policy(policy)
+
     def _confidence_for_budget(self, *, proposal, draft_block_ids, draft_tokens):
         """Head confidence by default; draft entropy through the calibration
         table when the selector says so. Returns (confidence, entropy)."""
         selector = self._confidence_selector
+        if selector is not None and selector.uses_draft_prob:
+            corrected = self._require_draft_logits(proposal)
+            q_drawn = drawn_prob_from_logits(
+                corrected, proposal.draft_block.temperatures, draft_tokens
+            )
+            return shifted_draft_prob(q_drawn), None
         if selector is not None and selector.uses_entropy:
             corrected = proposal.draft_block.corrected_logits
             if corrected is None:
@@ -617,6 +630,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 entropy,
             )
         return proposal.confidence, None
+
+    @staticmethod
+    def _require_draft_logits(proposal) -> torch.Tensor:
+        corrected = proposal.draft_block.corrected_logits
+        if corrected is None:
+            raise RuntimeError(
+                "draft-side confidence needs the draft logits; the greedy folded "
+                "proposal does not keep them (set SGLANG_DSPARK_FOLDED_PROPOSAL=0)."
+            )
+        return corrected
 
     def _trace_signals(
         self, *, proposal, draft_block_ids, draft_tokens, confidence, draft_entropy
@@ -639,6 +662,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         if draft_entropy is not None and selector.entropy_ready:
             out["confidence_entropy"] = entropy_confidence(
                 entropy=draft_entropy, calibrator=selector.calibrator
+            )
+        if corrected is not None:
+            out["confidence_draft_prob"] = shifted_draft_prob(
+                drawn_prob_from_logits(
+                    corrected, proposal.draft_block.temperatures, draft_tokens
+                )
             )
         return out
 

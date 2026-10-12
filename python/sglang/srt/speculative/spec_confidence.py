@@ -3,7 +3,8 @@
 The budget planner consumes a per-slot conditional confidence c_k and sorts by
 the survival cumprod(c). The entropy source maps the draft's own per-slot
 entropy to a calibrated survival chain through a quantile-bin table fitted
-offline, then hands the planner the conditional ratios of that chain.
+offline, then hands the planner the conditional ratios of that chain. The
+draft_prob source is D-cut's uncalibrated prefix product of q(drafted token).
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ import torch
 class ConfidenceSource(str, enum.Enum):
     HEAD = "head"
     ENTROPY = "entropy"
+    # D-cut (arXiv 2607.14647): raw draft probability of the drafted tokens, used
+    # in its lossless shifted form (App. B) -- slot k scores prod_{t<k} q(z_t).
+    DRAFT_PROB = "draft_prob"
 
 
 class EntropyCalibrationTable(msgspec.Struct, frozen=True):
@@ -128,6 +132,33 @@ def entropy_from_logits(
     return -(logp.exp() * logp).sum(-1)
 
 
+def shifted_draft_prob(q_drawn: torch.Tensor) -> torch.Tensor:
+    """D-cut's shifted score as per-slot conditionals: slot 1 gets 1, slot t gets
+    q(z_{t-1}), so cumprod gives prod_{t<k} q(z_t). The admission of slot k never
+    depends on the token drawn at k, which keeps rejection sampling exact."""
+    q = q_drawn.to(torch.float32).clamp(0.0, 1.0)
+    return torch.cat([torch.ones_like(q[:, :1]), q[:, :-1]], dim=1)
+
+
+def drawn_prob_from_logits(
+    logits: torch.Tensor, temperatures: Optional[torch.Tensor], tokens: torch.Tensor
+) -> torch.Tensor:
+    """q(z) of the drafted tokens under softmax(logits / T); logits [bs, gamma, V]."""
+    x = logits.to(torch.float32)
+    if temperatures is not None:
+        x = x / temperatures.to(torch.float32).view(-1, 1, 1).clamp_min(1e-5)
+    logp = torch.log_softmax(x, dim=-1)
+    return torch.gather(logp, 2, tokens.to(torch.int64).unsqueeze(-1)).squeeze(-1).exp()
+
+
+def drawn_prob_from_candidates(
+    *, q_rows: torch.Tensor, candidate_ids: torch.Tensor, tokens: torch.Tensor
+) -> torch.Tensor:
+    """q(z) of the drafted tokens from a sparse top-k q ([bs, gamma, K])."""
+    match = candidate_ids == tokens.to(candidate_ids.dtype).unsqueeze(-1)
+    return (q_rows.to(torch.float32) * match).sum(-1)
+
+
 def entropy_confidence(
     *, entropy: torch.Tensor, calibrator: EntropyCalibrator
 ) -> torch.Tensor:
@@ -179,3 +210,7 @@ class DraftConfidenceSelector:
     @property
     def uses_entropy(self) -> bool:
         return self.source is ConfidenceSource.ENTROPY
+
+    @property
+    def uses_draft_prob(self) -> bool:
+        return self.source is ConfidenceSource.DRAFT_PROB

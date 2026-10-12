@@ -101,8 +101,10 @@ from sglang.srt.speculative.ragged_verify import (
 from sglang.srt.speculative.spec_confidence import (
     ConfidenceSource,
     DraftConfidenceSelector,
+    drawn_prob_from_candidates,
     entropy_confidence,
     entropy_from_probs,
+    shifted_draft_prob,
 )
 from sglang.srt.speculative.spec_step_trace import SpecStepTrace, selector_alpha
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -644,7 +646,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._confidence_selector = DraftConfidenceSelector(
             gamma=gamma,
             device=self.device,
-            default_source=ConfidenceSource.ENTROPY,
+            # Without a table only the uncalibrated D-cut signal can run.
+            default_source=(
+                ConfidenceSource.ENTROPY
+                if envs.SGLANG_SPEC_ENTROPY_TABLE_PATH.get()
+                else ConfidenceSource.DRAFT_PROB
+            ),
             has_head=False,
         )
         self._verify_planner = DSparkVerifyPlanner(
@@ -693,6 +700,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._verify_planner is None:
             raise ValueError("DFLASH ragged verify is off (SGLANG_RAGGED_VERIFY_MODE)")
         self._verify_planner.set_fixed_verify_len(verify_len)
+
+    def set_spec_budget_policy(self, policy: str) -> None:
+        if self._verify_planner is None:
+            raise ValueError("DFLASH ragged verify is off (SGLANG_RAGGED_VERIFY_MODE)")
+        self._verify_planner.set_budget_policy(policy)
 
     def dump_info_records(self) -> Optional[dict]:
         return None
@@ -2892,7 +2904,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        draft_entropy, confidence = self._step_confidence()
+        draft_entropy, confidence = self._step_confidence(drafted=draft_tokens[:, 1:])
         verify_token_budget, layout = self._plan_verify(
             batch=batch,
             draft_input=draft_input,
@@ -3107,20 +3119,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _step_confidence(
-        self,
+        self, *, drafted: torch.Tensor
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """(selector q entropy, budget confidence), each [bs, gamma] or None."""
-        needs_entropy = self._step_trace.enabled or (
-            self._confidence_selector is not None
-            and self._confidence_selector.uses_entropy
-        )
-        if not needs_entropy or self._selector_step_q is None:
+        """(selector q entropy, budget confidence), each [bs, gamma] or None.
+        ``drafted`` holds the proposed tokens [bs, gamma] (D-cut's q(z))."""
+        selector = self._confidence_selector
+        needs_q = self._step_trace.enabled or selector is not None
+        if not needs_q or self._selector_step_q is None:
             return None, None
-        draft_entropy = entropy_from_probs(self._selector_step_q[1])
+        candidate_ids, q_rows = self._selector_step_q
+        draft_entropy = entropy_from_probs(q_rows)
         if self._verify_planner is None:
             return draft_entropy, None
+        if selector.uses_draft_prob:
+            q_drawn = drawn_prob_from_candidates(
+                q_rows=q_rows, candidate_ids=candidate_ids, tokens=drafted
+            )
+            return draft_entropy, shifted_draft_prob(q_drawn)
         confidence = entropy_confidence(
-            entropy=draft_entropy, calibrator=self._confidence_selector.calibrator
+            entropy=draft_entropy, calibrator=selector.calibrator
         )
         return draft_entropy, confidence
 
@@ -3250,6 +3267,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_entropy=draft_entropy,
                 confidence=confidence,
                 sampling_info=sampling_info,
+                drafted=candidates[:, 1:],
             )
 
         next_draft_input = self._make_next_draft_input_decode(
@@ -3287,6 +3305,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_entropy: Optional[torch.Tensor],
         confidence: Optional[torch.Tensor],
         sampling_info,
+        drafted: torch.Tensor,
     ) -> None:
         # alpha needs the full-width target rows: exact only when every slot was
         # verified (static or cap-accept), which is how calibration data is taken.
@@ -3317,4 +3336,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             entropy=draft_entropy,
             confidence=confidence,
             alpha=alpha,
+            signals=self._trace_signals(draft_entropy=draft_entropy, drafted=drafted),
         )
+
+    def _trace_signals(
+        self, *, draft_entropy: Optional[torch.Tensor], drafted: torch.Tensor
+    ) -> dict:
+        """Every budget signal of this step on the same drafts, for offline replay."""
+        if self._selector_step_q is None:
+            return {}
+        candidate_ids, q_rows = self._selector_step_q
+        out = {
+            "confidence_draft_prob": shifted_draft_prob(
+                drawn_prob_from_candidates(
+                    q_rows=q_rows, candidate_ids=candidate_ids, tokens=drafted
+                )
+            )
+        }
+        selector = self._confidence_selector
+        if draft_entropy is not None and selector is not None and selector.entropy_ready:
+            out["confidence_entropy"] = entropy_confidence(
+                entropy=draft_entropy, calibrator=selector.calibrator
+            )
+        return out
