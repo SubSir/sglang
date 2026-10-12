@@ -560,6 +560,12 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Draft confidence for the ragged verify budget: "head" (DSpark default) or
+    # "entropy" (draft entropy through a calibration table; DFlash default).
+    SGLANG_SPEC_CONFIDENCE_SOURCE = EnvStr("")
+    SGLANG_SPEC_ENTROPY_TABLE_PATH = EnvStr("")
+    # Per-verify-step JSONL trace (budget, verify lens, accept, entropy, alpha).
+    SGLANG_SPEC_STEP_TRACE_PATH = EnvStr("")
 
     # ===================================================================
     # Memory pools and KV-cache sizing

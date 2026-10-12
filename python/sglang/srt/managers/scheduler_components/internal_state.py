@@ -157,9 +157,18 @@ class SchedulerInternalStateController:
             return SetInternalStateReqOutput(updated=False)
 
         # Worker commands apply directly; config keys land in one override.
+        # A new entropy table must load before a switch to entropy reads it.
         overrides = {}
-        for key, value in requested.items():
-            overrides.update(handlers[key].apply(key, value) or {})
+        try:
+            for key, value in sorted(
+                requested.items(), key=lambda kv: kv[0] != "spec_entropy_table_path"
+            ):
+                overrides.update(handlers[key].apply(key, value) or {})
+        except (ValueError, OSError) as e:
+            # A rejected knob value is reported, not raised, so a bad request
+            # cannot take down the scheduler.
+            logger.warning(f"spec confidence knob rejected: {e}")
+            return SetInternalStateReqOutput(updated=False)
         if overrides:
             get_context().override(source="update_server_args", **overrides)
             logger.info(f"Config updated via context override: {overrides}")
@@ -182,6 +191,13 @@ class SchedulerInternalStateController:
             "dspark_clear_info_records": _UpdateHandler(
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
+            **{
+                key: _UpdateHandler(
+                    self._validate_spec_confidence_knob,
+                    self._apply_spec_confidence_knob,
+                )
+                for key in _SPEC_CONFIDENCE_KNOBS
+            },
         }
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
@@ -205,6 +221,10 @@ class SchedulerInternalStateController:
 
     def _apply_accept_threshold(self, key: str, value: Any) -> Dict[str, Any]:
         # Acceptance statistics describe the previous threshold; start over.
+        self._reset_accept_stats()
+        return {key: value}
+
+    def _reset_accept_stats(self) -> None:
         accept_length = self._average_accept_length()
         if accept_length is not None:
             logger.info(f"avg_spec_accept_length={accept_length}")
@@ -212,10 +232,13 @@ class SchedulerInternalStateController:
         metrics_reporter.spec_total_num_accept_tokens = (
             metrics_reporter.spec_total_num_forward_ct
         ) = 0
-        return {key: value}
 
     def _validate_dspark_budget_frac(self, key: str, value: Any) -> None:
-        self._require_dspark_worker(key, "set_dspark_forced_budget_frac")
+        # DFLASH reuses the DSpark verify planner, so it takes the knob too.
+        if not self.scheduler.spec_algorithm.is_dflash_family() or not hasattr(
+            self.scheduler.draft_worker, "set_dspark_forced_budget_frac"
+        ):
+            raise UpdateRejected(f"{key} requires a DSpark draft worker.")
         if value is not None and not (0.0 < float(value) <= 1.0):
             raise UpdateRejected(f"{key} must be in (0, 1] or null, got {value}.")
 
@@ -231,6 +254,20 @@ class SchedulerInternalStateController:
     def _apply_dspark_clear_records(self, key: str, value: Any) -> None:
         if value:
             self.scheduler.draft_worker.clear_info_records()
+
+    def _validate_spec_confidence_knob(self, key: str, value: Any) -> None:
+        if not self.scheduler.spec_algorithm.is_dflash_family():
+            raise UpdateRejected(f"{key} requires a DSpark or DFLASH draft worker.")
+
+    def _apply_spec_confidence_knob(self, key: str, value: Any) -> None:
+        # Worker commands; a bad value raises ValueError/OSError, caught above.
+        worker = self.scheduler.draft_worker
+        if key == "spec_fixed_verify_len":
+            worker.set_spec_fixed_verify_len(None if value is None else int(value))
+        else:
+            getattr(worker, f"set_{key}")(value)
+        # Acceptance statistics describe the previous verify policy.
+        self._reset_accept_stats()
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
         if not self.scheduler.spec_algorithm.is_dspark() or not hasattr(
@@ -280,6 +317,14 @@ class SchedulerInternalStateController:
             queued.extend(prealloc_queue.retracted_queue)
             queued.extend(prealloc_queue.held_rebootstrap_reqs)
         return any(req.return_sampling_mask and not req.finished() for req in queued)
+
+
+# Dynamic-verify knobs routed to the draft worker's set_<key> command.
+_SPEC_CONFIDENCE_KNOBS = (
+    "spec_confidence_source",
+    "spec_entropy_table_path",
+    "spec_fixed_verify_len",
+)
 
 
 class _UpdateHandler:

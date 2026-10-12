@@ -159,8 +159,18 @@ class SpeculativeAlgorithm(Enum):
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
-        graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        graphs in the decode cuda graph runner. DFLASH opts in only when a
+        ragged mode is selected, so its default static path is unchanged."""
+        if self.is_dspark():
+            return True
+        if not self.is_dflash():
+            return False
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
