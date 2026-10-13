@@ -527,7 +527,9 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
     must follow the target. K taken in-step from the current block's scores reads the
     slot's own token through its descendants' entropy (D-cut App. B) and must not.
     A per-request survival threshold whose price comes from an earlier step is a
-    stopping rule on the draft prefix, so it is lossless under any cost model."""
+    stopping rule on the draft prefix, so it is lossless under any cost model. So is
+    D-cut's App. B causal scan: admit the best frontier slot while the batch's
+    tokens per second rise, stop at the first drop."""
 
     B, GAMMA, V = 2, 3, 4
 
@@ -627,6 +629,19 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
             surv = torch.cat([surv[:, 1:], surv[:, -1:]], 1)
         return 1 + (surv >= lam.repeat_interleave(self.B)[:, None]).sum(1)
 
+    def _scan_lens(self, pre, cost):
+        """Survivals are non-increasing per request, so the frontier order is the batch's
+        descending order; K is the first rank where (B + sum) / t(B + K) stops rising."""
+        surv = self.surv[pre.reshape(-1)].view(len(pre), -1)
+        order = surv.argsort(dim=1, descending=True, stable=True)
+        tau = self.B + torch.cat([torch.zeros(len(pre), 1), surv.gather(1, order).cumsum(1)], 1)
+        t = torch.tensor([self._step_seconds(self.B + k, cost) for k in range(tau.shape[1])])
+        theta = tau / t
+        up = torch.cat([theta[:, 1:] > theta[:, :-1], torch.zeros(len(pre), 1, dtype=torch.bool)], 1)
+        k = up.long().argmin(1)
+        rank = order.argsort(1)
+        return 1 + (rank < k[:, None]).view(-1, self.GAMMA).sum(1)
+
     def _tv_per_position(self, k_rule):
         n = 100_000
         x = self._walk(n * self.B)
@@ -638,6 +653,9 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
             lam = self._lagged_price(self._walk(n * self.B), cost)
             lens = self._threshold_lens(pre, lam, reads_own_token="own_token" in k_rule)
             self.last_lens = lens  # read back by the threshold test's binding check
+        elif k_rule.startswith("scan"):
+            lens = self._scan_lens(pre, "linear" if "linear" in k_rule else "table")
+            self.last_lens = lens
         else:
             src = pre if k_rule == "in_step" else self._prefix_id(self._walk(n * self.B)).view(n, self.B)
             k = self.k_tab[src[:, 0], src[:, 1]]
@@ -666,7 +684,7 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
     def test_threshold_with_lagged_price_is_lossless(self):
         # verify_all runs on the same draws per seed with no cutoff: the sampling-floor reference.
         for seed in range(3):
-            for rule in ("verify_all", "threshold_table", "threshold_linear"):
+            for rule in ("verify_all", "threshold_table", "threshold_linear", "scan_linear"):
                 torch.manual_seed(seed)
                 tv = self._tv_per_position(rule)
                 bound = [0.002 + 4 * self._tv_floor(c) for c in self.last_counts]
