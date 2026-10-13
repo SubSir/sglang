@@ -298,7 +298,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._confidence_selector is not None:
             self._confidence_selector.configure_thinking(
                 tokenizer=self.target_worker.tokenizer,
-                req_to_token_pool=self.model_runner.req_to_token_pool,
+                req_to_token_pool=self.target_worker.model_runner.req_to_token_pool,
             )
         self._step_trace = SpecStepTrace(
             tp_rank=self.model_runner.tp_rank, tag="dspark"

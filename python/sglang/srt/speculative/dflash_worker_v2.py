@@ -628,7 +628,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._confidence_selector.configure_thinking(
             tokenizer=self._target_worker.tokenizer,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
+            # The target's pool exists here (the draft runner's is attached later) and
+            # is the one requests are bound to before their first draft step.
+            req_to_token_pool=self._target_worker.model_runner.req_to_token_pool,
         )
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
