@@ -628,9 +628,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._confidence_selector.configure_thinking(
             tokenizer=self._target_worker.tokenizer,
-            # The target's pool exists here (the draft runner's is attached later) and
-            # is the one requests are bound to before their first draft step.
-            req_to_token_pool=self._target_worker.model_runner.req_to_token_pool,
+            # The pools are built after the workers; requests are bound to the target's.
+            req_to_token_pool_getter=lambda: self._target_worker.model_runner.req_to_token_pool,
         )
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -2379,6 +2378,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._confidence_selector is not None:
+                self._confidence_selector.mark_prompts(batch.reqs)
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,

@@ -261,50 +261,68 @@ class TestPerRequestThinkingTable(CustomTestCase):
             entropy_confidence(entropy=entropy, calibrator=on, thinking=thinking), only_on
         )
 
-    def test_flag_lives_on_the_pool_row_through_reshuffles(self):
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-
-        pool = ReqToTokenPool(size=8, max_context_len=16, device="cpu", enable_memory_saver=False)
-        pool.enable_prompt_thinking(think_start=self.START, think_end=self.END)
-        S, E = self.START, self.END
-        reqs = [types.SimpleNamespace(kv=_Kv(), origin_input_ids=ids)
-                for ids in ([1, S, 2], [1, S, 2, E, 3], [S], [4, 5])]
-        rows = pool.alloc(reqs)
-        self.assertEqual(pool.prompt_thinking[rows].tolist(), [True, False, True, False])
-        # Chunked prefill keeps its row; the flag stays.
-        reqs[0].kv.kv_allocated_len = 4
-        self.assertEqual(pool.alloc([reqs[0]]), [rows[0]])
-        self.assertTrue(bool(pool.prompt_thinking[rows[0]]))
-        # Retract / preempt: the row is freed and reused by another request, then the
-        # retracted request is re-admitted on a new row with its own flag again.
-        pool.free(reqs[1])
-        other = types.SimpleNamespace(kv=_Kv(), origin_input_ids=[9, S])
-        other_row = pool.alloc([other])[0]
-        self.assertTrue(bool(pool.prompt_thinking[other_row]))
-        new_row = pool.alloc([reqs[1]])[0]
-        self.assertFalse(bool(pool.prompt_thinking[new_row]))
-        self.assertEqual(pool.prompt_thinking[[rows[0], rows[2], rows[3]]].tolist(), [True, True, False])
-
-    def test_selector_reads_the_pool_flags(self):
+    def _selector_and_pool(self, gamma):
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_confidence import DraftConfidenceSelector
 
-        gamma = 7
         on, off = self._tables(gamma)
         sel = DraftConfidenceSelector(gamma=gamma, device="cpu", default_source=ConfidenceSource.DRAFT_PROB, has_head=False)
         sel.calibrator, sel.calibrator_nothink = on, off
         pool = ReqToTokenPool(size=8, max_context_len=16, device="cpu", enable_memory_saver=False)
         tok = types.SimpleNamespace(get_vocab=lambda: {"<think>": self.START, "</think>": self.END})
-        sel.configure_thinking(tokenizer=tok, req_to_token_pool=pool)
+        # The pool does not exist when the worker builds the selector: a getter.
+        sel.configure_thinking(tokenizer=tok, req_to_token_pool_getter=lambda: pool)
+        return sel, pool, on, off
+
+    def test_flag_lives_on_the_pool_row_through_reshuffles(self):
+        sel, pool, _, _ = self._selector_and_pool(7)
+        S, E = self.START, self.END
+        reqs = [types.SimpleNamespace(kv=_Kv(), origin_input_ids=ids)
+                for ids in ([1, S, 2], [1, S, 2, E, 3], [S], [4, 5])]
+        rows = pool.alloc(reqs)
+        sel.mark_prompts(reqs)  # their prefill
+        self.assertEqual(sel.thinking_rows(torch.tensor(rows)).tolist(), [True, False, True, False])
+        # Chunked prefill: same row, marked again with the same value.
+        reqs[0].kv.kv_allocated_len = 4
+        self.assertEqual(pool.alloc([reqs[0]]), [rows[0]])
+        sel.mark_prompts([reqs[0]])
+        self.assertTrue(bool(sel.thinking_rows(torch.tensor([rows[0]]))))
+        # Retract / preempt: the row is freed and taken by another request (marked at
+        # its prefill); the retracted request is re-prefilled on a new row.
+        pool.free(reqs[1])
+        other = types.SimpleNamespace(kv=_Kv(), origin_input_ids=[9, S])
+        other_row = pool.alloc([other])[0]
+        sel.mark_prompts([other])
+        new_row = pool.alloc([reqs[1]])[0]
+        sel.mark_prompts([reqs[1]])
+        self.assertTrue(bool(sel.thinking_rows(torch.tensor([other_row]))))
+        self.assertFalse(bool(sel.thinking_rows(torch.tensor([new_row]))))
+        self.assertEqual(sel.thinking_rows(torch.tensor([rows[0], rows[2], rows[3]])).tolist(), [True, True, False])
+
+    def test_selector_reads_the_pool_flags(self):
+        gamma = 7
+        sel, pool, on, off = self._selector_and_pool(gamma)
         reqs = [types.SimpleNamespace(kv=_Kv(), origin_input_ids=ids)
                 for ids in ([1, self.START], [2, self.START, 3, self.END], [3, self.START])]
         rows = torch.tensor(pool.alloc(reqs))
+        sel.mark_prompts(reqs)
         entropy = torch.rand(3, gamma) * 3
         got = sel.entropy_confidence(entropy=entropy, req_pool_indices=rows)
         want = entropy_confidence(entropy=entropy, calibrator=on, calibrator_nothink=off,
                                   thinking=torch.tensor([True, False, True]))
         torch.testing.assert_close(got, want)
-        self.assertEqual(sel.thinking_rows(rows).tolist(), [True, False, True])
+
+    def test_single_table_configures_nothing(self):
+        from sglang.srt.speculative.spec_confidence import DraftConfidenceSelector
+
+        sel = DraftConfidenceSelector(gamma=7, device="cpu", default_source=ConfidenceSource.DRAFT_PROB, has_head=False)
+        sel.calibrator, _ = self._tables(7)
+        sel.configure_thinking(tokenizer=None, req_to_token_pool_getter=lambda: None)  # no NOTHINK table
+        sel.mark_prompts([types.SimpleNamespace(kv=_Kv(), origin_input_ids=[1])])  # no-op
+        entropy = torch.rand(2, 7) * 3
+        self.assertIsNone(sel.thinking_rows(torch.tensor([1, 2])))
+        torch.testing.assert_close(sel.entropy_confidence(entropy=entropy, req_pool_indices=torch.tensor([1, 2])),
+                                   entropy_confidence(entropy=entropy, calibrator=sel.calibrator))
 
 
 class TestDcutSignalAndPolicy(CustomTestCase):
