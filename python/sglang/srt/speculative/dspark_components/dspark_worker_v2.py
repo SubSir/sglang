@@ -307,7 +307,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._confidence_selector is not None:
             self._confidence_selector.configure_thinking(
                 tokenizer=self.target_worker.tokenizer,
-                req_to_token_pool=self.target_worker.model_runner.req_to_token_pool,
+                # The pools are built after the workers; requests are bound to the target's.
+                req_to_token_pool_getter=lambda: self.target_worker.model_runner.req_to_token_pool,
             )
         self._step_trace = SpecStepTrace(
             tp_rank=get_parallel().tp_rank, tag="dspark"
@@ -726,6 +727,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._confidence_selector is not None:
+                self._confidence_selector.mark_prompts(batch.reqs)
             if batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination:
                 plan = DPSpecPrefillCoordinationPlan(
                     *batch.dp_spec_prefill_coordination_metadata,

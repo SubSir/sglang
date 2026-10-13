@@ -408,15 +408,15 @@ class ReqToTokenPool:
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
         # Per row: whether the bound request's prompt opens <think> (dynamic verify's
-        # per-request entropy table). Off (None markers) unless a worker enables it.
+        # per-request entropy table; written by the speculative worker at prefill).
         self.prompt_thinking: Optional[torch.Tensor] = None
-        self._think_markers: Optional[tuple[int, int]] = None
 
-    def enable_prompt_thinking(self, *, think_start: int, think_end: int) -> None:
-        self._think_markers = (think_start, think_end)
-        self.prompt_thinking = torch.ones(
-            self._alloc_size, dtype=torch.bool, device=self.device
-        )
+    def enable_prompt_thinking(self) -> torch.Tensor:
+        if self.prompt_thinking is None:
+            self.prompt_thinking = torch.ones(
+                self._alloc_size, dtype=torch.bool, device=self.device
+            )
+        return self.prompt_thinking
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -436,29 +436,11 @@ class ReqToTokenPool:
         if select_index is None:
             return None
         offset = 0
-        bound = []
         for r in reqs:
             if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 offset += 1
-                bound.append(r)
-        if self._think_markers is not None and bound:
-            self._mark_prompt_thinking(bound)
         return [r.kv.req_pool_idx for r in reqs]
-
-    def _mark_prompt_thinking(self, reqs: list[Req]) -> None:
-        # A row is (re)bound once per admission, retract and preemption included, and
-        # the flag is a function of the prompt alone, so reshuffles cannot change it.
-        from sglang.srt.speculative.spec_confidence import prompt_opens_thinking
-
-        start, end = self._think_markers
-        rows = torch.tensor([r.kv.req_pool_idx for r in reqs], dtype=torch.int64)
-        flags = torch.tensor(
-            [prompt_opens_thinking(r.origin_input_ids, think_start=start, think_end=end)
-             for r in reqs],
-            dtype=torch.bool,
-        )
-        self.prompt_thinking[rows.to(self.device)] = flags.to(self.device)
 
     def alloc_rows(self, need_size: int) -> Optional[List[int]]:
         """Take need_size rows and bump their generation, with no Req bound to

@@ -205,8 +205,9 @@ class DraftConfidenceSelector:
         self.calibrator: Optional[EntropyCalibrator] = None
         # Optional table for requests not in thinking mode; None = one table for all.
         self.calibrator_nothink: Optional[EntropyCalibrator] = None
-        # Per req_to_token_pool row: whether that request's prompt opens <think>.
-        self._prompt_thinking: Optional[torch.Tensor] = None
+        # (<think>, </think>) ids and the request-pool getter; None = one table for all.
+        self._think_markers: Optional[tuple[int, int]] = None
+        self._pool_getter = None
         table_path = envs.SGLANG_SPEC_ENTROPY_TABLE_PATH.get()
         if table_path:
             self.load_table(table_path)
@@ -230,9 +231,10 @@ class DraftConfidenceSelector:
             table=EntropyCalibrationTable.load(path), gamma=self.gamma, device=self.device
         )
 
-    def configure_thinking(self, *, tokenizer, req_to_token_pool) -> None:
-        """Per-request table choice needs the think markers (from the tokenizer) and
-        the pool's per-row flag, which the pool fills when it binds a request."""
+    def configure_thinking(self, *, tokenizer, req_to_token_pool_getter) -> None:
+        """Per-request table choice: the think markers come from the tokenizer, the
+        per-row flags live on the request pool (built after the workers, hence the
+        getter) and are written by mark_prompts on every prefill."""
         if self.calibrator_nothink is None:
             return
         if tokenizer is None:
@@ -247,26 +249,40 @@ class DraftConfidenceSelector:
                 "SGLANG_SPEC_ENTROPY_TABLE_PATH_NOTHINK needs <think> and </think> "
                 "tokens in the tokenizer vocabulary"
             )
-        req_to_token_pool.enable_prompt_thinking(think_start=start, think_end=end)
-        self._prompt_thinking = req_to_token_pool.prompt_thinking
+        self._think_markers = (start, end)
+        self._pool_getter = req_to_token_pool_getter
+
+    def mark_prompts(self, reqs) -> None:
+        """Called on prefill batches. Every request is prefilled after it is bound to
+        its pool row and before its first draft step, including re-prefill after a
+        retract or preemption; the flag depends on the prompt alone."""
+        if self._think_markers is None or not reqs:
+            return
+        start, end = self._think_markers
+        table = self._pool_getter().enable_prompt_thinking()
+        rows = torch.tensor([r.kv.req_pool_idx for r in reqs], dtype=torch.int64)
+        flags = torch.tensor(
+            [prompt_opens_thinking(r.origin_input_ids, think_start=start, think_end=end)
+             for r in reqs],
+            dtype=torch.bool,
+        )
+        table[rows.to(table.device)] = flags.to(table.device)
+
+    def thinking_rows(self, req_pool_indices: torch.Tensor) -> Optional[torch.Tensor]:
+        if self._think_markers is None:
+            return None
+        table = self._pool_getter().enable_prompt_thinking()
+        return table[req_pool_indices.to(torch.int64)]
 
     def entropy_confidence(
         self, *, entropy: torch.Tensor, req_pool_indices: torch.Tensor
     ) -> torch.Tensor:
-        thinking = None
-        if self._prompt_thinking is not None:
-            thinking = self._prompt_thinking[req_pool_indices.to(torch.int64)]
         return entropy_confidence(
             entropy=entropy,
             calibrator=self.calibrator,
             calibrator_nothink=self.calibrator_nothink,
-            thinking=thinking,
+            thinking=self.thinking_rows(req_pool_indices),
         )
-
-    def thinking_rows(self, req_pool_indices: torch.Tensor) -> Optional[torch.Tensor]:
-        if self._prompt_thinking is None:
-            return None
-        return self._prompt_thinking[req_pool_indices.to(torch.int64)]
 
     def set_source(self, name: str) -> None:
         source = ConfidenceSource(name)
