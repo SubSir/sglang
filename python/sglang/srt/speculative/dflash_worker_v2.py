@@ -91,7 +91,6 @@ from sglang.srt.speculative.spec_confidence import (
     ConfidenceSource,
     DraftConfidenceSelector,
     drawn_prob_from_candidates,
-    entropy_confidence,
     entropy_from_probs,
     shifted_draft_prob,
 )
@@ -626,6 +625,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 else ConfidenceSource.DRAFT_PROB
             ),
             has_head=False,
+        )
+        self._confidence_selector.configure_thinking(
+            tokenizer=self._target_worker.tokenizer,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
         )
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -2774,7 +2777,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        draft_entropy, confidence = self._step_confidence(drafted=draft_tokens[:, 1:])
+        draft_entropy, confidence = self._step_confidence(
+            drafted=draft_tokens[:, 1:], req_pool_indices=batch.req_pool_indices
+        )
         verify_token_budget, layout = self._plan_verify(
             batch=batch,
             draft_input=draft_input,
@@ -2983,7 +2988,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _step_confidence(
-        self, *, drafted: torch.Tensor
+        self, *, drafted: torch.Tensor, req_pool_indices: torch.Tensor
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """(selector q entropy, budget confidence), each [bs, gamma] or None.
         ``drafted`` holds the proposed tokens [bs, gamma] (D-cut's q(z))."""
@@ -3000,8 +3005,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 q_rows=q_rows, candidate_ids=candidate_ids, tokens=drafted
             )
             return draft_entropy, shifted_draft_prob(q_drawn)
-        confidence = entropy_confidence(
-            entropy=draft_entropy, calibrator=selector.calibrator
+        confidence = selector.entropy_confidence(
+            entropy=draft_entropy, req_pool_indices=req_pool_indices
         )
         return draft_entropy, confidence
 
@@ -3213,11 +3218,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             entropy=draft_entropy,
             confidence=confidence,
             alpha=alpha,
-            signals=self._trace_signals(draft_entropy=draft_entropy, drafted=drafted),
+            signals=self._trace_signals(
+                draft_entropy=draft_entropy,
+                drafted=drafted,
+                req_pool_indices=batch.req_pool_indices,
+            ),
         )
 
     def _trace_signals(
-        self, *, draft_entropy: Optional[torch.Tensor], drafted: torch.Tensor
+        self,
+        *,
+        draft_entropy: Optional[torch.Tensor],
+        drafted: torch.Tensor,
+        req_pool_indices: torch.Tensor,
     ) -> dict:
         """Every budget signal of this step on the same drafts, for offline replay."""
         if self._selector_step_q is None:
@@ -3232,7 +3245,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         }
         selector = self._confidence_selector
         if draft_entropy is not None and selector is not None and selector.entropy_ready:
-            out["confidence_entropy"] = entropy_confidence(
-                entropy=draft_entropy, calibrator=selector.calibrator
+            out["confidence_entropy"] = selector.entropy_confidence(
+                entropy=draft_entropy, req_pool_indices=req_pool_indices
             )
+            out["thinking"] = selector.thinking_rows(req_pool_indices)
         return out

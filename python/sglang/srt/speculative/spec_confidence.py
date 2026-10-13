@@ -160,11 +160,34 @@ def drawn_prob_from_candidates(
 
 
 def entropy_confidence(
-    *, entropy: torch.Tensor, calibrator: EntropyCalibrator
+    *,
+    entropy: torch.Tensor,
+    calibrator: EntropyCalibrator,
+    calibrator_nothink: Optional[EntropyCalibrator] = None,
+    thinking: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """[bs, gamma] entropy -> [bs, gamma] conditional confidence in [0, 1]."""
-    survival = calibrator.survival(raw_survival_chain(torch.exp(-entropy)))
+    """[bs, gamma] entropy -> [bs, gamma] conditional confidence in [0, 1]. With a
+    second table, rows whose request is not in thinking mode ([bs] bool) use it."""
+    raw = raw_survival_chain(torch.exp(-entropy))
+    survival = calibrator.survival(raw)
+    if calibrator_nothink is not None and thinking is not None:
+        survival = torch.where(
+            thinking.view(-1, 1), survival, calibrator_nothink.survival(raw)
+        )
     return conditional_from_survival(survival)
+
+
+def prompt_opens_thinking(ids, *, think_start: int, think_end: int) -> bool:
+    """True when the prompt leaves a reasoning segment open: its last think marker
+    is <think>. The Qwen3.x templates end the generation prompt with "<think>\n"
+    (thinking) or "<think>\n\n</think>\n\n" (not); DeepSeek-V4/V4.1 with
+    "<think>" or "</think>". A prompt with neither marker counts as not thinking."""
+    for token in reversed(ids):
+        if token == think_end:
+            return False
+        if token == think_start:
+            return True
+    return False
 
 
 class DraftConfidenceSelector:
@@ -180,9 +203,20 @@ class DraftConfidenceSelector:
         self.device = device
         self.has_head = has_head
         self.calibrator: Optional[EntropyCalibrator] = None
+        # Optional table for requests not in thinking mode; None = one table for all.
+        self.calibrator_nothink: Optional[EntropyCalibrator] = None
+        # Per req_to_token_pool row: whether that request's prompt opens <think>.
+        self._prompt_thinking: Optional[torch.Tensor] = None
         table_path = envs.SGLANG_SPEC_ENTROPY_TABLE_PATH.get()
         if table_path:
             self.load_table(table_path)
+        nothink_path = envs.SGLANG_SPEC_ENTROPY_TABLE_PATH_NOTHINK.get()
+        if nothink_path:
+            self.calibrator_nothink = EntropyCalibrator(
+                table=EntropyCalibrationTable.load(nothink_path),
+                gamma=self.gamma,
+                device=self.device,
+            )
         requested = envs.SGLANG_SPEC_CONFIDENCE_SOURCE.get()
         self.source = default_source
         self.set_source(requested or default_source.value)
@@ -195,6 +229,44 @@ class DraftConfidenceSelector:
         self.calibrator = EntropyCalibrator(
             table=EntropyCalibrationTable.load(path), gamma=self.gamma, device=self.device
         )
+
+    def configure_thinking(self, *, tokenizer, req_to_token_pool) -> None:
+        """Per-request table choice needs the think markers (from the tokenizer) and
+        the pool's per-row flag, which the pool fills when it binds a request."""
+        if self.calibrator_nothink is None:
+            return
+        if tokenizer is None:
+            raise ValueError(
+                "SGLANG_SPEC_ENTROPY_TABLE_PATH_NOTHINK reads the prompt's think markers "
+                "and needs the tokenizer (not --skip-tokenizer-init)"
+            )
+        vocab = tokenizer.get_vocab()
+        start, end = vocab.get("<think>"), vocab.get("</think>")
+        if start is None or end is None:
+            raise ValueError(
+                "SGLANG_SPEC_ENTROPY_TABLE_PATH_NOTHINK needs <think> and </think> "
+                "tokens in the tokenizer vocabulary"
+            )
+        req_to_token_pool.enable_prompt_thinking(think_start=start, think_end=end)
+        self._prompt_thinking = req_to_token_pool.prompt_thinking
+
+    def entropy_confidence(
+        self, *, entropy: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> torch.Tensor:
+        thinking = None
+        if self._prompt_thinking is not None:
+            thinking = self._prompt_thinking[req_pool_indices.to(torch.int64)]
+        return entropy_confidence(
+            entropy=entropy,
+            calibrator=self.calibrator,
+            calibrator_nothink=self.calibrator_nothink,
+            thinking=thinking,
+        )
+
+    def thinking_rows(self, req_pool_indices: torch.Tensor) -> Optional[torch.Tensor]:
+        if self._prompt_thinking is None:
+            return None
+        return self._prompt_thinking[req_pool_indices.to(torch.int64)]
 
     def set_source(self, name: str) -> None:
         source = ConfidenceSource(name)

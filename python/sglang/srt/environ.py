@@ -556,6 +556,7 @@ class Envs:
     # "entropy" (draft entropy through a calibration table; DFlash default).
     SGLANG_SPEC_CONFIDENCE_SOURCE = EnvStr("")
     SGLANG_SPEC_ENTROPY_TABLE_PATH = EnvStr("")
+    SGLANG_SPEC_ENTROPY_TABLE_PATH_NOTHINK = EnvStr("")
     # Verify-budget policy: "marginal" (any budget; DSpark) or "ratio" (D-cut's
     # four capacity points, arXiv 2607.14647).
     SGLANG_SPEC_BUDGET_POLICY = EnvStr("marginal")

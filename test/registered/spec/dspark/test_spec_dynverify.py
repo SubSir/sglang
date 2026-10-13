@@ -45,6 +45,7 @@ from sglang.srt.speculative.spec_confidence import (
     entropy_confidence,
     entropy_from_logits,
     entropy_from_probs,
+    prompt_opens_thinking,
     raw_survival_chain,
     shifted_draft_prob,
 )
@@ -206,6 +207,104 @@ class TestBudgetFromEntropy(CustomTestCase):
         for i, n in enumerate(lens.tolist()):
             chosen[i, : n - 1] = True
         self.assertGreaterEqual(float(surv[chosen].min()), float(surv[~chosen].max()))
+
+
+class _Kv:
+    def __init__(self):
+        self.req_pool_idx = None
+        self.kv_allocated_len = 0
+
+    @property
+    def holds_kv(self):
+        return self.req_pool_idx is not None
+
+
+class TestPerRequestThinkingTable(CustomTestCase):
+    """Thinking and non-thinking requests in one batch each use their own entropy
+    table; the per-request choice is fixed by the prompt and lives on the pool row."""
+
+    START, END = 7, 8  # stand-in <think> / </think> ids
+
+    def _tables(self, gamma):
+        rng = np.random.default_rng(3)
+        tx = np.minimum.accumulate(np.cumprod(rng.uniform(0, 1, (2000, gamma)), 1), 1)
+        on = EntropyCalibrator(table=_export_table(tx, tx * 0.95), gamma=gamma, device="cpu")
+        off = EntropyCalibrator(table=_export_table(tx, np.sqrt(tx)), gamma=gamma, device="cpu")
+        return on, off
+
+    def test_prompt_rule(self):
+        S, E = self.START, self.END
+        cases = {
+            (1, 2, S, 3): True,  # Qwen thinking: "...assistant\n<think>\n"
+            (1, 2, S, 3, 3, E, 3, 3): False,  # Qwen non-thinking: "<think>\n\n</think>\n\n"
+            (1, S, 4, E, 5, 2, S): True,  # earlier turn closed, new turn opens (V4.1 "<think>")
+            (1, 2, S, 4, E): False,  # V4.1 chat mode ends with "</think>"
+            (1, 2, 3): False,  # no marker at all
+        }
+        for ids, want in cases.items():
+            self.assertEqual(prompt_opens_thinking(list(ids), think_start=S, think_end=E), want, ids)
+
+    def test_mixed_batch_matches_two_single_table_runs(self):
+        torch.manual_seed(0)
+        gamma = 7
+        on, off = self._tables(gamma)
+        entropy = torch.rand(6, gamma) * 3
+        thinking = torch.tensor([True, False, True, False, False, True])
+        mixed = entropy_confidence(entropy=entropy, calibrator=on, calibrator_nothink=off, thinking=thinking)
+        only_on = entropy_confidence(entropy=entropy, calibrator=on)
+        only_off = entropy_confidence(entropy=entropy, calibrator=off)
+        torch.testing.assert_close(mixed[thinking], only_on[thinking])
+        torch.testing.assert_close(mixed[~thinking], only_off[~thinking])
+        self.assertFalse(torch.allclose(only_on, only_off))  # the two tables do differ
+        # One table configured: unchanged path, the flag is ignored.
+        torch.testing.assert_close(
+            entropy_confidence(entropy=entropy, calibrator=on, thinking=thinking), only_on
+        )
+
+    def test_flag_lives_on_the_pool_row_through_reshuffles(self):
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        pool = ReqToTokenPool(size=8, max_context_len=16, device="cpu", enable_memory_saver=False)
+        pool.enable_prompt_thinking(think_start=self.START, think_end=self.END)
+        S, E = self.START, self.END
+        reqs = [types.SimpleNamespace(kv=_Kv(), origin_input_ids=ids)
+                for ids in ([1, S, 2], [1, S, 2, E, 3], [S], [4, 5])]
+        rows = pool.alloc(reqs)
+        self.assertEqual(pool.prompt_thinking[rows].tolist(), [True, False, True, False])
+        # Chunked prefill keeps its row; the flag stays.
+        reqs[0].kv.kv_allocated_len = 4
+        self.assertEqual(pool.alloc([reqs[0]]), [rows[0]])
+        self.assertTrue(bool(pool.prompt_thinking[rows[0]]))
+        # Retract / preempt: the row is freed and reused by another request, then the
+        # retracted request is re-admitted on a new row with its own flag again.
+        pool.free(reqs[1])
+        other = types.SimpleNamespace(kv=_Kv(), origin_input_ids=[9, S])
+        other_row = pool.alloc([other])[0]
+        self.assertTrue(bool(pool.prompt_thinking[other_row]))
+        new_row = pool.alloc([reqs[1]])[0]
+        self.assertFalse(bool(pool.prompt_thinking[new_row]))
+        self.assertEqual(pool.prompt_thinking[[rows[0], rows[2], rows[3]]].tolist(), [True, True, False])
+
+    def test_selector_reads_the_pool_flags(self):
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.speculative.spec_confidence import DraftConfidenceSelector
+
+        gamma = 7
+        on, off = self._tables(gamma)
+        sel = DraftConfidenceSelector(gamma=gamma, device="cpu", default_source=ConfidenceSource.DRAFT_PROB, has_head=False)
+        sel.calibrator, sel.calibrator_nothink = on, off
+        pool = ReqToTokenPool(size=8, max_context_len=16, device="cpu", enable_memory_saver=False)
+        tok = types.SimpleNamespace(get_vocab=lambda: {"<think>": self.START, "</think>": self.END})
+        sel.configure_thinking(tokenizer=tok, req_to_token_pool=pool)
+        reqs = [types.SimpleNamespace(kv=_Kv(), origin_input_ids=ids)
+                for ids in ([1, self.START], [2, self.START, 3, self.END], [3, self.START])]
+        rows = torch.tensor(pool.alloc(reqs))
+        entropy = torch.rand(3, gamma) * 3
+        got = sel.entropy_confidence(entropy=entropy, req_pool_indices=rows)
+        want = entropy_confidence(entropy=entropy, calibrator=on, calibrator_nothink=off,
+                                  thinking=torch.tensor([True, False, True]))
+        torch.testing.assert_close(got, want)
+        self.assertEqual(sel.thinking_rows(rows).tolist(), [True, False, True])
 
 
 class TestDcutSignalAndPolicy(CustomTestCase):
