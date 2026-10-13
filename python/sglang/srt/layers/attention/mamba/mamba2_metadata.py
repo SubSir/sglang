@@ -79,6 +79,9 @@ class ForwardMetadata:
     # a cuda-graph capture then holds one build instead of one per layer.
     fused_accept_state_indices: Optional[torch.Tensor] = None
     fused_accept_num_accepted: Optional[torch.Tensor] = None
+    # Compact (ragged) verify: dense [bs, draft_token_num] slot per packed token, the same
+    # for every GDN layer of a forward, so built once (see GDNAttnBackend.forward_extend).
+    ragged_dense_token_indices: Optional[torch.Tensor] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
