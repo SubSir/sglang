@@ -1498,12 +1498,41 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        # DFLASH fused tree verify wrote no SSM snapshots: replay each
+        # request's accepted path from the per-layer stash instead.
+        # (A static test: graph replays run no Python, so no per-step flag.)
+        st = getattr(self.linear_attn_backend, "tree_stash", None)
+        tree_fused = st is not None
+        if tree_fused:
+            from sglang.kernels.ops.attention.fla.gdn_tree_verify import (
+                advance_ssm_states_along_accept_paths,
+            )
+
+            Hg, K, V = st["dims"]
+            has_track = mamba_track_indices is not None
+            advance_ssm_states_along_accept_paths(
+                st["k"],
+                st["v"],
+                st["g"],
+                st["beta"],
+                mamba_caches.temporal,
+                state_indices_tensor,
+                st["anc"],
+                last_correct_step_indices,
+                st["k"].shape[2],
+                Hg,
+                K,
+                V,
+                track_steps=mamba_steps_to_track if has_track else None,
+                track_slots=mamba_track_indices if has_track else None,
+            )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            skip_ssm=tree_fused,
         )
 
         self._update_ple_state_after_mtp_verify(
