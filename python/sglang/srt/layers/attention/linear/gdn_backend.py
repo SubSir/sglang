@@ -549,6 +549,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        self._first_gdn_layer_id: Optional[int] = None
 
     def init_forward_metadata_out_graph(
         self,
@@ -988,8 +989,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # KDAAttnBackend: scatter to step slots, gather back after.
                 batch_size = query_start_loc.shape[0] - 1
                 num_dense_tokens = batch_size * draft_token_num
+                # Built at the first GDN layer of every forward, reused by the rest: the
+                # build then sits inside a graph capture (not in a warmup run that
+                # shares the metadata object) and in every eager forward.
+                if self._first_gdn_layer_id is None:
+                    self._first_gdn_layer_id = layer.layer_id
                 dense_token_indices = forward_metadata.ragged_dense_token_indices
-                if dense_token_indices is None:
+                if layer.layer_id == self._first_gdn_layer_id or dense_token_indices is None:
                     dense_token_indices = ragged_verify_dense_scatter_indices(
                         query_start_loc=query_start_loc,
                         seq_len=seq_len,
