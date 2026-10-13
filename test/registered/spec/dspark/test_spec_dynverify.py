@@ -699,7 +699,7 @@ class TestStaticPathUnchanged(CustomTestCase):
         self.assertFalse(w.carries_confidence)
         self.assertIsNone(w.get_confidence_budget_prepare())
         w._selector_step_q = (torch.zeros(2, 7, 16, dtype=torch.int64), torch.rand(2, 7, 16))
-        self.assertEqual(w._step_confidence(drafted=torch.zeros(2, 7)), (None, None))
+        self.assertEqual(w._step_confidence(drafted=torch.zeros(2, 7), req_pool_indices=torch.zeros(2, dtype=torch.long)), (None, None))
         self.assertEqual(
             w._plan_verify(batch=None, draft_input=None, confidence=None, prefix_lens=None),
             (None, None),
@@ -751,7 +751,8 @@ class TestDSparkEntropySource(CustomTestCase):
         tx = np.minimum.accumulate(np.cumprod(rng.uniform(0, 1, (1000, 4)), 1), 1)
         cal = EntropyCalibrator(table=_export_table(tx, tx), gamma=4, device="cpu")
         w._confidence_selector = types.SimpleNamespace(
-            uses_entropy=True, uses_draft_prob=False, calibrator=cal, source=ConfidenceSource.ENTROPY
+            uses_entropy=True, uses_draft_prob=False, calibrator=cal, source=ConfidenceSource.ENTROPY,
+            entropy_confidence=lambda *, entropy, req_pool_indices: entropy_confidence(entropy=entropy, calibrator=cal),
         )
         block = types.SimpleNamespace(
             corrected_logits=corrected, temperatures=torch.ones(2)
@@ -765,7 +766,8 @@ class TestDSparkEntropySource(CustomTestCase):
         corrected = torch.randn(2, 4, 30)
         w, proposal, cal = self._worker(corrected)
         conf, ent = w._confidence_for_budget(
-            proposal=proposal, draft_block_ids=None, draft_tokens=None
+            proposal=proposal, draft_block_ids=None, draft_tokens=None,
+                req_pool_indices=torch.zeros(2, dtype=torch.long),
         )
         q = torch.softmax(corrected, -1)
         torch.testing.assert_close(ent, -(q * q.log()).sum(-1))
@@ -775,7 +777,8 @@ class TestDSparkEntropySource(CustomTestCase):
         w, proposal, _ = self._worker(None)
         with self.assertRaises(RuntimeError):
             w._confidence_for_budget(
-                proposal=proposal, draft_block_ids=None, draft_tokens=None
+                proposal=proposal, draft_block_ids=None, draft_tokens=None,
+                req_pool_indices=torch.zeros(2, dtype=torch.long),
             )
 
 
