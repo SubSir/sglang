@@ -643,13 +643,18 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
             k = self.k_tab[src[:, 0], src[:, 1]]
             lens = self.len_tab[pre[:, 0], pre[:, 1], k].view(-1)
         out, num_out = self._emit(x, lens)
-        tv = []
+        tv, self.last_counts = [], []
         for j in range(self.GAMMA + 1):
             sel = num_out > j
             if int(sel.sum()) >= 10_000:
                 hist = torch.bincount(out[sel, j], minlength=self.V).float()
                 tv.append(0.5 * float((hist / hist.sum() - self.p).abs().sum()))
+                self.last_counts.append(int(sel.sum()))
         return tv
+
+    def _tv_floor(self, count):
+        """Expected TV of `count` exact draws from p (half-normal mean per bin)."""
+        return 0.5 * float((2 * self.p * (1 - self.p) / (math.pi * count)).sqrt().sum())
 
     def test_lagged_k_is_lossless_and_in_step_k_is_not(self):
         for rule in ("verify_all", "lagged"):
@@ -659,12 +664,18 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
         self.assertGreater(max(tv), 0.025, f"in-step K should leak: TV per position {tv}")
 
     def test_threshold_with_lagged_price_is_lossless(self):
-        for rule in ("threshold_table", "threshold_linear"):
-            tv = self._tv_per_position(rule)
-            self.assertLess(max(tv), 0.01, f"{rule}: TV per position {tv}")
-            # The cutoff must bind and depend on the prefix, or the case proves nothing.
-            hist = torch.bincount(self.last_lens, minlength=self.GAMMA + 2)
-            self.assertGreaterEqual(int((hist > len(self.last_lens) // 100).sum()), 2, f"{rule}: {hist.tolist()}")
+        # verify_all runs on the same draws per seed with no cutoff: the sampling-floor reference.
+        for seed in range(3):
+            for rule in ("verify_all", "threshold_table", "threshold_linear"):
+                torch.manual_seed(seed)
+                tv = self._tv_per_position(rule)
+                bound = [0.002 + 4 * self._tv_floor(c) for c in self.last_counts]
+                self.assertTrue(all(t < b for t, b in zip(tv, bound)), f"seed {seed} {rule}: TV {tv} bound {bound}")
+                if rule != "verify_all":
+                    # The cutoff must bind and depend on the prefix, or the case proves nothing.
+                    hist = torch.bincount(self.last_lens, minlength=self.GAMMA + 2)
+                    self.assertGreaterEqual(int((hist > len(self.last_lens) // 100).sum()), 2, f"{rule}: {hist.tolist()}")
+        torch.manual_seed(0)
         tv = self._tv_per_position("threshold_own_token")
         self.assertGreater(max(tv), 0.025, f"a threshold that reads x_j should leak: TV per position {tv}")
 
