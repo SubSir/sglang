@@ -77,7 +77,6 @@ from sglang.srt.speculative.spec_confidence import (
     ConfidenceSource,
     DraftConfidenceSelector,
     drawn_prob_from_logits,
-    entropy_confidence,
     entropy_from_logits,
     shifted_draft_prob,
 )
@@ -305,6 +304,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             if has_head or envs.SGLANG_SPEC_ENTROPY_TABLE_PATH.get()
             else None
         )
+        if self._confidence_selector is not None:
+            self._confidence_selector.configure_thinking(
+                tokenizer=self.target_worker.tokenizer,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+            )
         self._step_trace = SpecStepTrace(
             tp_rank=get_parallel().tp_rank, tag="dspark"
         )
@@ -607,7 +611,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._verify_planner.set_budget_policy(policy)
 
-    def _confidence_for_budget(self, *, proposal, draft_block_ids, draft_tokens):
+    def _confidence_for_budget(
+        self, *, proposal, draft_block_ids, draft_tokens, req_pool_indices
+    ):
         """Head confidence by default; draft entropy through the calibration
         table when the selector says so. Returns (confidence, entropy)."""
         selector = self._confidence_selector
@@ -626,7 +632,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             entropy = entropy_from_logits(corrected, proposal.draft_block.temperatures)
             return (
-                entropy_confidence(entropy=entropy, calibrator=selector.calibrator),
+                selector.entropy_confidence(
+                    entropy=entropy, req_pool_indices=req_pool_indices
+                ),
                 entropy,
             )
         return proposal.confidence, None
@@ -642,7 +650,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         return corrected
 
     def _trace_signals(
-        self, *, proposal, draft_block_ids, draft_tokens, confidence, draft_entropy
+        self,
+        *,
+        proposal,
+        draft_block_ids,
+        draft_tokens,
+        confidence,
+        draft_entropy,
+        req_pool_indices,
     ) -> dict:
         """Both candidate budget signals of this step on identical drafts, whatever
         the active source (trace only: the extra work forces syncs anyway)."""
@@ -660,9 +675,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             out["entropy"] = draft_entropy
         if draft_entropy is not None and selector.entropy_ready:
-            out["confidence_entropy"] = entropy_confidence(
-                entropy=draft_entropy, calibrator=selector.calibrator
+            out["confidence_entropy"] = selector.entropy_confidence(
+                entropy=draft_entropy, req_pool_indices=req_pool_indices
             )
+            out["thinking"] = selector.thinking_rows(req_pool_indices)
         if corrected is not None:
             out["confidence_draft_prob"] = shifted_draft_prob(
                 drawn_prob_from_logits(
@@ -1022,7 +1038,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
         confidence, draft_entropy = self._confidence_for_budget(
-            proposal=proposal, draft_block_ids=draft_block_ids, draft_tokens=draft_tokens
+            proposal=proposal,
+            draft_block_ids=draft_block_ids,
+            draft_tokens=draft_tokens,
+            req_pool_indices=batch.req_pool_indices,
         )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
@@ -1241,6 +1260,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens=draft_tokens,
                     confidence=confidence,
                     draft_entropy=draft_entropy,
+                    req_pool_indices=batch.req_pool_indices,
                 ),
             )
 
