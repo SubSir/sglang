@@ -525,7 +525,9 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
     """T=1 rejection sampling with the served cutoff rule: survivals from the walk's q
     rows, K from a lagged step, per-request top-K admission. Every emitted position
     must follow the target. K taken in-step from the current block's scores reads the
-    slot's own token through its descendants' entropy (D-cut App. B) and must not."""
+    slot's own token through its descendants' entropy (D-cut App. B) and must not.
+    A per-request survival threshold whose price comes from an earlier step is a
+    stopping rule on the draft prefix, so it is lossless under any cost model."""
 
     B, GAMMA, V = 2, 3, 4
 
@@ -538,7 +540,7 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
         self.p = torch.tensor([0.1, 0.3, 0.3, 0.3])  # every target row, prefix-independent
         # A step SPS table: past the first edge every slot is free, so K jumps from 0
         # to all slots on the batch's total survival, the case where in-step K leaks.
-        table = SpsCostTable(
+        self.table = table = SpsCostTable(
             sample_batch_tokens=[self.B, self.B + 1],
             sample_steps_per_sec=[1.0, 0.7],
             max_batch_tokens=self.B * (self.GAMMA + 1),
@@ -547,7 +549,7 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
         # A request's survivals depend on its walk prefix (x_0 .. x_{gamma-2}) only,
         # so the real planner is tabulated over every prefix of every request.
         prefixes = torch.cartesian_prod(*[torch.arange(self.V)] * (self.GAMMA - 1))
-        surv = raw_survival_chain(torch.exp(-entropy_from_probs(self._q_rows(prefixes))))
+        self.surv = surv = raw_survival_chain(torch.exp(-entropy_from_probs(self._q_rows(prefixes))))
         n_pre, n_k = len(prefixes), self.B * self.GAMMA + 1
         self.k_tab = torch.empty(n_pre, n_pre, dtype=torch.long)
         self.len_tab = torch.empty(n_pre, n_pre, n_k, self.B, dtype=torch.long)
@@ -603,12 +605,39 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
             num_out += emitted.long()
         return out, num_out
 
+    def _step_seconds(self, tokens, cost):
+        if cost == "linear":
+            return 1.0 + 0.1 * tokens
+        probes, sps = self.table.sample_batch_tokens, self.table.sample_steps_per_sec
+        i = max(sum(t <= tokens for t in probes) - 1, 0)
+        return 1.0 / sps[i]
+
+    def _lagged_price(self, x_prev, cost):
+        """lam = (seconds per verified token) * expected commits / step time, from an
+        earlier step's batch; the table's slope is its secant from 1 token per request."""
+        tok = self.B * (self.GAMMA + 1)
+        t = self._step_seconds(tok, cost)
+        slope = (t - self._step_seconds(self.B, cost)) / (tok - self.B)
+        commits = self.B + self.surv[self._prefix_id(x_prev)].view(-1, self.B * self.GAMMA).sum(1)
+        return slope * commits / t
+
+    def _threshold_lens(self, pre, lam, reads_own_token=False):
+        surv = self.surv[pre.reshape(-1)]
+        if reads_own_token:  # control: slot j decides on slot j + 1's survival, which reads x_j
+            surv = torch.cat([surv[:, 1:], surv[:, -1:]], 1)
+        return 1 + (surv >= lam.repeat_interleave(self.B)[:, None]).sum(1)
+
     def _tv_per_position(self, k_rule):
         n = 100_000
         x = self._walk(n * self.B)
         pre = self._prefix_id(x).view(n, self.B)
         if k_rule == "verify_all":
             lens = torch.full((n * self.B,), self.GAMMA + 1)
+        elif k_rule.startswith("threshold"):
+            cost = "linear" if "linear" in k_rule else "table"
+            lam = self._lagged_price(self._walk(n * self.B), cost)
+            lens = self._threshold_lens(pre, lam, reads_own_token="own_token" in k_rule)
+            self.last_lens = lens  # read back by the threshold test's binding check
         else:
             src = pre if k_rule == "in_step" else self._prefix_id(self._walk(n * self.B)).view(n, self.B)
             k = self.k_tab[src[:, 0], src[:, 1]]
@@ -628,6 +657,16 @@ class TestDraftDependentCutoffIsLossless(CustomTestCase):
             self.assertLess(max(tv), 0.01, f"{rule}: TV per position {tv}")
         tv = self._tv_per_position("in_step")
         self.assertGreater(max(tv), 0.025, f"in-step K should leak: TV per position {tv}")
+
+    def test_threshold_with_lagged_price_is_lossless(self):
+        for rule in ("threshold_table", "threshold_linear"):
+            tv = self._tv_per_position(rule)
+            self.assertLess(max(tv), 0.01, f"{rule}: TV per position {tv}")
+            # The cutoff must bind and depend on the prefix, or the case proves nothing.
+            hist = torch.bincount(self.last_lens, minlength=self.GAMMA + 2)
+            self.assertGreaterEqual(int((hist > len(self.last_lens) // 100).sum()), 2, f"{rule}: {hist.tolist()}")
+        tv = self._tv_per_position("threshold_own_token")
+        self.assertGreater(max(tv), 0.025, f"a threshold that reads x_j should leak: TV per position {tv}")
 
 
 class TestSpecMropeRagged(CustomTestCase):
