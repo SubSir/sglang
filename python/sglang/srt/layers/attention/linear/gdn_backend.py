@@ -525,6 +525,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
+    # Fused chain verify (SGLANG_ENABLE_GDN_FUSED_VERIFY); class defaults keep a
+    # backend built without __init__ on the snapshot verify path.
+    tree_fused_verify: bool = False
+    tree_stash: Optional[dict] = None
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -554,6 +558,121 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         self._use_strided_target_verify_qkv = False
         self._first_gdn_layer_id: Optional[int] = None
+        # Chain verify through the fused tree kernels (adapted from trymirai/sglang):
+        # no per-step state snapshots; the commit replays the accepted prefix from a stash.
+        self.tree_fused_verify = (
+            envs.SGLANG_ENABLE_GDN_FUSED_VERIFY.get() and not model_runner.is_draft_worker
+        )
+        self.tree_stash = None
+        self._chain_parents: Optional[torch.Tensor] = None
+
+    def _tree_fused_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        batch_size: int,
+        draft_token_num: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        dense_token_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Chain verify with the fused tree kernels on the dense [bs, T] layout. Writes
+        no SSM state: each layer stashes its raw (k, v, b) and g, and the commit
+        replays the accepted prefix. Compact verify scatters its packed tokens to the
+        dense slots (zero pads, which only ever follow a request's real tokens, so no
+        real row has a pad ancestor) and gathers the real rows back."""
+        from sglang.kernels.ops.attention.fla.gdn_tree_verify import (
+            alloc_tree_structure_buffers,
+            build_tree_ancestor_masks,
+            build_tree_structure_into,
+            tree_gdn_triton_verify,
+            tree_mask_capacity,
+        )
+        bs, T = batch_size, draft_token_num
+        H, V = layer.num_v_heads, layer.head_v_dim
+        Hg, K = layer.num_k_heads, layer.head_k_dim
+        ordinal = self.req_to_token_pool.mamba_map[layer.layer_id]
+        if self.tree_stash is None:
+            rows = self.verify_intermediate_state_indices.numel()
+            layers = len(self.req_to_token_pool.mamba_map)
+            dev = query.device
+            self.tree_stash = dict(
+                k=torch.zeros(layers, rows, T, Hg * K, dtype=query.dtype, device=dev),
+                v=torch.zeros(layers, rows, T, H * V, dtype=value.dtype, device=dev),
+                g=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
+                beta=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
+                anc=torch.zeros(
+                    rows,
+                    tree_mask_capacity(T),
+                    tree_mask_capacity(T) // 64,
+                    dtype=torch.int64,
+                    device=dev,
+                ),
+                struct=alloc_tree_structure_buffers(rows, T, T - 1, dev),
+                dims=(Hg, K, V),
+            )
+        st = self.tree_stash
+        if self._chain_parents is None:
+            # Node j's parent is j - 1; the root's entry is never read.
+            rows = st["k"].shape[1]
+            self._chain_parents = (
+                (torch.arange(T, device=query.device) - 1).clamp(min=0).expand(rows, T).contiguous()
+            )
+        if dense_token_indices is not None:
+            n = bs * T
+
+            def to_dense(x: torch.Tensor) -> torch.Tensor:
+                d = x.new_zeros(n + 1, x.shape[-1])
+                d.index_copy_(0, dense_token_indices, x)
+                return d[:n]
+
+            query = to_dense(query.reshape(-1, Hg * K))
+            key = to_dense(key.reshape(-1, Hg * K))
+            value = to_dense(value.reshape(-1, H * V))
+            a = to_dense(a.reshape(-1, H))
+            b = to_dense(b.reshape(-1, H))
+        if ordinal == 0:
+            # Once per verify, shared by every GDN layer (recorded in the graph).
+            parents = self._chain_parents[:bs]
+            st["tree"] = build_tree_structure_into(parents, st["struct"])
+            build_tree_ancestor_masks(parents, T, out=st["anc"])
+        g, _ = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        st["g"][ordinal, :bs].copy_(g.view(bs, T, H))
+        # Raw b: the commit takes sigmoid in fp32 (fused_gdn_gating rounds beta).
+        st["beta"][ordinal, :bs].copy_(b.reshape(bs, T, H))
+        # Raw q/k: the kernels l2-normalize in fp32, as the recurrent verify does.
+        q = query.reshape(bs, T, Hg, K).contiguous()
+        k = st["k"][ordinal, :bs].view(bs, T, Hg, K)
+        k.copy_(key.reshape(bs, T, Hg, K))
+        v = st["v"][ordinal, :bs].view(bs, T, H, V)
+        v.copy_(value.reshape(bs, T, H, V))
+        o = tree_gdn_triton_verify(
+            layer.A_log,
+            a.reshape(bs, T, H).contiguous(),
+            layer.dt_bias,
+            1.0,
+            20.0,
+            q,
+            k,
+            v,
+            b.reshape(bs, T, H).contiguous(),
+            ssm_states,
+            cache_indices[:bs].long(),
+            st["tree"],
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            precision="tf32",
+        )
+        o = o.reshape(bs * T, H, V)
+        if dense_token_indices is not None:
+            # Ghost row (zeros) for graph-padding tokens past the real ones.
+            o = torch.cat([o, o.new_zeros(1, H, V)])[dense_token_indices]
+        return o.unsqueeze(0)
 
     def init_forward_metadata_out_graph(
         self,
@@ -1178,6 +1297,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            elif self.tree_fused_verify and retrieve_parent_token is None:
+                core_attn_out = self._tree_fused_target_verify(
+                    layer=layer,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    dense_token_indices=dense_token_indices,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
