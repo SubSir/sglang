@@ -166,6 +166,8 @@ def _k0_scalars_kernel(
         # a/b rows of sequence i_n start at packed token in_qsl[i_n]; pad rows read as zeros.
         a_start = tl.load(in_qsl_ptr + i_n).to(tl.int64)
         a_len = tl.load(in_qsl_ptr + i_n + 1).to(tl.int64) - a_start
+        if a_len == 0:  # a graph-padding request: nothing downstream reads its rows
+            return
         a_base, b_base = a_start * stride_a_t, a_start * stride_b_t
     else:
         a_len = T
@@ -221,6 +223,8 @@ def _k1_gram_kernel(
     PREC: tl.constexpr, G: tl.constexpr, MAX_DEPTH: tl.constexpr,
     BF16_GRAM: tl.constexpr, BF16_INVERSE: tl.constexpr,
     tile_ptr=None,
+    seq_qsl_ptr=None,
+    SKIP_EMPTY: tl.constexpr = False,
 ):
     # lower-triangular tile grid: upper tiles (j > i) are identically zero
     # and never read by K2/K3, so they are not computed or stored.
@@ -231,6 +235,9 @@ def _k1_gram_kernel(
     i_t = tl.load(tile_ptr + 2 * i_l)
     i_j = tl.load(tile_ptr + 2 * i_l + 1)
     i_n, i_h = i_nh_h // H, i_nh_h % H
+    if SKIP_EMPTY:
+        if tl.load(seq_qsl_ptr + i_n + 1) == tl.load(seq_qsl_ptr + i_n):
+            return
 
     rows = i_t * BT + tl.arange(0, BT)
     cols = i_j * BT + tl.arange(0, BT)
@@ -324,9 +331,14 @@ def _k2_solve_kernel(
     BV: tl.constexpr, V: tl.constexpr, BT: tl.constexpr,
     PREC: tl.constexpr,
     BF16_STATE: tl.constexpr, BF16_FORWARD: tl.constexpr,
+    seq_qsl_ptr=None,
+    SKIP_EMPTY: tl.constexpr = False,
 ):
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
+    if SKIP_EMPTY:
+        if tl.load(seq_qsl_ptr + i_n + 1) == tl.load(seq_qsl_ptr + i_n):
+            return
     i_h = i_hv // (HV // H)
     offs_k = tl.arange(0, BK)
     offs_v = i_v * BV + tl.arange(0, BV)
@@ -397,6 +409,9 @@ def _k3_out_kernel(
 ):
     i_t, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
+    if OUT_PACKED:
+        if tl.load(out_qsl_ptr + i_n + 1) == tl.load(out_qsl_ptr + i_n):
+            return
     i_h = i_hv // (HV // H)
     rows = i_t * BT + tl.arange(0, BT)
     m_r = rows < T
@@ -482,7 +497,8 @@ def tree_gdn_triton_verify(
     output is packed [out_num_tokens, HV, V]: sequence i's first len_i rows land
     at out_query_start_loc[i]; it is a workspace reused by the next call, and
     rows no sequence covers (graph padding) hold zeros or an earlier call's
-    finite values. a/b may be [B, T, HV] or flat [B * T, HV] rows (any row
+    finite values. Sequences of length 0 in in_query_start_loc (graph padding)
+    are skipped by every kernel. a/b may be [B, T, HV] or flat [B * T, HV] rows (any row
     stride); with in_query_start_loc they are packed [num_tokens, HV] like the
     output. g_stash/b_stash ([B, T, HV] fp32 views) receive the gate and the raw
     b of every slot for the commit's replay."""
@@ -565,6 +581,8 @@ def tree_gdn_triton_verify(
         BF16_GRAM=bf16_gram, BF16_INVERSE=bf16_inverse,
         MAX_DEPTH=tree.max_depth,
         tile_ptr=tile_t,
+        seq_qsl_ptr=in_query_start_loc,
+        SKIP_EMPTY=in_query_start_loc is not None,
         num_warps=4,
     )
     _k2_solve_kernel[(B * HV, NV)](
@@ -581,6 +599,8 @@ def tree_gdn_triton_verify(
         USE_H0=initial_state_source is not None,
         NB=NB, BK=BK, K=K, BV=BV, V=V, BT=BT, PREC=precision,
         BF16_STATE=bf16_state, BF16_FORWARD=bf16_forward,
+        seq_qsl_ptr=in_query_start_loc,
+        SKIP_EMPTY=in_query_start_loc is not None,
         num_warps=8,
     )
     _k3_out_kernel[(NB, NV, B * HV)](

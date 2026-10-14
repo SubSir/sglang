@@ -8,7 +8,8 @@ into the committed state shows up as an error.
 Per case: outputs of every real token, and the committed SSM state of every request after
 accepting a random prefix (reference: the recurrent kernel's per-step intermediate state).
 Two layers, so the once-per-verify tree build (ordinal 0) is reused by the second.
-Every case also runs with SGLANG_GDN_PACKED_VERIFY off (dense a/b staging, gathered output,
+Trailing zero-length requests stand in for graph-padding slots: the packed kernels skip them, and
+they are left out of the outputs and the commit. Every case also runs with SGLANG_GDN_PACKED_VERIFY off (dense a/b staging, gathered output,
 gating and stash copies outside the kernel): outputs must agree bit for bit, and the committed
 state to fp32 rounding (the stash's g then comes from fused_gdn_gating instead of the verify kernel). A separate check runs the conv update on packed tokens against the same
 tokens zero-padded to the dense layout: output, conv state and per-step windows bit-identical.
@@ -53,7 +54,10 @@ def case(lens, extra_pad, compact, seed, packed=True):
     n_real = int(qsl[-1])
     seq = n_real + extra_pad  # graph-padding tokens past the real ones
     slots = torch.randperm(POOL - 1, generator=g, device="cuda")[:bs].int() + 1
-    accept = torch.tensor([int(torch.randint(0, n, (1,), generator=g, device="cuda")) for n in lens], device="cuda")
+    accept = torch.tensor([int(torch.randint(0, max(n, 1), (1,), generator=g, device="cuda")) for n in lens],
+                          device="cuda")
+    m = sum(1 for n in lens if n > 0)  # real requests; zero-length ones trail
+    assert all(n > 0 for n in lens[:m]) and all(n == 0 for n in lens[m:])
     pool0 = rnd(L, POOL, H, V, K, sc=0.1)
     be, pool = backend(packed), pool0.clone()
     idx = ragged_verify_dense_scatter_indices(query_start_loc=qsl, seq_len=seq, draft_token_num=T) if compact else None
@@ -84,23 +88,23 @@ def case(lens, extra_pad, compact, seed, packed=True):
         inter = torch.zeros(MAX_BS, T, H, V, K, device="cuda")
         ref = fused_sigmoid_gating_delta_rule_update(
             A_log=layer.A_log, dt_bias=layer.dt_bias, q=q[:, :n_real], k=k[:, :n_real], v=v[:, :n_real],
-            a=a[:n_real], b=b[:n_real], initial_state_source=pool0[l].clone(), initial_state_indices=slots,
-            cu_seqlens=qsl, use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
+            a=a[:n_real], b=b[:n_real], initial_state_source=pool0[l].clone(), initial_state_indices=slots[:m],
+            cu_seqlens=qsl[: m + 1], use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
             is_kda=False, disable_state_update=True, intermediate_states_buffer=inter,
-            intermediate_state_indices=torch.arange(bs, device="cuda", dtype=torch.int32), cache_steps=T,
+            intermediate_state_indices=torch.arange(m, device="cuda", dtype=torch.int32), cache_steps=T,
             retrieve_parent_token=None)
         outs.append(out.reshape(seq, H, V)[:n_real].clone())
         o = out.reshape(seq, H, V)[:n_real].float()
         r = ref.reshape(n_real, H, V).float()
         worst_o = max(worst_o, float((o - r).abs().max() / r.abs().max()))
-        for i in range(bs):
+        for i in range(m):
             ref_committed[l, slots[i]] = inter[i, accept[i]]
     st = be.tree_stash
-    advance_ssm_states_along_accept_paths(st["k"], st["v"], st["g"], st["beta"], pool, slots, st["anc"],
-                                          accept, st["k"].shape[2], HG, K, V)
+    advance_ssm_states_along_accept_paths(st["k"], st["v"], st["g"], st["beta"], pool, slots[:m], st["anc"][:m],
+                                          accept[:m], st["k"].shape[2], HG, K, V)
     worst_s = float((pool - ref_committed).abs().max() / ref_committed.abs().max())
     assert all(bool(torch.isfinite(b).all()) for b in be._dense_bufs.values()), "a staging buffer went non-finite"
-    untouched = [s for s in range(POOL) if s not in set(slots.tolist())]
+    untouched = [s for s in range(POOL) if s not in set(slots[:m].tolist())]
     assert torch.equal(pool[:, untouched], pool0[:, untouched]), "commit wrote a slot outside the batch"
     return worst_o, worst_s, outs, pool
 
@@ -137,7 +141,8 @@ def conv_case(lens, extra_pad, seed, dim=384, width=4):
 def main():
     torch.manual_seed(0)
     cases = [("static", [T] * 5, 0, False), ("compact", [1, 3, T, 2, 5, 7, 1, 4], 0, True),
-             ("compact+graph pad", [2, T, 1, 6], 3, True), ("compact bs1", [4], 1, True)]
+             ("compact+graph pad", [2, T, 1, 6], 3, True), ("compact bs1", [4], 1, True),
+             ("compact+empty reqs", [3, T, 1, 5, 0, 0, 0], 2, True)]
     ok = True
     for seed in range(3):
         for name, lens, pad, compact in cases:
