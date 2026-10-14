@@ -118,6 +118,40 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _log_verify_shadow(
+    *,
+    full_logits: List[torch.Tensor],
+    compact_logits: torch.Tensor,
+    verify_lens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+) -> None:
+    """On the rows compact verifies: max |logit diff|, argmax agreement and per-request greedy
+    accept length (row j predicts draft column j + 1), full vs full and full vs compact."""
+    bs, width = draft_tokens.shape
+    lens = verify_lens.to(device=draft_tokens.device, dtype=torch.int64)
+    cols = torch.arange(width, device=draft_tokens.device)
+    rows = (cols[None, :] < lens[:, None]).reshape(-1)
+
+    def accept_len(logits: torch.Tensor) -> torch.Tensor:
+        pred = logits.argmax(-1).view(bs, width)[:, : width - 1]
+        hit = (pred == draft_tokens[:, 1:]) & (cols[None, : width - 1] < lens[:, None] - 1)
+        return hit.int().cumprod(dim=1).sum(dim=1)
+
+    def compare(x: torch.Tensor, y: torch.Tensor) -> str:
+        x, y = x[: bs * width].float(), y[: bs * width].float()
+        diff = (x[rows] - y[rows]).abs().max().item() if rows.any() else 0.0
+        agree = int((x[rows].argmax(-1) == y[rows].argmax(-1)).sum())
+        same_acc = int((accept_len(x) == accept_len(y)).sum())
+        return f"maxdiff={diff:.4g} argmax={agree}/{int(rows.sum())} accept={same_acc}/{bs}"
+
+    first, second = full_logits
+    logger.info(
+        "[RAGGED-SHADOW] full/full %s | full/compact %s",
+        compare(first, second),
+        compare(first, compact_logits),
+    )
+
 _FusedKVMaterializeHelper = None
 
 
@@ -604,6 +638,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # (candidate_ids, q_rows) of the current step, [bs, gamma, top_k] each.
         self._selector_step_q: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._step_trace = SpecStepTrace(tp_rank=self.model_runner.tp_rank, tag="dflash")
+        self._shadow_interval = envs.SGLANG_RAGGED_VERIFY_SHADOW_INTERVAL.get()
+        self._shadow_steps = 0
         self._verify_planner: Optional[DSparkVerifyPlanner] = None
         self._verify_executor: Optional[TargetVerifyExecutor] = None
         self._confidence_selector: Optional[DraftConfidenceSelector] = None
@@ -2829,6 +2865,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         if run_compact:
+            shadow_logits = self._maybe_shadow_full_verify(
+                batch=batch,
+                verify_input=verify_input,
+                draft_input=draft_input,
+                sampling_info=sampling_info,
+                seq_lens_cpu_backup=seq_lens_cpu_backup,
+                seq_lens_sum_backup=seq_lens_sum_backup,
+            )
             # The compact executor adds each request's own verify length to the
             # committed host lengths, not the full block.
             batch.seq_lens_cpu = seq_lens_cpu_backup
@@ -2840,6 +2884,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs,
                 sampling_info=sampling_info,
             )
+            if shadow_logits is not None:
+                _log_verify_shadow(
+                    full_logits=shadow_logits,
+                    compact_logits=target_out.logits_output.next_token_logits,
+                    verify_lens=layout.verify_lens,
+                    draft_tokens=draft_tokens,
+                )
         else:
             target_out = self._run_full_verify(
                 batch=batch,
@@ -2911,6 +2962,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             confidence=confidence,
             sampling_info=sampling_info,
         )
+
+    def _maybe_shadow_full_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        draft_input: DFlashDraftInputV2,
+        sampling_info,
+        seq_lens_cpu_backup,
+        seq_lens_sum_backup,
+    ) -> Optional[List[torch.Tensor]]:
+        """Debug: two full verifies of this batch before its compact verify (which runs last, so
+        the committed KV / state is the compact one's). Returns both [bs * block, vocab] logits."""
+        if self._shadow_interval <= 0:
+            return None
+        self._shadow_steps += 1
+        if self._shadow_steps % self._shadow_interval:
+            return None
+        host_lens, host_sum = batch.seq_lens_cpu, batch.seq_lens_sum
+        runs = []
+        for _ in range(2):
+            batch.seq_lens_cpu, batch.seq_lens_sum = host_lens, host_sum
+            out = self._run_full_verify(
+                batch=batch,
+                verify_input=verify_input,
+                draft_input=draft_input,
+                sampling_info=sampling_info,
+                seq_lens_cpu_backup=seq_lens_cpu_backup,
+                seq_lens_sum_backup=seq_lens_sum_backup,
+            )
+            runs.append(out.logits_output.next_token_logits.float().clone())
+        return runs
 
     def _run_full_verify(
         self,

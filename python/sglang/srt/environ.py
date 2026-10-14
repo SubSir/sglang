@@ -1384,6 +1384,9 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Debug: every N compact verifies, run the full verify twice on the same batch first and log
+    # logit diffs (full vs full, full vs compact) on the rows compact verifies; 0 = off.
+    SGLANG_RAGGED_VERIFY_SHADOW_INTERVAL = EnvInt(0)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
