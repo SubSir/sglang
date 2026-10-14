@@ -1407,11 +1407,10 @@ class DeepseekSparseAttnBackend(
             envs.SGLANG_DSA_FUSE_TOPK.get()
             and self.dsa_topk_backend.should_use_topk_v2()
             and self.dsa_decode_impl == "trtllm"
-            and not is_cp_active()
             and (self.dsa_index_kpool <= 1 or self.real_page_size == 64)
         ):
             raise NotImplementedError(
-                "DSA compact (ragged) verify needs the trtllm decode impl, fused top-k v2, no CP, "
+                "DSA compact (ragged) verify needs the trtllm decode impl, fused top-k v2, "
                 f"and page size 64 under kpool (got decode impl {self.dsa_decode_impl}, "
                 f"kpool {self.dsa_index_kpool}, page {self.real_page_size})."
             )
