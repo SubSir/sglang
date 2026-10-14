@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Optional, Union
 
 import msgspec
@@ -91,6 +92,10 @@ class DSparkVerifyPlanner:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._tp_sync = tp_sync
+        self._lens_stats_interval = envs.SGLANG_DSPARK_VERIFY_LENS_STATS_INTERVAL.get()
+        # [2, width + 1] int64 on device: per-request len hist, bs-weighted max-len hist.
+        self._lens_stats: Optional[torch.Tensor] = None
+        self._lens_stats_steps = 0
         self._align_verify_tokens_to_graph_tier = (
             get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -504,6 +509,8 @@ class DSparkVerifyPlanner:
                     tier_num_reqs=global_num_reqs,
                 )
             return None
+        if self._lens_stats_interval > 0:
+            self._accumulate_lens_stats(verify_lens)
         bs = int(verify_lens.shape[0])
         tier_num_reqs = bs if global_num_reqs is None else global_num_reqs
         if dp_tier_num_tokens is not None:
@@ -653,6 +660,29 @@ class DSparkVerifyPlanner:
             )
 
         return verify_lens
+
+    def _accumulate_lens_stats(self, verify_lens: torch.Tensor) -> None:
+        # Device-side only; the single host read is the periodic log line.
+        width = self.verify_num_draft_tokens
+        if self._lens_stats is None:
+            self._lens_stats = torch.zeros(
+                (2, width + 1), dtype=torch.int64, device=verify_lens.device
+            )
+        lens = verify_lens.to(torch.int64).clamp(0, width)
+        self._lens_stats[0].index_add_(0, lens, torch.ones_like(lens))
+        self._lens_stats[1].index_add_(
+            0, lens.max().view(1), torch.full_like(lens[:1], lens.numel())
+        )
+        self._lens_stats_steps += 1
+        if self._lens_stats_steps % self._lens_stats_interval == 0:
+            len_hist, bs_weighted_max_hist = self._lens_stats.tolist()
+            logger.info(
+                "[DSPARK-LENS] t=%.1f steps=%d len_hist=%s bs_weighted_max_hist=%s",
+                time.time(),
+                self._lens_stats_steps,
+                len_hist,
+                bs_weighted_max_hist,
+            )
 
     def _log_verify_lens_decision(
         self,
