@@ -1371,6 +1371,10 @@ class Envs:
     # whole batch once max_seqlen_q * qheads_per_kvhead > 128; a cap of 128 // qheads_per_kvhead keeps 128-row
     # tiles, so each request is tiled by its own length (cu_seqlens_q) and short ones stop paying for the longest.
     SGLANG_FA4_VERIFY_MAX_Q_LEN = EnvInt(0)
+    # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).
+    SGLANG_SPEC_FUSED_CONFIDENCE = EnvBool(True)
+    # Dynamic verify: build the compact verify window (positions, KV slots, token ids) in one launch.
+    SGLANG_SPEC_FUSED_VERIFY_WINDOW = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

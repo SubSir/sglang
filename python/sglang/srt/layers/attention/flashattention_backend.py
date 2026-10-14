@@ -767,12 +767,18 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
 
-    def _verify_max_seq_len_q(self, max_q: int) -> int:
-        """Target-verify max_seqlen_q for the kernel, capped by SGLANG_FA4_VERIFY_MAX_Q_LEN on FA4."""
+    def _verify_max_seq_len_q(
+        self, max_q: int, *, num_tokens: Optional[int] = None, bs: Optional[int] = None
+    ) -> int:
+        """Target-verify max_seqlen_q for the kernel, capped by SGLANG_FA4_VERIFY_MAX_Q_LEN on FA4
+        when the batch's mean verify length is within the cap (else the 256-row tiles win: most
+        requests are long, and splitting them would re-read their KV)."""
         cap = envs.SGLANG_FA4_VERIFY_MAX_Q_LEN.get()
-        if cap > 0 and self.fa_impl_ver == 4:
-            return min(max_q, cap)
-        return max_q
+        if cap <= 0 or self.fa_impl_ver != 4:
+            return max_q
+        if num_tokens is not None and bs and num_tokens > cap * bs:
+            return max_q
+        return min(max_q, cap)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -935,7 +941,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_q = self._verify_max_seq_len_q(
                         geometry.max_seq_len_q
                         if geometry.max_seq_len_q is not None
-                        else self.speculative_num_draft_tokens
+                        else self.speculative_num_draft_tokens,
+                        num_tokens=ragged_layout.graph_num_tokens,
+                        bs=ragged_layout.bs,
                     )
                     metadata.max_seq_len_k = int(
                         metadata.cache_seqlens_int32.max().item()
@@ -947,7 +955,9 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.seq_lens + self.speculative_num_draft_tokens
                     ).to(torch.int32)
                     metadata.max_seq_len_q = self._verify_max_seq_len_q(
-                        self.speculative_num_draft_tokens
+                        self.speculative_num_draft_tokens,
+                        num_tokens=self.speculative_num_draft_tokens * forward_batch.batch_size,
+                        bs=forward_batch.batch_size,
                     )
                     metadata.max_seq_len_k = (
                         eager_max_k + self.speculative_num_draft_tokens
@@ -2651,7 +2661,7 @@ class FlashAttentionBackend(AttentionBackend):
                     "cache_seqlens"
                 ][:bs]
                 metadata.max_seq_len_q = self._verify_max_seq_len_q(
-                    self.speculative_num_draft_tokens
+                    self.speculative_num_draft_tokens, num_tokens=num_tokens, bs=bs
                 )
                 metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
                     : bs + 1

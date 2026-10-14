@@ -197,3 +197,29 @@ def build_qo_indptr_triton(*, verify_lens: torch.Tensor) -> QoIndptrResult:
         BLOCK=BLOCK,
     )
     return QoIndptrResult(qo_indptr=qo_indptr, extend_start_loc=extend_start_loc)
+
+
+@triton.jit
+def _ragged_kv_geometry_kernel(
+    seq_lens_ptr, verify_lens_ptr, cache_ptr, cu_k_ptr, bs, BLOCK: tl.constexpr
+):
+    idx = tl.arange(0, BLOCK)
+    m = idx < bs
+    kv = (tl.load(seq_lens_ptr + idx, mask=m, other=0) + tl.load(verify_lens_ptr + idx, mask=m, other=0)).to(tl.int32)
+    tl.store(cache_ptr + idx, kv, mask=m)
+    tl.store(cu_k_ptr, 0)
+    tl.store(cu_k_ptr + 1 + idx, tl.cumsum(kv, axis=0), mask=m)
+
+
+def ragged_kv_geometry_triton(
+    *, seq_lens: torch.Tensor, verify_lens: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(seq_lens + verify_lens) as int32 and its zero-led inclusive cumsum, in one launch."""
+    bs = seq_lens.shape[0]
+    cache = torch.empty(bs, dtype=torch.int32, device=seq_lens.device)
+    cu_k = torch.empty(bs + 1, dtype=torch.int32, device=seq_lens.device)
+    _ragged_kv_geometry_kernel[(1,)](
+        seq_lens, verify_lens, cache, cu_k, bs, BLOCK=triton.next_power_of_2(max(bs, 1))
+    )
+    return cache, cu_k
+

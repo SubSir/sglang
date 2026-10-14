@@ -58,6 +58,9 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     # Per-row upper bound (capped padded variant); rows never exceed it, so
     # dense [bs, cap] consumers stay in bounds. None = full-coverage variant.
     cap: Optional[int] = None
+    # padded_to_bucket results keyed by (padded_bs, cap): every attention / linear backend and the graph
+    # runner pad the same step's layout, so the pad + indptr launches run once per iteration.
+    padded_cache: dict = msgspec.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.verify_lens_cpu is None:
@@ -178,6 +181,13 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             PaddedToBucket,
         )
 
+        # Tensors made inside a graph capture live in the graph's pool and are rewritten by later replays:
+        # never serve or keep those.
+        capturing = self.verify_lens.is_cuda and torch.cuda.is_current_stream_capturing()
+        key = (padded_bs, cap)
+        hit = None if capturing else self.padded_cache.get(key)
+        if hit is not None:
+            return hit
         padded = PaddedToBucket.execute(
             verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
@@ -187,12 +197,15 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         if cap is not None:
             padded = torch.clamp(padded, max=cap)
 
-        return RaggedVerifyLayout._assemble_device(
+        out = RaggedVerifyLayout._assemble_device(
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
         )
+        if not capturing:
+            self.padded_cache[key] = out
+        return out
 
 
 def build_capture_verify_lens(
@@ -237,11 +250,20 @@ def build_ragged_target_verify_geometry(
     seq_lens: torch.Tensor,
     layout: RaggedVerifyLayout,
 ) -> RaggedTargetVerifyGeometry:
-    cache_seqlens_int32 = (seq_lens + layout.verify_lens).to(torch.int32)
     cu_seqlens_q = layout.qo_indptr_device.to(torch.int32)
-    cu_seqlens_k = torch.nn.functional.pad(
-        torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
-    )
+    if seq_lens.is_cuda and seq_lens.shape[0] == layout.verify_lens.shape[0]:
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+            ragged_kv_geometry_triton,
+        )
+
+        cache_seqlens_int32, cu_seqlens_k = ragged_kv_geometry_triton(
+            seq_lens=seq_lens, verify_lens=layout.verify_lens
+        )
+    else:
+        cache_seqlens_int32 = (seq_lens + layout.verify_lens).to(torch.int32)
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+        )
     max_seq_len_q = (
         max(layout.verify_lens_cpu) if layout.verify_lens_cpu is not None else None
     )
