@@ -416,14 +416,16 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            verify_lens_cpu = (
-                layout.verify_lens_cpu
-                if layout.verify_lens_cpu is not None
-                else layout.verify_lens.cpu().tolist()
-            )
-            batch.seq_lens_cpu = seq_lens_cpu_backup + torch.tensor(
-                verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
-            )
+            if layout.verify_lens_cpu is not None:
+                batch.seq_lens_cpu = seq_lens_cpu_backup + torch.tensor(
+                    layout.verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
+                )
+            else:
+                # Lens live on the device only (planned this step): reading them back
+                # blocks the host on the planner. Host lens are only bounds for the
+                # verify forward (the attention backends read the device lens), so
+                # use the static verify width, as static verify does.
+                batch.seq_lens_cpu = seq_lens_cpu_backup + self.verify_num_draft_tokens
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
         return self._forward_prepared_verify(
