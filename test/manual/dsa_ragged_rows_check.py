@@ -34,6 +34,11 @@ def main():
     kv, rows = _ragged_verify_rows(seq_lens=seq, qo_indptr=qo, req_pool_indices=torch.arange(bs), num_rows=bs * T)
     want = torch.cat([s + torch.arange(1, T + 1) for s in seq]).to(torch.int32)
     assert torch.equal(kv, want) and rows.tolist() == [i for i in range(bs) for _ in range(T)]
+    # Graph replay: qo_indptr spans 4 tier slots, only 2 real requests are passed.
+    qo = torch.tensor([0, 2, 3, 3, 3], dtype=torch.int32)
+    kv, rows = _ragged_verify_rows(seq_lens=torch.tensor([10, 40]), qo_indptr=qo,
+                                   req_pool_indices=torch.tensor([6, 8]), num_rows=6)
+    assert kv.tolist() == [11, 12, 41, 1, 1, 1] and rows.tolist() == [6, 6, 8, 6, 6, 6], (kv.tolist(), rows.tolist())
     print("DSA_RAGGED_ROWS_OK")
 
 
@@ -67,6 +72,11 @@ def kpool_main():
     assert plan.effective_n_per_batch.tolist() == lens.tolist()
     rows = ragged_kpool_padded_rows(qo_indptr=qo, num_rows=18, num_draft_tokens=N)
     assert rows.tolist() == [0, 1] + [16 + j for j in range(8)] + [24 + j for j in range(5)] + [40] * 3, rows.tolist()
+    # Replay with 2 real requests into the same 5-slot plan: the stale slots 2..4 are zeroed.
+    fill_ragged_kpool_write_plan(plan, write_start=seq[:2], req_pool_indices=pool[:2], verify_lens=lens[:2],
+                                 real_page_rows=table[:2], pool_size=P, slots_per_page=spp)
+    assert plan.write_loc[:2].tolist() == want[:2] and not plan.write_loc[2:].any()
+    assert plan.effective_n_per_batch.tolist() == [2, 0, 0, 0, 0] and not plan.req[2:].any()
     print("DSA_RAGGED_KPOOL_OK")
 
 

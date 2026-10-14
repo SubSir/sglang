@@ -180,14 +180,19 @@ def _ragged_verify_rows(
     KV slots. Rows past the last real token (graph padding) read request 0's first slot.
     Returns (kv_len int32 [num_rows], req_pool_index [num_rows])."""
     bs = qo_indptr.shape[0] - 1
+    # Replays pass only the real requests while qo_indptr spans the tier's slots; real rows
+    # always map below that count, and the clamp keeps the discarded padding gather in bounds.
+    num_real = min(bs, seq_lens.shape[0], req_pool_indices.shape[0])
     rows = torch.arange(num_rows, device=seq_lens.device, dtype=torch.int32)
     qo = qo_indptr.to(torch.int32)
-    req = torch.searchsorted(qo[1:].contiguous(), rows, right=True).clamp_(max=max(bs - 1, 0))
+    req = torch.searchsorted(qo[1:].contiguous(), rows, right=True).clamp_(
+        max=max(num_real - 1, 0)
+    )
     valid = rows < qo[-1]
-    kv = seq_lens[:bs].to(torch.int32)[req] + (rows - qo[req]) + 1
+    kv = seq_lens[:num_real].to(torch.int32)[req] + (rows - qo[req]) + 1
     kv = torch.where(valid, kv, torch.ones_like(kv))
     req = torch.where(valid, req, torch.zeros_like(req))
-    return kv, req_pool_indices[:bs][req.long()]
+    return kv, req_pool_indices[:num_real][req.long()]
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -1518,14 +1523,14 @@ class DeepseekSparseAttnBackend(
         page_table_1 = metadata.page_table_1
         page_table_1.copy_(self.req_to_token[req_rows.long(), : page_table_1.shape[1]])
         qo = layout.qo_indptr_device
-        num_slots = qo.shape[0] - 1
+        num_real = min(qo.shape[0] - 1, req_pool_indices.shape[0], seq_lens.shape[0])
         fill_ragged_kpool_write_plan(
             metadata.kpool_write_plan,
-            write_start=seq_lens[:num_slots],
-            req_pool_indices=req_pool_indices[:num_slots],
-            verify_lens=qo[1:] - qo[:-1],
+            write_start=seq_lens[:num_real],
+            req_pool_indices=req_pool_indices[:num_real],
+            verify_lens=(qo[1:] - qo[:-1])[:num_real],
             real_page_rows=self._ragged_real_page_rows(
-                req_pool_indices[:num_slots], metadata.real_page_table.shape[1]
+                req_pool_indices[:num_real], metadata.real_page_table.shape[1]
             ),
             pool_size=self.dsa_index_kpool,
             slots_per_page=self._kpool_slots_per_page(),

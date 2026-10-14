@@ -808,7 +808,12 @@ def fill_ragged_kpool_write_plan(
     slots_per_page: int,
 ) -> None:
     """Torch twin of _update_kpool_write_plan_kernel's per-request outputs, reading request b's
-    real page row from real_page_rows[b] instead of the padded table's row b * N."""
+    real page row from real_page_rows[b] instead of the padded table's row b * N. The inputs hold
+    the n real requests; the plan's remaining graph slots are zeroed (effective_n 0, no write)."""
+    n = write_start.shape[0]
+    for buf in (plan.req, plan.write_start, plan.tail_logical_start, plan.write_loc):
+        buf[n:].zero_()
+    plan.effective_n_per_batch[n:].zero_()
     ws = write_start.to(torch.int32)
     base_pool = ws // pool_size
     pool_id = base_pool[:, None] + torch.arange(
@@ -818,11 +823,11 @@ def fill_ragged_kpool_write_plan(
         0, real_page_rows.shape[1] - 1
     )
     packed_page = torch.gather(real_page_rows, 1, token_page_row.long()).to(torch.int64)
-    plan.req.copy_(req_pool_indices.to(torch.int64))
-    plan.write_start.copy_(ws)
-    plan.tail_logical_start.copy_(base_pool * pool_size)
-    plan.write_loc.copy_(packed_page * slots_per_page + (pool_id % slots_per_page))
-    plan.effective_n_per_batch.copy_(verify_lens.to(torch.int32))
+    plan.req[:n].copy_(req_pool_indices.to(torch.int64))
+    plan.write_start[:n].copy_(ws)
+    plan.tail_logical_start[:n].copy_(base_pool * pool_size)
+    plan.write_loc[:n].copy_(packed_page * slots_per_page + (pool_id % slots_per_page))
+    plan.effective_n_per_batch[:n].copy_(verify_lens.to(torch.int32))
 
 
 def ragged_kpool_padded_rows(
