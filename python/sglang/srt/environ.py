@@ -1367,6 +1367,9 @@ class Envs:
     # Chain target verify on GDN through the fused tree kernels (no per-step SSM
     # snapshots; the commit replays the accepted prefix). Static and compact verify.
     SGLANG_ENABLE_GDN_FUSED_VERIFY = EnvBool(False)
+    # Compact fused GDN verify reads packed tokens in the conv and writes packed output from the
+    # verify kernel (False = scatter to the dense [bs, T] layout and gather back).
+    SGLANG_GDN_PACKED_VERIFY = EnvBool(True)
     # FA4 target verify: cap the max_seqlen_q handed to the kernel (0 = off). FA4 picks 256-row CTAs for the
     # whole batch once max_seqlen_q * qheads_per_kvhead > 128; a cap of 128 // qheads_per_kvhead keeps 128-row
     # tiles, so each request is tiled by its own length (cu_seqlens_q) and short ones stop paying for the longest.

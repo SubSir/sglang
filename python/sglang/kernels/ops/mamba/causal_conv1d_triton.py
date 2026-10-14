@@ -597,6 +597,7 @@ def _causal_conv1d_update_kernel(
     retrieve_next_token_ptr,
     retrieve_next_sibling_ptr,
     retrieve_parent_token_ptr,
+    query_start_loc_ptr,  # (batch + 1,) packed x offsets, IS_VARLEN_X only
     o_ptr,  # (batch, dim, seqlen)
     # Matrix dimensions
     batch: int,
@@ -642,6 +643,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    IS_VARLEN_X: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -736,7 +738,15 @@ def _causal_conv1d_update_kernel(
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
     VAL = state_len - seqlen
-    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    if IS_VARLEN_X:
+        # Packed x: this sequence's tokens start at query_start_loc[idx_seq]; slots past
+        # its length read as zeros, exactly what a zero-padded dense x would hold.
+        x_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+        x_len = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64) - x_start
+        x_base = x_ptr + x_start * stride_x_token + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    else:
+        x_len = seqlen
+        x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
     x_ptrs = (
         x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
@@ -744,7 +754,7 @@ def _causal_conv1d_update_kernel(
 
     mask_x = (
         (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
+        & (idx_tokens - VAL < x_len)[:, None]
         & (idx_feats < dim)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
@@ -923,7 +933,7 @@ def _causal_conv1d_update_kernel(
                     if j == 1:  # KERNEL_WIDTH-1:
                         matrix_w = w_col1
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < x_len), other=0.0)
                 elif KERNEL_WIDTH == 3:
                     if j == 1:
                         matrix_w = w_col1
@@ -931,7 +941,7 @@ def _causal_conv1d_update_kernel(
                     elif j == 2:
                         matrix_w = w_col2
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < x_len), other=0.0)
                 elif KERNEL_WIDTH == 4:
                     if j == 1:
                         matrix_w = w_col1
@@ -942,7 +952,7 @@ def _causal_conv1d_update_kernel(
                     elif j == 3:
                         matrix_w = w_col3
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < x_len), other=0.0)
 
                 acc += matrix_x * matrix_w  # [BLOCK_N]
 
@@ -1014,6 +1024,8 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    query_start_loc: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1038,6 +1050,9 @@ def causal_conv1d_update(
             in this case, the kernel will not process entries at
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
+    query_start_loc: (batch + 1,) int32. If not None, x is packed (num_tokens, dim) with
+        sequence i at rows [query_start_loc[i], query_start_loc[i+1]); out is still the dense
+        (batch, dim, max_seqlen) layout, slots past a sequence's length computed from zeros.
     """
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
@@ -1047,11 +1062,17 @@ def causal_conv1d_update(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
-    unsqueeze = x.dim() == 2
-    if unsqueeze:
-        # make it (batch, dim, seqlen) with seqlen == 1
-        x = x.unsqueeze(-1)
-    batch, dim, seqlen = x.shape
+    if query_start_loc is not None:
+        assert retrieve_next_token is None, "packed x has no tree-mask variant"
+        assert num_accept_tokens is None and max_seqlen is not None
+        batch, seqlen, dim = query_start_loc.shape[0] - 1, max_seqlen, x.shape[1]
+        unsqueeze = False
+    else:
+        unsqueeze = x.dim() == 2
+        if unsqueeze:
+            # make it (batch, dim, seqlen) with seqlen == 1
+            x = x.unsqueeze(-1)
+        batch, dim, seqlen = x.shape
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
@@ -1075,11 +1096,15 @@ def causal_conv1d_update(
         assert weight.stride(1) == 1  # Need this
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
-    # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
-    out = torch.empty_like(x)
     stride_w_dim, stride_w_width = weight.stride()
-
-    stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
+    if query_start_loc is not None:
+        # Token-major like the dense callers' (batch, seqlen, dim).transpose(1, 2).
+        out = x.new_empty(batch, seqlen, dim).transpose(1, 2)
+        stride_x_seq, stride_x_dim, stride_x_token = 0, x.stride(1), x.stride(0)
+    else:
+        # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
+        out = torch.empty_like(x)
+        stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
 
     stride_o_seq, stride_o_dim, stride_o_token = out.stride()
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
@@ -1158,6 +1183,7 @@ def causal_conv1d_update(
         retrieve_next_token,
         retrieve_next_sibling,
         retrieve_parent_token,
+        query_start_loc,
         out,
         # Matrix dimensions
         batch,
@@ -1203,6 +1229,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        IS_VARLEN_X=query_start_loc is not None,
         **pdl_kwargs,
     )
     if unsqueeze:
