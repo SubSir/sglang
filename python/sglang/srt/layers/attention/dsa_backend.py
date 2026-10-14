@@ -85,6 +85,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
@@ -160,6 +161,28 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+def _ragged_verify_rows(
+    *,
+    seq_lens: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    num_rows: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Ragged target verify as num_rows q-length-1 rows: row r is packed token r of request i
+    (qo_indptr[i] <= r < qo_indptr[i + 1]) and attends to seq_lens[i] + (r - qo_indptr[i]) + 1
+    KV slots. Rows past the last real token (graph padding) read request 0's first slot.
+    Returns (kv_len int32 [num_rows], req_pool_index [num_rows])."""
+    bs = qo_indptr.shape[0] - 1
+    rows = torch.arange(num_rows, device=seq_lens.device, dtype=torch.int32)
+    qo = qo_indptr.to(torch.int32)
+    req = torch.searchsorted(qo[1:].contiguous(), rows, right=True).clamp_(max=max(bs - 1, 0))
+    valid = rows < qo[-1]
+    kv = seq_lens[:bs].to(torch.int32)[req] + (rows - qo[req]) + 1
+    kv = torch.where(valid, kv, torch.ones_like(kv))
+    req = torch.where(valid, req, torch.zeros_like(req))
+    return kv, req_pool_indices[:bs][req.long()]
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -310,6 +333,9 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+    # Compact (ragged) target verify runs as one q-length-1 row per packed verify token
+    # (_ragged_verify_rows): the trtllm decode kernel and the per-row indexer path take it.
+    supports_ragged_verify_graph: bool = True
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
@@ -847,6 +873,19 @@ class DeepseekSparseAttnBackend(
 
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            if ragged_layout is not None:
+                self.set_dsa_prefill_impl(forward_batch)
+                width = self.req_to_token.shape[1]
+                self.forward_metadata = self._build_ragged_verify_metadata(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    layout=ragged_layout,
+                    num_rows=forward_batch.input_ids.shape[0],
+                    page_table_1=None,
+                    width=width,
+                )
+                return
         else:
             draft_token_num = 0
 
@@ -1353,6 +1392,106 @@ class DeepseekSparseAttnBackend(
             )
         )
 
+    def _check_ragged_verify_supported(self) -> None:
+        # The ragged rows refresh dsa_seqlens_expanded / real_page_table / the schedule only, not the
+        # wide page_table_1, which only the unfused top-k transform reads.
+        if not (
+            envs.SGLANG_DSA_FUSE_TOPK.get()
+            and self.dsa_topk_backend.should_use_topk_v2()
+            and self.dsa_index_kpool <= 1
+            and self.dsa_decode_impl == "trtllm"
+            and not is_cp_active()
+        ):
+            raise NotImplementedError(
+                "DSA compact (ragged) verify needs the trtllm decode impl, fused top-k v2, "
+                f"index_kpool 1 and no CP (got decode impl {self.dsa_decode_impl}, "
+                f"kpool {self.dsa_index_kpool})."
+            )
+
+    def _ragged_real_page_rows(self, req_rows: torch.Tensor, cols: int) -> torch.Tensor:
+        """[rows, cols] page-granular table: row r is req_rows[r]'s req_to_token row sampled every page."""
+        idx = torch.arange(cols, device=req_rows.device, dtype=torch.int64) * self.real_page_size
+        return (
+            self.req_to_token[req_rows.long()[:, None], idx[None, :]] // self.real_page_size
+        ).to(torch.int32)
+
+    def _build_ragged_verify_metadata(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layout,
+        num_rows: int,
+        page_table_1: Optional[torch.Tensor],
+        width: int,
+    ) -> DSAMetadata:
+        """Target verify of a ragged layout as num_rows decode-like q-length-1 rows. Every per-row
+        tensor is freshly allocated, so a graph capture can own them and replays refill in place."""
+        self._check_ragged_verify_supported()
+        kv, req_rows = _ragged_verify_rows(
+            seq_lens=seq_lens,
+            qo_indptr=layout.qo_indptr_device,
+            req_pool_indices=req_pool_indices,
+            num_rows=num_rows,
+        )
+        dsa_cache_seqlens = compute_dsa_seqlens(
+            kv, dsa_index_topk=self.dsa_index_topk, index_kpool=self.dsa_index_kpool
+        )
+        ctx_lens_2d = kv.view(-1, 1).clone()
+        cols = (width + self.real_page_size - 1) // self.real_page_size
+        return DSAMetadata(
+            page_size=self.real_page_size,
+            cache_seqlens_int32=kv.clone(),
+            max_seq_len_q=1,
+            max_seq_len_k=width,
+            cu_seqlens_q=torch.arange(num_rows + 1, device=self.device, dtype=torch.int32),
+            cu_seqlens_k=compute_cu_seqlens(kv),
+            page_table_1=page_table_1,
+            real_page_table=self._ragged_real_page_rows(req_rows, cols),
+            dsa_cache_seqlens_int32=dsa_cache_seqlens,
+            dsa_cu_seqlens_q=torch.arange(num_rows + 1, device=self.device, dtype=torch.int32),
+            dsa_cu_seqlens_k=compute_cu_seqlens(dsa_cache_seqlens),
+            dsa_extend_seq_lens_list=[1] * num_rows,
+            dsa_seqlens_expanded=kv,
+            paged_mqa_schedule_metadata=(
+                deep_gemm.get_paged_mqa_logits_metadata(ctx_lens_2d, 64, deep_gemm.get_num_sms())
+                if is_cuda()
+                else None
+            ),
+            paged_mqa_ctx_lens_2d=ctx_lens_2d,
+            topk_v2_plan=self._build_topk_v2_plan(kv),
+        )
+
+    def _refill_ragged_verify_metadata(
+        self,
+        metadata: DSAMetadata,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layout,
+    ) -> None:
+        """Replay-prep (out of graph): rewrite the per-row tensors of a captured ragged-verify tier."""
+        kv, req_rows = _ragged_verify_rows(
+            seq_lens=seq_lens,
+            qo_indptr=layout.qo_indptr_device,
+            req_pool_indices=req_pool_indices,
+            num_rows=metadata.dsa_seqlens_expanded.shape[0],
+        )
+        metadata.cache_seqlens_int32.copy_(kv)
+        metadata.dsa_seqlens_expanded.copy_(kv)
+        metadata.cu_seqlens_k[1:].copy_(torch.cumsum(kv, dim=0, dtype=torch.int32))
+        dsa_cache_seqlens = compute_dsa_seqlens(
+            kv, dsa_index_topk=self.dsa_index_topk, index_kpool=self.dsa_index_kpool
+        )
+        metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
+        metadata.dsa_cu_seqlens_k[1:].copy_(torch.cumsum(dsa_cache_seqlens, dim=0, dtype=torch.int32))
+        metadata.real_page_table.copy_(
+            self._ragged_real_page_rows(req_rows, metadata.real_page_table.shape[1])
+        )
+        metadata.paged_mqa_ctx_lens_2d.copy_(kv.view(-1, 1))
+        self._refresh_paged_mqa_schedule_metadata(metadata, metadata.paged_mqa_ctx_lens_2d)
+        self._refresh_topk_v2_plan(metadata)
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -1540,6 +1679,42 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        ragged_layout = (
+            spec_info.ragged_verify_layout
+            if forward_mode.is_target_verify() and spec_info is not None
+            else None
+        )
+        if ragged_layout is not None:
+            # Ragged tiers are keyed by token count: tiers with equal request slots must not share.
+            key = ("ragged_verify", ragged_layout.graph_num_tokens)
+            if key not in self.decode_cuda_graph_metadata:
+                page_table = self.decode_cuda_graph_metadata["page_table"]
+                metadata = self._build_ragged_verify_metadata(
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    layout=ragged_layout,
+                    num_rows=ragged_layout.graph_num_tokens,
+                    page_table_1=(
+                        page_table[: ragged_layout.graph_num_tokens, :]
+                        if page_table is not None
+                        else None
+                    ),
+                    width=(
+                        page_table.shape[1] if page_table is not None else self.req_to_token.shape[1]
+                    ),
+                )
+                self.decode_cuda_graph_metadata[key] = metadata
+            else:
+                metadata = self.decode_cuda_graph_metadata[key]
+                self._refill_ragged_verify_metadata(
+                    metadata,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    layout=ragged_layout,
+                )
+            self.forward_metadata = metadata
+            return
+
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
