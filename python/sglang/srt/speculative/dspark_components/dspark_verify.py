@@ -722,7 +722,8 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
-        candidates = torch.zeros(
+        # Every row is written by the scatter (fill_value past a request's length).
+        candidates = torch.empty(
             (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
         )
         scatter_compact_to_strided_into(

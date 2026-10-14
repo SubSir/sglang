@@ -1467,6 +1467,10 @@ class Envs:
     # Chain target verify on GDN through the fused tree kernels (no per-step SSM
     # snapshots; the commit replays the accepted prefix). Static and compact verify.
     SGLANG_ENABLE_GDN_FUSED_VERIFY = EnvBool(False)
+    # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).
+    SGLANG_SPEC_FUSED_CONFIDENCE = EnvBool(True)
+    # Dynamic verify: build the compact verify window (positions, KV slots, token ids) in one launch.
+    SGLANG_SPEC_FUSED_VERIFY_WINDOW = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)

@@ -3144,6 +3144,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             return None, None
         candidate_ids, q_rows = self._selector_step_q
+        if (
+            self._verify_planner is not None
+            and q_rows.is_cuda
+            and not selector.uses_draft_prob
+            and envs.SGLANG_SPEC_FUSED_CONFIDENCE.get()
+        ):
+            # One launch for entropy + calibrated survival + conditional ratios.
+            return selector.fused_entropy_confidence(
+                q_rows=q_rows, req_pool_indices=req_pool_indices
+            )
         draft_entropy = entropy_from_probs(q_rows)
         if self._verify_planner is None:
             return draft_entropy, None

@@ -7,6 +7,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -168,6 +169,112 @@ def _ragged_finalize_kernel(
     tl.store(cache_out_ptr + offs, cl, mask=mask)
 
 
+@triton.jit
+def _fused_verify_window_kernel(
+    verify_lens_ptr,
+    prefix_ptr,
+    pool_idx_ptr,
+    req_to_token_ptr,
+    block_ids_ptr,
+    draft_tokens_ptr,
+    pos_out_ptr,
+    cache_out_ptr,
+    ids_out_ptr,
+    win_out_ptr,
+    bs,
+    n,
+    pool_len,
+    block_cols,
+    gamma,
+    verify_w,
+    ROWS: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Per compact verify row: owning request (from the in-register prefix sum of verify_lens), position,
+    KV slot (req_to_token at prefix + within) and token id (anchor, then the drafts). Rows past the real
+    total get 0 in every output, as the unfused builder writes."""
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    rmask = rows < n
+    ob = tl.arange(0, BLOCK_B)
+    bmask = ob < bs
+    vl = tl.load(verify_lens_ptr + ob, mask=bmask, other=0).to(tl.int64)
+    incl = tl.cumsum(vl, axis=0)
+    total = tl.sum(vl, axis=0)
+    r64 = rows.to(tl.int64)
+    # req = number of requests whose inclusive end is <= row (padded slots never count).
+    ends = tl.where(bmask, incl, total + n + 1)
+    req = tl.sum(tl.where(ends[None, :] <= r64[:, None], 1, 0), axis=1)
+    valid = rmask & (r64 < total)
+    safe = tl.minimum(req, bs - 1)
+    sel = ob[None, :] == safe[:, None]
+    start = tl.sum(tl.where(sel, incl - vl, 0), axis=1)
+    within = tl.where(valid, r64 - start, 0)
+    prefix = tl.load(prefix_ptr + safe, mask=rmask, other=0).to(tl.int64)
+    pos = tl.where(valid, prefix + within, 0)
+    pool = tl.load(pool_idx_ptr + safe, mask=rmask, other=0).to(tl.int64)
+    cache = tl.load(req_to_token_ptr + pool * pool_len + prefix + within, mask=valid, other=0).to(tl.int64)
+    anchor = tl.load(block_ids_ptr + safe.to(tl.int64) * block_cols, mask=rmask, other=0).to(tl.int64)
+    wcol = tl.maximum(within - 1, 0)
+    draft = tl.load(draft_tokens_ptr + safe.to(tl.int64) * gamma + wcol, mask=rmask, other=0).to(tl.int64)
+    ids = tl.where(valid, tl.where(within == 0, anchor, draft), 0)
+    tl.store(pos_out_ptr + rows, pos, mask=rmask)
+    tl.store(cache_out_ptr + rows, tl.where(valid, cache, 0), mask=rmask)
+    tl.store(ids_out_ptr + rows, ids, mask=rmask)
+    win = tl.where(valid, safe.to(tl.int64) * verify_w + within, -1)
+    tl.store(win_out_ptr + rows, win, mask=rmask)
+
+
+_FUSED_WINDOW_MAX_BS = 256
+
+
+def build_ragged_verify_window_fused(
+    *,
+    batch: ScheduleBatch,
+    layout: RaggedVerifyLayout,
+    draft_block_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    bs: int,
+    device: str,
+    verify_num_draft_tokens: int,
+    model_runner,
+) -> RaggedVerifyWindow:
+    """build_ragged_verify_window_triton in one launch (the unfused path runs two row-index builds, the
+    cache-loc assignment, a finalize and a gather, each with its own casts and cumsum)."""
+    n = layout.graph_num_tokens
+    req_to_token = model_runner.req_to_token_pool.req_to_token
+    positions = torch.empty(n, dtype=torch.int64, device=device)
+    cache_loc = torch.empty(n, dtype=torch.int64, device=device)
+    ids = torch.empty(n, dtype=torch.int64, device=device)
+    window_index = torch.empty(n, dtype=torch.int64, device=device)
+    ROWS = 64
+    _fused_verify_window_kernel[(triton.cdiv(n, ROWS),)](
+        layout.verify_lens,
+        batch.seq_lens,
+        batch.req_pool_indices,
+        req_to_token,
+        draft_block_ids,
+        draft_tokens,
+        positions,
+        cache_loc,
+        ids,
+        window_index,
+        bs,
+        n,
+        req_to_token.stride(0),
+        draft_block_ids.stride(0),
+        draft_tokens.stride(0),
+        verify_num_draft_tokens,
+        ROWS=ROWS,
+        BLOCK_B=triton.next_power_of_2(max(bs, 2)),
+    )
+    return RaggedVerifyWindow(
+        positions=positions,
+        verify_cache_loc=cache_loc,
+        verify_ids=ids,
+        window_index=window_index,
+    )
+
+
 def build_ragged_verify_window_triton(
     *,
     batch: ScheduleBatch,
@@ -179,6 +286,17 @@ def build_ragged_verify_window_triton(
     verify_num_draft_tokens: int,
     model_runner,
 ) -> RaggedVerifyWindow:
+    if (
+        bs <= _FUSED_WINDOW_MAX_BS
+        and draft_block_ids.stride(1) == 1
+        and draft_tokens.stride(1) == 1
+        and envs.SGLANG_SPEC_FUSED_VERIFY_WINDOW.get()
+    ):
+        return build_ragged_verify_window_fused(
+            batch=batch, layout=layout, draft_block_ids=draft_block_ids, draft_tokens=draft_tokens,
+            bs=bs, device=device, verify_num_draft_tokens=verify_num_draft_tokens,
+            model_runner=model_runner,
+        )
     prefix_lens = batch.seq_lens
     verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
     padded_total = layout.graph_num_tokens
@@ -547,19 +665,24 @@ def scatter_compact_to_strided(
 def _scatter_compact_to_strided_kernel(
     compact_ptr,
     verify_lens_ptr,
-    start_ptr,
     out_ptr,
     stride,
     dim,
+    bs,
     fill_value,
     BLOCK_D: tl.constexpr,
+    BLOCK_B: tl.constexpr,
 ):
     o = tl.program_id(0).to(tl.int64)
     dblk = tl.program_id(1)
     i = o // stride
     w = o % stride
-    vl_i = tl.load(verify_lens_ptr + i)
-    start_i = tl.load(start_ptr + i)
+    ob = tl.arange(0, BLOCK_B)
+    # Request i's compact start = sum of the earlier requests' verify lengths (bs <= BLOCK_B).
+    lens = tl.load(verify_lens_ptr + ob, mask=ob < i, other=0).to(tl.int64)
+    start_i = tl.sum(lens, axis=0)
+    vl_i = tl.load(verify_lens_ptr + tl.minimum(i, bs - 1)).to(tl.int64)
+    vl_i = tl.where(i < bs, vl_i, 0)
     d = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
     dmask = d < dim
     in_range = w < vl_i
@@ -577,23 +700,25 @@ def scatter_compact_to_strided_into(
     stride: int,
     fill_value: float,
 ) -> torch.Tensor:
+    """out[i * stride + w] = compact[start_i + w] for w < verify_lens[i], else fill_value; every out row is
+    written. One launch: the per-request starts are summed in-kernel."""
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
     compact = compact.contiguous()
-    verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
-    start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
+    bs = verify_lens.shape[0]
     n_out = out.shape[0]
     BLOCK_D = 1024
     grid = (n_out, triton.cdiv(dim, BLOCK_D))
     _scatter_compact_to_strided_kernel[grid](
         compact,
         verify_lens,
-        start,
         out,
         stride,
         dim,
+        bs,
         fill_value,
         BLOCK_D=BLOCK_D,
+        BLOCK_B=triton.next_power_of_2(max(bs, 2)),
     )
     return out
 

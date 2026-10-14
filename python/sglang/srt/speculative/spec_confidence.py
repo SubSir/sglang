@@ -208,6 +208,9 @@ class DraftConfidenceSelector:
         # (<think>, </think>) ids and the request-pool getter; None = one table for all.
         self._think_markers: Optional[tuple[int, int]] = None
         self._pool_getter = None
+        # Calibration tables stacked for the fused kernel, rebuilt when a table changes.
+        self._stacked_tables = None
+        self._stacked_key: Optional[tuple[int, int]] = None
         table_path = envs.SGLANG_SPEC_ENTROPY_TABLE_PATH.get()
         if table_path:
             self.load_table(table_path)
@@ -283,6 +286,22 @@ class DraftConfidenceSelector:
             calibrator_nothink=self.calibrator_nothink,
             thinking=self.thinking_rows(req_pool_indices),
         )
+
+    def fused_entropy_confidence(
+        self, *, q_rows: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(entropy, entropy_confidence) of [bs, gamma, K] q rows in one Triton launch (CUDA)."""
+        from sglang.kernels.ops.speculative.spec_confidence_triton import (
+            fused_entropy_confidence,
+            stack_calibration_tables,
+        )
+
+        key = (id(self.calibrator), id(self.calibrator_nothink))
+        if self._stacked_key != key:
+            cals = [self.calibrator] + ([self.calibrator_nothink] if self.calibrator_nothink else [])
+            self._stacked_tables, self._stacked_key = stack_calibration_tables(cals), key
+        thinking = self.thinking_rows(req_pool_indices) if self.calibrator_nothink is not None else None
+        return fused_entropy_confidence(q_rows, self._stacked_tables, thinking)
 
     def set_source(self, name: str) -> None:
         source = ConfidenceSource(name)
