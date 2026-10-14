@@ -1,6 +1,10 @@
 """GPU check: the fused chain verify (GDNAttnBackend._tree_fused_target_verify + the replayed
 commit) against the varlen recurrent verify kernel, static and compact layouts.
 
+Compact: q/k/v arrive dense (as from the conv path) with large finite junk in the pad slots,
+and the persistent a/b staging buffers start full of junk, so a pad leaking into a real row or
+into the committed state shows up as an error.
+
 Per case: outputs of every real token, and the committed SSM state of every request after
 accepting a random prefix (reference: the recurrent kernel's per-step intermediate state).
 Two layers, so the once-per-verify tree build (ordinal 0) is reused by the second.
@@ -26,6 +30,10 @@ def backend():
     be.req_to_token_pool = types.SimpleNamespace(mamba_map={i: i for i in range(L)})
     be.verify_intermediate_state_indices = torch.arange(MAX_BS, device="cuda")
     be.tree_stash, be._chain_parents = None, None
+    be._gather_key = be._gather_idx = None
+    g = torch.Generator(device="cuda").manual_seed(123)
+    junk = lambda: torch.randn(MAX_BS * T + 1, H, generator=g, device="cuda").bfloat16() * 50  # noqa: E731
+    be._dense_bufs = {"a": junk(), "b": junk()}
     return be
 
 
@@ -48,11 +56,24 @@ def case(lens, extra_pad, compact, seed):
     for l in range(L):
         layer = types.SimpleNamespace(layer_id=l, num_v_heads=H, head_v_dim=V, num_k_heads=HG, head_k_dim=K,
                                       A_log=rnd(H, sc=0.5), dt_bias=rnd(H, sc=0.5))
-        q, k = rnd(1, seq, HG, K).bfloat16(), rnd(1, seq, HG, K).bfloat16()
-        v = rnd(1, seq, H, V).bfloat16()
         a, b = rnd(seq, H).bfloat16(), rnd(seq, H).bfloat16()
-        out = be._tree_fused_target_verify(layer=layer, batch_size=bs, draft_token_num=T, query=q, key=k, value=v,
-                                           a=a, b=b, ssm_states=pool[l], cache_indices=slots, dense_token_indices=idx)
+        if compact:  # dense q/k/v with junk pads; the packed real tokens are their dense slots
+            n = bs * T
+            qd, kd = rnd(1, n, HG, K, sc=20.0).bfloat16(), rnd(1, n, HG, K, sc=20.0).bfloat16()
+            vd = rnd(1, n, H, V, sc=20.0).bfloat16()
+            real = idx[:n_real]
+            for t, s in ((qd, 1.0), (kd, 1.0), (vd, 1.0)):
+                t[0, real] = rnd(n_real, *t.shape[2:], sc=s).bfloat16()
+            q, k, v = qd[:, real], kd[:, real], vd[:, real]
+            out = be._tree_fused_target_verify(layer=layer, batch_size=bs, draft_token_num=T, query=qd, key=kd,
+                                               value=vd, a=a, b=b, ssm_states=pool[l], cache_indices=slots,
+                                               dense_token_indices=idx)
+        else:
+            q, k = rnd(1, seq, HG, K).bfloat16(), rnd(1, seq, HG, K).bfloat16()
+            v = rnd(1, seq, H, V).bfloat16()
+            out = be._tree_fused_target_verify(layer=layer, batch_size=bs, draft_token_num=T, query=q, key=k,
+                                               value=v, a=a, b=b, ssm_states=pool[l], cache_indices=slots,
+                                               dense_token_indices=None)
         # Reference: varlen recurrent verify over the real tokens, per-step states kept.
         inter = torch.zeros(MAX_BS, T, H, V, K, device="cuda")
         ref = fused_sigmoid_gating_delta_rule_update(
@@ -71,6 +92,7 @@ def case(lens, extra_pad, compact, seed):
     advance_ssm_states_along_accept_paths(st["k"], st["v"], st["g"], st["beta"], pool, slots, st["anc"],
                                           accept, st["k"].shape[2], HG, K, V)
     worst_s = float((pool - ref_committed).abs().max() / ref_committed.abs().max())
+    assert all(bool(torch.isfinite(b).all()) for b in be._dense_bufs.values()), "a staging buffer went non-finite"
     untouched = [s for s in range(POOL) if s not in set(slots.tolist())]
     assert torch.equal(pool[:, untouched], pool0[:, untouched]), "commit wrote a slot outside the batch"
     return worst_o, worst_s

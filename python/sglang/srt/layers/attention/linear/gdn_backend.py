@@ -9,8 +9,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
-from sglang.srt.environ import envs
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
 from sglang.srt.layers.attention.linear.kda_backend import (
     ragged_verify_dense_scatter_indices,
 )
@@ -513,6 +514,11 @@ class GDNKernelDispatcher:
         )
 
 
+# Fused compact verify stages tokens in persistent dense buffers whose pad slots keep
+# stale values: they must stay finite, or 0 * NaN in the solve would reach real rows.
+_DENSE_PAD_FINITE = Invariant("gdn.fused_verify.dense_pad_finite", Bucket.GUARD, IsTrue())
+
+
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
@@ -557,6 +563,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         self.tree_stash = None
         self._chain_parents: Optional[torch.Tensor] = None
+        # Compact + fused: dense [bs, T] staging reused by every GDN layer and step. Pad
+        # slots keep stale finite values; they only follow a request's real tokens, so
+        # no real row and no committed state ever reads them.
+        self._dense_bufs: dict = {}
+        self._gather_key: Optional[torch.Tensor] = None
+        self._gather_idx: Optional[torch.Tensor] = None
+
+    def _dense_buf(self, name: str, rows: int, cols: int, like: torch.Tensor, width: int) -> torch.Tensor:
+        """[rows, cols] view of a persistent zero-initialised buffer (largest verify batch + ghost row)."""
+        buf = self._dense_bufs.get(name)
+        if buf is None or buf.shape[1] != cols:
+            cap = self.verify_intermediate_state_indices.numel() * width + 1
+            buf = torch.zeros(cap, cols, dtype=like.dtype, device=like.device)
+            self._dense_bufs[name] = buf
+        assert rows <= buf.shape[0], (rows, buf.shape)
+        return buf[:rows]
 
     def _tree_fused_target_verify(
         self,
@@ -575,9 +597,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         """Chain verify with the fused tree kernels on the dense [bs, T] layout. Writes
         no SSM state: each layer stashes its raw (k, v, b) and g, and the commit
-        replays the accepted prefix. Compact verify scatters its packed tokens to the
-        dense slots (zero pads, which only ever follow a request's real tokens, so no
-        real row has a pad ancestor) and gathers the real rows back."""
+        replays the accepted prefix. Under compact verify q/k/v arrive dense from the
+        conv path, a/b are scattered to the dense slots (pads only ever follow a
+        request's real tokens, so no real row has a pad ancestor) and the real rows
+        are gathered back."""
         from sglang.kernels.ops.attention.fla.gdn_tree_verify import (
             alloc_tree_structure_buffers,
             build_tree_ancestor_masks,
@@ -616,18 +639,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 (torch.arange(T, device=query.device) - 1).clamp(min=0).expand(rows, T).contiguous()
             )
         if dense_token_indices is not None:
+            # q/k/v come dense from the conv path; only the gate inputs are packed.
             n = bs * T
-
-            def to_dense(x: torch.Tensor) -> torch.Tensor:
-                d = x.new_zeros(n + 1, x.shape[-1])
-                d.index_copy_(0, dense_token_indices, x)
-                return d[:n]
-
-            query = to_dense(query.reshape(-1, Hg * K))
-            key = to_dense(key.reshape(-1, Hg * K))
-            value = to_dense(value.reshape(-1, H * V))
-            a = to_dense(a.reshape(-1, H))
-            b = to_dense(b.reshape(-1, H))
+            a_d = self._dense_buf("a", n + 1, H, a, T)
+            a_d.index_copy_(0, dense_token_indices, a.reshape(-1, H))
+            b_d = self._dense_buf("b", n + 1, H, b, T)
+            b_d.index_copy_(0, dense_token_indices, b.reshape(-1, H))
+            a, b = a_d[:n], b_d[:n]
+            if resolve_level() >= InvariantCheckLevel.WARN and not torch.cuda.is_current_stream_capturing():
+                for name, buf in self._dense_bufs.items():
+                    expect(_DENSE_PAD_FINITE, torch.isfinite(buf).all(-1), msg=name)
         if ordinal == 0:
             # Once per verify, shared by every GDN layer (recorded in the graph).
             parents = self._chain_parents[:bs]
@@ -662,8 +683,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         o = o.reshape(bs * T, H, V)
         if dense_token_indices is not None:
-            # Ghost row (zeros) for graph-padding tokens past the real ones.
-            o = torch.cat([o, o.new_zeros(1, H, V)])[dense_token_indices]
+            if self._gather_key is not dense_token_indices:
+                # Once per forward (the indices object is shared by every GDN layer):
+                # graph-padding tokens map to the ghost slot; read row n-1 instead, finite
+                # and discarded downstream.
+                self._gather_key = dense_token_indices
+                self._gather_idx = dense_token_indices.clamp(max=bs * T - 1)
+            o = o[self._gather_idx]
         return o.unsqueeze(0)
 
     def init_forward_metadata_out_graph(
@@ -1095,6 +1121,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             draft_token_num = forward_batch.spec_info.draft_token_num
             dense_token_indices = None
+            fused_dense = (
+                self.tree_fused_verify
+                and retrieve_parent_token is None
+                and not use_replayssm_fold
+                and not use_replayssm_spec
+            )
             if forward_batch.spec_info.ragged_verify_layout is None:
                 batch_size = seq_len // draft_token_num
                 mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
@@ -1117,7 +1149,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         draft_token_num=draft_token_num,
                     )
                     forward_metadata.ragged_dense_token_indices = dense_token_indices
-                dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+                if fused_dense:
+                    dense = self._dense_buf(
+                        "qkv", num_dense_tokens + 1, mixed_qkv.shape[-1], mixed_qkv, draft_token_num
+                    )
+                else:
+                    dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
                 dense.index_copy_(0, dense_token_indices, mixed_qkv)
                 mixed_qkv_dense = dense[:num_dense_tokens].view(
                     batch_size, draft_token_num, -1
@@ -1139,7 +1176,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
                 batch_size * draft_token_num, -1
             )
-            if dense_token_indices is None:
+            if dense_token_indices is None or fused_dense:
+                # The fused verify reads q/k/v in the dense layout: no gather back.
                 mixed_qkv = mixed_qkv_flat
             else:
                 # Ghost row (zeros) so uncovered tier-leftover tokens gather finite values.
