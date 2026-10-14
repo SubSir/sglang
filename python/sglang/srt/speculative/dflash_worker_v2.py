@@ -2984,15 +2984,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         runs = []
         for _ in range(2):
             batch.seq_lens_cpu, batch.seq_lens_sum = host_lens, host_sum
-            out = self._run_full_verify(
-                batch=batch,
-                verify_input=verify_input,
-                draft_input=draft_input,
-                sampling_info=sampling_info,
-                seq_lens_cpu_backup=seq_lens_cpu_backup,
-                seq_lens_sum_backup=seq_lens_sum_backup,
+            forward_batch, graph_planned = verify_input.prepare_for_verify(
+                batch, self.target_worker
             )
-            runs.append(out.logits_output.next_token_logits.float().clone())
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+            # A compact server captures only ragged tiers; replaying one with a full-width
+            # batch reads the wrong layout, so the shadow full verify always runs eager.
+            if graph_planned:
+                self.target_worker.model_runner.attn_backend.init_forward_metadata(
+                    forward_batch
+                )
+            forward_batch.can_run_decode_cuda_graph = False
+            out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
+            logits = out.logits_output.next_token_logits
+            if sampling_info is not None:
+                apply_dflash_verify_logits_adjustments(
+                    next_token_logits=logits,
+                    sampling_info=sampling_info,
+                    draft_token_num=int(self.block_size),
+                )
+            runs.append(logits.float().clone())
         return runs
 
     def _run_full_verify(
