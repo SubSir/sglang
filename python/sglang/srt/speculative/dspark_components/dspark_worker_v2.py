@@ -631,7 +631,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "entropy confidence needs the draft logits; the greedy folded "
                     "proposal does not keep them (set SGLANG_DSPARK_FOLDED_PROPOSAL=0)."
                 )
-            entropy = entropy_from_logits(corrected, proposal.draft_block.temperatures)
+            entropy = self._draft_entropy(corrected, proposal.draft_block.temperatures)
             return (
                 selector.entropy_confidence(
                     entropy=entropy, req_pool_indices=req_pool_indices
@@ -639,6 +639,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 entropy,
             )
         return proposal.confidence, None
+
+    @staticmethod
+    def _draft_entropy(logits: torch.Tensor, temperatures: Optional[torch.Tensor]) -> torch.Tensor:
+        """Full-vocab draft entropy: one fused pass on CUDA (the torch path is log_softmax + exp + mul + sum)."""
+        if (
+            logits.is_cuda
+            and envs.SGLANG_SPEC_FUSED_CONFIDENCE.get()
+            and logits.stride(-1) == 1
+            and logits.stride(0) == logits.shape[1] * logits.stride(1)
+        ):
+            from sglang.kernels.ops.speculative.spec_confidence_triton import logits_entropy
+
+            return logits_entropy(logits, temperatures)
+        return entropy_from_logits(logits, temperatures)
 
     @staticmethod
     def _require_draft_logits(proposal) -> torch.Tensor:

@@ -115,3 +115,59 @@ def fused_entropy_confidence(
         BE=triton.next_power_of_2(E),
     )
     return ent, conf
+
+
+@triton.jit
+def _logits_entropy_kernel(
+    x_ptr,
+    stride_row,
+    temp_ptr,
+    out_ptr,
+    V,
+    GAMMA: tl.constexpr,
+    HAS_TEMP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per (request, slot) row; one pass over the vocab with an online max:
+    # H = m + log(Z) - S / Z, Z = sum exp(x - m), S = sum exp(x - m) * x, x = logits / T.
+    row = tl.program_id(0)
+    inv_t = 1.0
+    if HAS_TEMP:
+        inv_t = 1.0 / tl.maximum(tl.load(temp_ptr + row // GAMMA).to(tl.float32), 1e-5)
+    base = x_ptr + row.to(tl.int64) * stride_row
+    m = -float("inf")
+    z = 0.0
+    sx = 0.0
+    for start in range(0, V, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        x = tl.load(base + offs, mask=offs < V, other=-float("inf")).to(tl.float32) * inv_t
+        m_new = tl.maximum(m, tl.max(x, axis=0))
+        scale = tl.exp(m - m_new)
+        e = tl.where(offs < V, tl.exp(x - m_new), 0.0)
+        z = z * scale + tl.sum(e, axis=0)
+        sx = sx * scale + tl.sum(e * tl.where(offs < V, x, 0.0), axis=0)
+        m = m_new
+    tl.store(out_ptr + row, m + tl.log(z) - sx / z)
+
+
+def logits_entropy(logits: torch.Tensor, temperatures: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Entropy of softmax(logits / T) per row in one launch; logits [bs, gamma, vocab] (last dim contiguous),
+    temperatures [bs] or None. Same quantity as spec_confidence.entropy_from_logits, fp32."""
+    bs, gamma, vocab = logits.shape
+    assert logits.stride(-1) == 1 and logits.stride(0) == gamma * logits.stride(1)
+    out = torch.empty((bs, gamma), dtype=torch.float32, device=logits.device)
+    if bs * gamma == 0:
+        return out
+    _logits_entropy_kernel[(bs * gamma,)](
+        logits,
+        logits.stride(1),
+        temperatures if temperatures is not None else out,
+        out,
+        vocab,
+        GAMMA=gamma,
+        HAS_TEMP=temperatures is not None,
+        BLOCK=4096,
+        num_warps=8,
+    )
+    return out
+
