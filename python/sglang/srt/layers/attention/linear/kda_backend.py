@@ -1111,12 +1111,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
             # Conv update and its per-step scratch want the dense
-            # [bs, draft_token_num] layout: scatter ragged tokens to their
-            # step slots, gather back after (pad steps are never committed).
-            # Uncovered tier-leftover tokens land in the ghost row (see
-            # ragged_verify_dense_scatter_indices); their values are pad
-            # garbage, discarded downstream (ghost collisions are
-            # value-irrelevant).
+            # [bs, draft_token_num] layout. The Triton conv reads the packed
+            # tokens itself (pad slots computed from zeros) and writes dense;
+            # pad steps are never committed. Uncovered tier-leftover tokens map
+            # to the ghost index (see ragged_verify_dense_scatter_indices).
             batch_size = query_start_loc.shape[0] - 1
             num_dense_tokens = batch_size * draft_token_num
             dense_token_indices = ragged_verify_dense_scatter_indices(
@@ -1124,17 +1122,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 seq_len=seq_len,
                 draft_token_num=draft_token_num,
             )
-            dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
-            dense.index_copy_(0, dense_token_indices, mixed_qkv)
-            mixed_qkv_dense = dense[:num_dense_tokens].view(
-                batch_size, draft_token_num, -1
-            )
+            if is_npu() or is_cpu():
+                dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+                dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                mixed_qkv_dense = dense[:num_dense_tokens].view(
+                    batch_size, draft_token_num, -1
+                )
+            else:
+                mixed_qkv_dense = None
 
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
-        mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
+        conv_packed = mixed_qkv_dense is None
         mixed_qkv_processed = causal_conv1d_update(
-            mixed_qkv_reshaped,
+            mixed_qkv if conv_packed else mixed_qkv_dense.transpose(1, 2),
             conv_states.transpose(-1, -2),
             layer.conv_weights,
             layer.bias,
@@ -1145,6 +1146,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
+            **(
+                dict(query_start_loc=query_start_loc, max_seqlen=draft_token_num)
+                if conv_packed
+                else {}
+            ),
         )
         mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
             batch_size * draft_token_num, -1
@@ -1152,12 +1158,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if dense_token_indices is None:
             mixed_qkv = mixed_qkv_flat
         else:
-            # Ghost row (zeros) so uncovered tail tokens gather finite values.
-            padded_flat = mixed_qkv_flat.new_zeros(
-                batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
-            )
-            padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
-            mixed_qkv = padded_flat[dense_token_indices]
+            # Uncovered tail tokens (ghost index) read the last dense row: finite values
+            # for rows the capped qsl skips and the output zeroes below.
+            mixed_qkv = mixed_qkv_flat[dense_token_indices.clamp(max=num_dense_tokens - 1)]
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
