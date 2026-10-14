@@ -409,6 +409,34 @@ class TestFixedVerifyLen(CustomTestCase):
         )
         self.assertEqual(budget, 5 * (3 - 1))
 
+    def test_fixed_len_needs_no_confidence(self):
+        """With a pinned length the worker skips the confidence kernels: lens and
+        budget must come out without confidence, a budget or a relayed value."""
+        p = self._planner()
+        p.set_fixed_verify_len(8)
+        req = torch.arange(4)
+        lens = p._schedule_verify_lens(
+            req_pool_indices=req, prefix_lens=torch.zeros(4), device="cpu", confidence=None, budget=None
+        )
+        self.assertEqual(lens.tolist(), [8] * 4)
+        self.assertEqual(p._budget_from_resolved(resolved=None, req_pool_indices_cpu=req), 4 * 7)
+        p.set_fixed_verify_len(None)
+        self.assertIsNone(p._budget_from_resolved(resolved=None, req_pool_indices_cpu=req))
+
+    def test_worker_skips_confidence_under_fixed_len(self):
+        w = object.__new__(DFlashWorkerV2)
+        w._confidence_selector = object()  # would raise if the entropy path ran
+        w._step_trace = types.SimpleNamespace(enabled=False)
+        w._selector_step_q = (torch.zeros(2, 7, 16, dtype=torch.int64), torch.rand(2, 7, 16))
+        w._verify_planner = types.SimpleNamespace(fixed_verify_len=8)
+        self.assertEqual(
+            w._step_confidence(drafted=torch.zeros(2, 7), req_pool_indices=torch.zeros(2, dtype=torch.long)),
+            (None, None),
+        )
+        w._step_trace = types.SimpleNamespace(enabled=True)  # the trace still records the entropy
+        with self.assertRaises(AttributeError):
+            w._step_confidence(drafted=torch.zeros(2, 7), req_pool_indices=torch.zeros(2, dtype=torch.long))
+
     def test_fixed_len_bounds(self):
         p = self._planner()
         for bad in (0, 9):

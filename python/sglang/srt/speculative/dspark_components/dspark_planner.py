@@ -395,9 +395,17 @@ class DSparkVerifyPlanner:
     ) -> Optional[int]:
         """Per-step verify-token budget: under overlap it was precomputed into
         the draft input by prepare_verify_budget; otherwise compute it now."""
-        if not self.schedules_verify_budget or confidence is None:
+        if not self.schedules_verify_budget:
+            return None
+        # A pinned verify length needs no confidence: the worker skips computing it.
+        if confidence is None and self._fixed_verify_len is None:
             return None
         if not get_schedule().disable_overlap_schedule:
+            return draft_input.verify_token_budget
+        if self._fixed_verify_len is not None:
+            draft_input.verify_token_budget = self._fixed_budget(
+                num_reqs=int(req_pool_indices.shape[0])
+            )
             return draft_input.verify_token_budget
 
         # No collective: the budget derives only from the broadcast draft tokens
@@ -420,11 +428,11 @@ class DSparkVerifyPlanner:
         resolved: Optional[ResolvedConfidence],
         req_pool_indices_cpu: torch.Tensor,
     ) -> Optional[int]:
+        if self._fixed_verify_len is not None:
+            return self._fixed_budget(num_reqs=int(req_pool_indices_cpu.shape[0]))
         if resolved is None:
             self._budget_planner.note_non_decode_step()
             return None
-        if self._fixed_verify_len is not None:
-            return self._fixed_budget(num_reqs=int(req_pool_indices_cpu.shape[0]))
         current_generation = self.model_runner.req_to_token_pool.req_generation[
             req_pool_indices_cpu.to(torch.int64)
         ]
@@ -608,7 +616,7 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or confidence is None or budget is None:
+        if self._budget_planner is None:
             return None
         if self._fixed_verify_len is not None:
             return torch.full(
@@ -617,6 +625,8 @@ class DSparkVerifyPlanner:
                 dtype=torch.int32,
                 device=device,
             )
+        if confidence is None or budget is None:
+            return None
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
