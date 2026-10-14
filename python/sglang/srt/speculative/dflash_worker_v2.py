@@ -3135,6 +3135,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         needs_q = self._step_trace.enabled or selector is not None
         if not needs_q or self._selector_step_q is None:
             return None, None
+        # A pinned verify length (the fixed-k arms) uses no confidence; skip its kernels
+        # unless the step trace records the entropy.
+        if (
+            self._verify_planner is not None
+            and self._verify_planner.fixed_verify_len is not None
+            and not self._step_trace.enabled
+        ):
+            return None, None
         candidate_ids, q_rows = self._selector_step_q
         draft_entropy = entropy_from_probs(q_rows)
         if self._verify_planner is None:
