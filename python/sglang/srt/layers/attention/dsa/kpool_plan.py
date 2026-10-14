@@ -782,6 +782,64 @@ def update_kpool_write_plan(
             plan.pool_schedule_metadata.copy_(new_schedule)
 
 
+def alloc_ragged_kpool_write_plan(
+    *, num_slots: int, num_draft_tokens: int, pool_size: int, device: torch.device
+) -> KPoolWritePlan:
+    """Per-request write plan of a ragged (packed) target verify: no per-q outputs, since the
+    packed rows read pooled lengths like decode rows; effective_n carries each request's verify len."""
+    return _alloc_kpool_write_plan_buffers(
+        max_bs=num_slots,
+        num_draft_tokens=num_draft_tokens,
+        pool_size=pool_size,
+        device=device,
+        is_verify=False,
+        is_v2=True,
+    )
+
+
+def fill_ragged_kpool_write_plan(
+    plan: KPoolWritePlan,
+    *,
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    verify_lens: torch.Tensor,
+    real_page_rows: torch.Tensor,
+    pool_size: int,
+    slots_per_page: int,
+) -> None:
+    """Torch twin of _update_kpool_write_plan_kernel's per-request outputs, reading request b's
+    real page row from real_page_rows[b] instead of the padded table's row b * N."""
+    ws = write_start.to(torch.int32)
+    base_pool = ws // pool_size
+    pool_id = base_pool[:, None] + torch.arange(
+        plan.write_loc.shape[1], device=ws.device, dtype=torch.int32
+    )
+    token_page_row = ((pool_id // slots_per_page) * pool_size).clamp_(
+        0, real_page_rows.shape[1] - 1
+    )
+    packed_page = torch.gather(real_page_rows, 1, token_page_row.long()).to(torch.int64)
+    plan.req.copy_(req_pool_indices.to(torch.int64))
+    plan.write_start.copy_(ws)
+    plan.tail_logical_start.copy_(base_pool * pool_size)
+    plan.write_loc.copy_(packed_page * slots_per_page + (pool_id % slots_per_page))
+    plan.effective_n_per_batch.copy_(verify_lens.to(torch.int32))
+
+
+def ragged_kpool_padded_rows(
+    *, qo_indptr: torch.Tensor, num_rows: int, num_draft_tokens: int
+) -> torch.Tensor:
+    """int64 [num_rows]: packed verify row -> b * N + j in the per-request padded layout the
+    tail-write kernel reads; graph-padding rows -> the dump row num_slots * N."""
+    num_slots = qo_indptr.shape[0] - 1
+    rows = torch.arange(num_rows, device=qo_indptr.device, dtype=torch.int32)
+    qo = qo_indptr.to(torch.int32)
+    req = torch.searchsorted(qo[1:].contiguous(), rows, right=True).clamp_(
+        max=max(num_slots - 1, 0)
+    )
+    padded = req.to(torch.int64) * num_draft_tokens + (rows - qo[req]).to(torch.int64)
+    return torch.where(rows < qo[-1], padded, num_slots * num_draft_tokens)
+
+
 def init_kpool_write_plan(
     metadata: DSAMetadata,
     forward_batch: ForwardBatch,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -69,6 +69,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
+    alloc_ragged_kpool_write_plan,
+    fill_ragged_kpool_write_plan,
+    init_pooled_paged_mqa_metadata,
+    ragged_kpool_padded_rows,
+    update_pooled_paged_mqa_metadata,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
@@ -284,6 +289,9 @@ class DSAMetadata:
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
+    # Ragged target verify with index_kpool > 1: packed row -> b * N + j of the padded layout the
+    # tail-write kernel reads (see ragged_kpool_padded_rows); None on every other path.
+    kpool_ragged_padded_rows: Optional[torch.Tensor] = None
 
 
 @torch.compile
@@ -1393,19 +1401,19 @@ class DeepseekSparseAttnBackend(
         )
 
     def _check_ragged_verify_supported(self) -> None:
-        # The ragged rows refresh dsa_seqlens_expanded / real_page_table / the schedule only, not the
-        # wide page_table_1, which only the unfused top-k transform reads.
+        # Without kpool the ragged rows leave the wide page_table_1 stale, which only the unfused
+        # top-k transform reads; with kpool they refresh it for the PAGED fused mapping.
         if not (
             envs.SGLANG_DSA_FUSE_TOPK.get()
             and self.dsa_topk_backend.should_use_topk_v2()
-            and self.dsa_index_kpool <= 1
             and self.dsa_decode_impl == "trtllm"
             and not is_cp_active()
+            and (self.dsa_index_kpool <= 1 or self.real_page_size == 64)
         ):
             raise NotImplementedError(
-                "DSA compact (ragged) verify needs the trtllm decode impl, fused top-k v2, "
-                f"index_kpool 1 and no CP (got decode impl {self.dsa_decode_impl}, "
-                f"kpool {self.dsa_index_kpool})."
+                "DSA compact (ragged) verify needs the trtllm decode impl, fused top-k v2, no CP, "
+                f"and page size 64 under kpool (got decode impl {self.dsa_decode_impl}, "
+                f"kpool {self.dsa_index_kpool}, page {self.real_page_size})."
             )
 
     def _ragged_real_page_rows(self, req_rows: torch.Tensor, cols: int) -> torch.Tensor:
@@ -1439,7 +1447,7 @@ class DeepseekSparseAttnBackend(
         )
         ctx_lens_2d = kv.view(-1, 1).clone()
         cols = (width + self.real_page_size - 1) // self.real_page_size
-        return DSAMetadata(
+        metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=kv.clone(),
             max_seq_len_q=1,
@@ -1460,6 +1468,75 @@ class DeepseekSparseAttnBackend(
             ),
             paged_mqa_ctx_lens_2d=ctx_lens_2d,
             topk_v2_plan=self._build_topk_v2_plan(kv),
+        )
+        if self.dsa_index_kpool <= 1:
+            return metadata
+        if page_table_1 is None:  # eager: size the token table to this batch
+            page_table_1 = torch.empty(
+                (num_rows, int(kv.max().item())), dtype=torch.int32, device=self.device
+            )
+        metadata = init_pooled_paged_mqa_metadata(
+            replace(metadata, page_table_1=page_table_1),
+            kv,
+            ForwardMode.DECODE,  # packed rows read the pooled index exactly like decode rows
+            pool_size=self.dsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=self._kpool_slots_per_page(),
+            build_schedule_metadata=self._build_kpool_paged_mqa_schedule_metadata(),
+        )
+        metadata = replace(
+            metadata,
+            kpool_write_plan=alloc_ragged_kpool_write_plan(
+                num_slots=layout.qo_indptr_device.shape[0] - 1,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                pool_size=self.dsa_index_kpool,
+                device=self.device,
+            ),
+            kpool_ragged_padded_rows=torch.empty(
+                num_rows, dtype=torch.int64, device=self.device
+            ),
+        )
+        self._refill_ragged_kpool(
+            metadata,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            layout=layout,
+            req_rows=req_rows,
+        )
+        return metadata
+
+    def _refill_ragged_kpool(
+        self,
+        metadata: DSAMetadata,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layout,
+        req_rows: torch.Tensor,
+    ) -> None:
+        """kpool pieces of a ragged verify: the per-row token table for the PAGED top-k mapping,
+        the per-request tail-write plan, and the packed -> padded row map for the tail write."""
+        page_table_1 = metadata.page_table_1
+        page_table_1.copy_(self.req_to_token[req_rows.long(), : page_table_1.shape[1]])
+        qo = layout.qo_indptr_device
+        num_slots = qo.shape[0] - 1
+        fill_ragged_kpool_write_plan(
+            metadata.kpool_write_plan,
+            write_start=seq_lens[:num_slots],
+            req_pool_indices=req_pool_indices[:num_slots],
+            verify_lens=qo[1:] - qo[:-1],
+            real_page_rows=self._ragged_real_page_rows(
+                req_pool_indices[:num_slots], metadata.real_page_table.shape[1]
+            ),
+            pool_size=self.dsa_index_kpool,
+            slots_per_page=self._kpool_slots_per_page(),
+        )
+        metadata.kpool_ragged_padded_rows.copy_(
+            ragged_kpool_padded_rows(
+                qo_indptr=qo,
+                num_rows=metadata.kpool_ragged_padded_rows.shape[0],
+                num_draft_tokens=self.speculative_num_draft_tokens,
+            )
         )
 
     def _refill_ragged_verify_metadata(
@@ -1491,6 +1568,23 @@ class DeepseekSparseAttnBackend(
         metadata.paged_mqa_ctx_lens_2d.copy_(kv.view(-1, 1))
         self._refresh_paged_mqa_schedule_metadata(metadata, metadata.paged_mqa_ctx_lens_2d)
         self._refresh_topk_v2_plan(metadata)
+        if self.dsa_index_kpool > 1:
+            update_pooled_paged_mqa_metadata(
+                metadata,
+                kv,
+                ForwardMode.DECODE,
+                pool_size=self.dsa_index_kpool,
+                real_page_size=self.real_page_size,
+                slots_per_page=self._kpool_slots_per_page(),
+                build_schedule_metadata=self._build_kpool_paged_mqa_schedule_metadata(),
+            )
+            self._refill_ragged_kpool(
+                metadata,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                layout=layout,
+                req_rows=req_rows,
+            )
 
     def _build_forward_metadata_cuda_graph(
         self,

@@ -63,6 +63,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+def _scatter_ragged_rows(
+    rows: torch.Tensor, padded_rows: torch.Tensor, num_padded: int
+) -> torch.Tensor:
+    """Packed [R, ...] -> zero-filled padded [num_padded, ...]; graph-padding rows land on a
+    dump row past the end, and a zero out_cache_loc makes the kernel skip an empty request."""
+    out = rows.new_zeros((num_padded + 1, *rows.shape[1:]))
+    out[padded_rows] = rows[: padded_rows.shape[0]]
+    return out[:num_padded]
+
+
 def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
     return envs.SGLANG_DSA_FUSE_TOPK.get() and not getattr(
         metadata, "force_unfused_topk", False
@@ -1457,13 +1467,23 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        padded_rows = metadata.attn_metadata.kpool_ragged_padded_rows
 
         def _compress_write() -> None:
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
+            write_key, write_loc = key, forward_batch.out_cache_loc
+            if padded_rows is not None:
+                # Ragged verify packs requests; the tail-write kernel reads b * N + j rows.
+                num_padded = plan.req.shape[0] * num_draft_tokens
+                write_key, score, write_loc = (
+                    _scatter_ragged_rows(t, padded_rows, num_padded)
+                    for t in (key, score, write_loc)
+                )
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=write_key,
+                score=score,
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
@@ -1471,7 +1491,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_start=plan.write_start,
                 tail_logical_start=plan.tail_logical_start,
                 write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=write_loc,
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
