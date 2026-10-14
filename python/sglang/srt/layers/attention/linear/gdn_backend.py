@@ -570,6 +570,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             envs.SGLANG_ENABLE_GDN_FUSED_VERIFY.get() and not model_runner.is_draft_worker
         )
         self.tree_stash = None
+        self.packed_fused_verify = envs.SGLANG_GDN_PACKED_VERIFY.get()
         self._chain_parents: Optional[torch.Tensor] = None
         # Compact + fused: dense [bs, T] staging reused by every GDN layer and step. Pad
         # slots keep stale finite values; they only follow a request's real tokens, so
@@ -602,13 +603,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         dense_token_indices: Optional[torch.Tensor],
+        query_start_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Chain verify with the fused tree kernels on the dense [bs, T] layout. Writes
         no SSM state: each layer stashes its raw (k, v, b) and g, and the commit
         replays the accepted prefix. Under compact verify q/k/v arrive dense from the
         conv path, a/b are scattered to the dense slots (pads only ever follow a
         request's real tokens, so no real row has a pad ancestor) and the real rows
-        are gathered back."""
+        are written packed by the kernel (gathered back with SGLANG_GDN_PACKED_VERIFY=0)."""
         from sglang.kernels.ops.attention.fla.gdn_tree_verify import (
             alloc_tree_structure_buffers,
             build_tree_ancestor_masks,
@@ -646,7 +648,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._chain_parents = (
                 (torch.arange(T, device=query.device) - 1).clamp(min=0).expand(rows, T).contiguous()
             )
-        if dense_token_indices is not None:
+        packed = self.packed_fused_verify
+        if dense_token_indices is not None and not packed:
             # q/k/v come dense from the conv path; only the gate inputs are packed.
             n = bs * T
             a_d = self._dense_buf("a", n + 1, H, a, T)
@@ -662,33 +665,44 @@ class GDNAttnBackend(MambaAttnBackendBase):
             parents = self._chain_parents[:bs]
             st["tree"] = build_tree_structure_into(parents, st["struct"])
             build_tree_ancestor_masks(parents, T, out=st["anc"])
-        g, _ = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        st["g"][ordinal, :bs].copy_(g.view(bs, T, H))
-        # Raw b: the commit takes sigmoid in fp32 (fused_gdn_gating rounds beta).
-        st["beta"][ordinal, :bs].copy_(b.reshape(bs, T, H))
+        if not packed:
+            g, _ = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            st["g"][ordinal, :bs].copy_(g.view(bs, T, H))
+            # Raw b: the commit takes sigmoid in fp32 (fused_gdn_gating rounds beta).
+            st["beta"][ordinal, :bs].copy_(b.reshape(bs, T, H))
         # Raw q/k: the kernels l2-normalize in fp32, as the recurrent verify does.
         q = query.reshape(bs, T, Hg, K).contiguous()
         k = st["k"][ordinal, :bs].view(bs, T, Hg, K)
         k.copy_(key.reshape(bs, T, Hg, K))
         v = st["v"][ordinal, :bs].view(bs, T, H, V)
         v.copy_(value.reshape(bs, T, H, V))
+        # Packed: k0 reads a/b where they are (packed rows under compact verify) and writes
+        # the commit's g and raw b itself.
+        packed_out = dense_token_indices is not None and packed
         o = tree_gdn_triton_verify(
             layer.A_log,
-            a.reshape(bs, T, H).contiguous(),
+            a.reshape(-1, H) if packed else a.reshape(bs, T, H).contiguous(),
             layer.dt_bias,
             1.0,
             20.0,
             q,
             k,
             v,
-            b.reshape(bs, T, H).contiguous(),
+            b.reshape(-1, H) if packed else b.reshape(bs, T, H).contiguous(),
             ssm_states,
             cache_indices[:bs].long(),
             st["tree"],
             scale=K**-0.5,
             use_qk_l2norm_in_kernel=True,
             precision="tf32",
+            out_query_start_loc=query_start_loc if packed_out else None,
+            out_num_tokens=dense_token_indices.shape[0] if packed_out else None,
+            in_query_start_loc=query_start_loc if packed_out else None,
+            g_stash=st["g"][ordinal, :bs] if packed else None,
+            b_stash=st["beta"][ordinal, :bs] if packed else None,
         )
+        if packed_out:
+            return o.unsqueeze(0)
         o = o.reshape(bs * T, H, V)
         if dense_token_indices is not None:
             if self._gather_key is not dense_token_indices:
@@ -1223,23 +1237,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         draft_token_num=draft_token_num,
                     )
                     forward_metadata.ragged_dense_token_indices = dense_token_indices
-                if fused_dense:
-                    dense = self._dense_buf(
-                        "qkv", num_dense_tokens + 1, mixed_qkv.shape[-1], mixed_qkv, draft_token_num
-                    )
+                if fused_dense and self.packed_fused_verify:
+                    # The conv reads the packed tokens itself and writes the dense layout.
+                    mixed_qkv_dense = None
                 else:
-                    dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
-                dense.index_copy_(0, dense_token_indices, mixed_qkv)
-                mixed_qkv_dense = dense[:num_dense_tokens].view(
-                    batch_size, draft_token_num, -1
-                )
-            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
+                    if fused_dense:
+                        dense = self._dense_buf(
+                            "qkv", num_dense_tokens + 1, mixed_qkv.shape[-1], mixed_qkv, draft_token_num
+                        )
+                    else:
+                        dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+                    dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                    mixed_qkv_dense = dense[:num_dense_tokens].view(
+                        batch_size, draft_token_num, -1
+                    )
+            conv_kwargs = dict(
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
@@ -1247,6 +1259,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
+            if mixed_qkv_dense is None:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    query_start_loc=query_start_loc,
+                    max_seqlen=draft_token_num,
+                    **conv_kwargs,
+                )
+            else:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_dense.transpose(1, 2),
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    **conv_kwargs,
+                )
             mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
                 batch_size * draft_token_num, -1
             )
@@ -1349,6 +1381,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
                     dense_token_indices=dense_token_indices,
+                    query_start_loc=query_start_loc,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which

@@ -141,12 +141,15 @@ def _dot(a, b, precision: tl.constexpr, bf16_operands: tl.constexpr):
 def _k0_scalars_kernel(
     a_ptr, b_ptr, A_log_ptr, dt_bias_ptr, p_ptr,
     prefix_ptr, beta_ptr,
+    in_qsl_ptr, g_stash_ptr, b_stash_ptr,
     T, HV: tl.constexpr, sp_beta, sp_thr,
-    stride_a_n, stride_a_t,
+    stride_a_n, stride_a_t, stride_b_n, stride_b_t,
     stride_p_n,
     stride_s_n, stride_s_t,
+    stride_gs_n, stride_gs_t,
     NB: tl.constexpr, BT: tl.constexpr, BH: tl.constexpr,
     BF16_K0: tl.constexpr,
+    IN_PACKED: tl.constexpr = False, STASH: tl.constexpr = False,
 ):
     # prefix = P @ g for ALL heads at once: one [BT,BT]@[BT,BH] dot per
     # t-chunk (P is per-sequence — loading it per head wastes 48x traffic).
@@ -159,6 +162,14 @@ def _k0_scalars_kernel(
     m_h = hv < HV
     A_log = tl.load(A_log_ptr + hv, mask=m_h, other=0.0).to(tl.float32)
     dtb = tl.load(dt_bias_ptr + hv, mask=m_h, other=0.0).to(tl.float32)
+    if IN_PACKED:
+        # a/b rows of sequence i_n start at packed token in_qsl[i_n]; pad rows read as zeros.
+        a_start = tl.load(in_qsl_ptr + i_n).to(tl.int64)
+        a_len = tl.load(in_qsl_ptr + i_n + 1).to(tl.int64) - a_start
+        a_base, b_base = a_start * stride_a_t, a_start * stride_b_t
+    else:
+        a_len = T
+        a_base, b_base = i_n * stride_a_n, i_n * stride_b_n
 
     acc = tl.zeros((BT, BH), dtype=tl.float32)
     for tb in tl.static_range(NB):
@@ -169,21 +180,27 @@ def _k0_scalars_kernel(
             mask=m_r[:, None] & m_t[None, :], other=0,
         ).to(tl.float32)
         a_tile = tl.load(
-            a_ptr + i_n * stride_a_n + tcols[:, None] * stride_a_t + hv[None, :],
-            mask=m_t[:, None] & m_h[None, :], other=0.0,
+            a_ptr + a_base + tcols[:, None] * stride_a_t + hv[None, :],
+            mask=(m_t & (tcols < a_len))[:, None] & m_h[None, :], other=0.0,
         ).to(tl.float32)
         g_tile = tl.where(
             m_t[:, None] & m_h[None, :],
             _gate(a_tile, A_log[None, :], dtb[None, :], sp_beta, sp_thr), 0.0,
         )
+        if STASH:
+            if i_rb == 0:  # the commit's g for every slot, written once per (sequence, head chunk)
+                tl.store(g_stash_ptr + i_n * stride_gs_n + tcols[:, None] * stride_gs_t + hv[None, :],
+                         g_tile, mask=m_t[:, None] & m_h[None, :])
         acc += _dot(p_tile, g_tile, "tf32x3", BF16_K0)
 
     b_v = tl.load(
-        b_ptr + i_n * stride_a_n + rows[:, None] * stride_a_t + hv[None, :],
-        mask=m_r[:, None] & m_h[None, :], other=0.0,
+        b_ptr + b_base + rows[:, None] * stride_b_t + hv[None, :],
+        mask=(m_r & (rows < a_len))[:, None] & m_h[None, :], other=0.0,
     ).to(tl.float32)
     beta = 1.0 / (1.0 + tl.exp(-b_v))
     m_rh = m_r[:, None] & m_h[None, :]
+    if STASH:  # raw b: the commit takes the sigmoid itself
+        tl.store(b_stash_ptr + i_n * stride_gs_n + rows[:, None] * stride_gs_t + hv[None, :], b_v, mask=m_rh)
     tl.store(prefix_ptr + i_n * stride_s_n + rows[:, None] * stride_s_t + hv[None, :], acc, mask=m_rh)
     tl.store(beta_ptr + i_n * stride_s_n + rows[:, None] * stride_s_t + hv[None, :], beta, mask=m_rh)
 
@@ -363,7 +380,7 @@ def _k2_solve_kernel(
 def _k3_out_kernel(
     q_ptr, prefix_ptr,
     QKD_ptr, U_ptr, h0_ptr, h0_idx_ptr,
-    O_ptr,
+    O_ptr, out_qsl_ptr,
     T, scale,
     H: tl.constexpr, HV: tl.constexpr,
     stride_q_n, stride_q_t, stride_q_h,
@@ -376,6 +393,7 @@ def _k3_out_kernel(
     BV: tl.constexpr, V: tl.constexpr, BT: tl.constexpr,
     PREC: tl.constexpr,
     BF16_STATE: tl.constexpr, BF16_READOUT: tl.constexpr,
+    OUT_PACKED: tl.constexpr = False,
 ):
     i_t, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -418,11 +436,21 @@ def _k3_out_kernel(
         )
         acc += _dot(qkd, u_blk, PREC, BF16_READOUT)
 
-    tl.store(
-        O_ptr + i_n * stride_o_n + rows[:, None] * stride_o_t + i_hv * stride_o_h + offs_v[None, :],
-        acc.to(O_ptr.dtype.element_ty),
-        mask=m_r[:, None] & m_v[None, :],
-    )
+    if OUT_PACKED:
+        # Row t of sequence i_n goes to packed token out_qsl[i_n] + t; rows past its length are pads.
+        o_start = tl.load(out_qsl_ptr + i_n).to(tl.int64)
+        o_len = tl.load(out_qsl_ptr + i_n + 1).to(tl.int64) - o_start
+        tl.store(
+            O_ptr + (o_start + rows[:, None]) * stride_o_t + i_hv * stride_o_h + offs_v[None, :],
+            acc.to(O_ptr.dtype.element_ty),
+            mask=(m_r & (rows < o_len))[:, None] & m_v[None, :],
+        )
+    else:
+        tl.store(
+            O_ptr + i_n * stride_o_n + rows[:, None] * stride_o_t + i_hv * stride_o_h + offs_v[None, :],
+            acc.to(O_ptr.dtype.element_ty),
+            mask=m_r[:, None] & m_v[None, :],
+        )
 
 
 def tree_gdn_triton_verify(
@@ -442,10 +470,22 @@ def tree_gdn_triton_verify(
     use_qk_l2norm_in_kernel: bool = False,
     precision: str = "ieee",
     bf16_mode: str | None = None,
+    out_query_start_loc: torch.Tensor | None = None,
+    out_num_tokens: int | None = None,
+    in_query_start_loc: torch.Tensor | None = None,
+    g_stash: torch.Tensor | None = None,
+    b_stash: torch.Tensor | None = None,
 ):
     """Same contract as gdn_tree_fused.tree_gdn_fused_verify. precision:
     "ieee" = fp32-exact dots (validation); "tf32" = tensor cores (serving,
-    ~2e-4 abs vs ieee — below bf16 input noise)."""
+    ~2e-4 abs vs ieee — below bf16 input noise). With out_query_start_loc the
+    output is packed [out_num_tokens, HV, V]: sequence i's first len_i rows land
+    at out_query_start_loc[i]; it is a workspace reused by the next call, and
+    rows no sequence covers (graph padding) hold zeros or an earlier call's
+    finite values. a/b may be [B, T, HV] or flat [B * T, HV] rows (any row
+    stride); with in_query_start_loc they are packed [num_tokens, HV] like the
+    output. g_stash/b_stash ([B, T, HV] fp32 views) receive the gate and the raw
+    b of every slot for the commit's replay."""
     if bf16_mode is None:
         bf16_mode = os.environ.get("SGLANG_GDN_TREE_BF16_OPERANDS", "none")
     assert initial_state_source.stride(0) == v.shape[2] * v.shape[3] * q.shape[3], (
@@ -482,16 +522,34 @@ def tree_gdn_triton_verify(
     QKD = _ws(("QKD", B * HV, NBT, dev), lambda: torch.empty(B * HV, NBT, NBT, device=dev, dtype=torch.float32))
     Ainv = _ws(("Ainv", B * HV, NB, dev), lambda: torch.empty(B * HV, NB, BT, BT, device=dev, dtype=torch.float32))
     U = torch.empty(B * HV, NBT, V, device=dev, dtype=torch.float32)
-    O = torch.empty(B, T, HV, V, device=dev, dtype=v.dtype)
+    if out_query_start_loc is None:
+        O = torch.empty(B, T, HV, V, device=dev, dtype=v.dtype)
+    else:
+        O = _ws(
+            ("O_packed", out_num_tokens, HV, V, v.dtype, dev),
+            lambda: torch.zeros(out_num_tokens, HV, V, device=dev, dtype=v.dtype),
+        )
     tile_t, n_tiles = _tri_tiles(NB, dev)
 
+    assert a.stride(-1) == 1 and b.stride(-1) == 1 and a.dim() == b.dim()
+    if a.dim() == 2:  # flat rows: sequence i_n starts at row i_n * T, or at in_query_start_loc[i_n]
+        ab_strides = (T * a.stride(0), a.stride(0), T * b.stride(0), b.stride(0))
+    else:
+        ab_strides = (a.stride(0), a.stride(1), b.stride(0), b.stride(1))
+    stash = g_stash is not None
+    if stash:
+        assert b_stash is not None and b_stash.stride() == g_stash.stride() and g_stash.stride(-1) == 1
     _k0_scalars_kernel[(B, NB, NHC)](
         a, b, A_log, dt_bias, p_u8, prefix, beta,
+        in_query_start_loc if in_query_start_loc is not None else a,
+        g_stash if stash else prefix, b_stash if stash else prefix,
         T, HV, softplus_beta, softplus_threshold,
-        a.stride(0), a.stride(1),
+        *ab_strides,
         p_u8.stride(0),
         prefix.stride(0), prefix.stride(1),
+        g_stash.stride(0) if stash else 0, g_stash.stride(1) if stash else 0,
         NB=NB, BT=BT, BH=BH, BF16_K0=bf16_k0,
+        IN_PACKED=in_query_start_loc is not None, STASH=stash,
         num_warps=4,
     )
     _k1_gram_kernel[(n_tiles, B * H)](
@@ -528,16 +586,19 @@ def tree_gdn_triton_verify(
     _k3_out_kernel[(NB, NV, B * HV)](
         q, prefix, QKD, U,
         initial_state_source, initial_state_indices, O,
+        out_query_start_loc if out_query_start_loc is not None else O,
         T, scale, H, HV,
         q.stride(0), q.stride(1), q.stride(2),
         prefix.stride(0), prefix.stride(1),
         QKD.stride(0), QKD.stride(1),
         U.stride(0), U.stride(1),
-        O.stride(0), O.stride(1), O.stride(2),
+        O.stride(0) if out_query_start_loc is None else 0,
+        *((O.stride(1), O.stride(2)) if out_query_start_loc is None else (O.stride(0), O.stride(1))),
         USE_L2NORM=use_qk_l2norm_in_kernel,
         USE_H0=initial_state_source is not None,
         NB=NB, BK=BK, K=K, BV=BV, V=V, BT=BT, PREC=precision,
         BF16_STATE=bf16_state, BF16_READOUT=bf16_readout,
+        OUT_PACKED=out_query_start_loc is not None,
         num_warps=4,
     )
 
