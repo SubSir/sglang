@@ -529,6 +529,9 @@ class Envs:
     # ===================================================================
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
+    # Test only: per-request verify len = hash(req_pool_index, step) over [floor, width], so every
+    # batch mixes lens reproducibly; greedy output must still equal static verify.
+    SGLANG_DSPARK_DEBUG_HASH_VERIFY_LENS = EnvBool(False)
     # Log cumulative verify-len histograms every N planned steps; 0 = off.
     SGLANG_DSPARK_VERIFY_LENS_STATS_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())

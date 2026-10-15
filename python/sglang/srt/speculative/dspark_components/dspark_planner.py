@@ -93,6 +93,8 @@ class DSparkVerifyPlanner:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._tp_sync = tp_sync
         self._lens_stats_interval = envs.SGLANG_DSPARK_VERIFY_LENS_STATS_INTERVAL.get()
+        self._debug_hash_lens = envs.SGLANG_DSPARK_DEBUG_HASH_VERIFY_LENS.get()
+        self._debug_hash_step = 0
         # [2, width + 1] int64 on device: per-request len hist, bs-weighted max-len hist.
         self._lens_stats: Optional[torch.Tensor] = None
         self._lens_stats_steps = 0
@@ -435,6 +437,10 @@ class DSparkVerifyPlanner:
     ) -> Optional[int]:
         if self._fixed_verify_len is not None:
             return self._fixed_budget(num_reqs=int(req_pool_indices_cpu.shape[0]))
+        if self._debug_hash_lens:  # full-width budget: the graph tier must fit any hashed lens
+            floor = max(self._schedule_cfg.min_verify_len, 1)
+            width = self._schedule_cfg.resolved_max_verify_len()
+            return int(req_pool_indices_cpu.shape[0]) * (width - floor)
         if resolved is None:
             self._budget_planner.note_non_decode_step()
             return None
@@ -632,6 +638,8 @@ class DSparkVerifyPlanner:
                 dtype=torch.int32,
                 device=device,
             )
+        if self._debug_hash_lens:
+            return self._debug_hashed_verify_lens(req_pool_indices=req_pool_indices, device=device)
         if confidence is None or budget is None:
             return None
         verify_lens = ScheduleVerifyLensTopk.execute(
@@ -660,6 +668,16 @@ class DSparkVerifyPlanner:
             )
 
         return verify_lens
+
+    def _debug_hashed_verify_lens(
+        self, *, req_pool_indices: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        # Same inputs on every TP rank (pool indices, step count), so the lens agree without a sync.
+        self._debug_hash_step += 1
+        floor = max(self._schedule_cfg.min_verify_len, 1)
+        width = self._schedule_cfg.resolved_max_verify_len()
+        mix = req_pool_indices.to(torch.int64) * 2654435761 + self._debug_hash_step * 40503
+        return (floor + (mix % 1000003) % (width - floor + 1)).to(device=device, dtype=torch.int32)
 
     def _accumulate_lens_stats(self, verify_lens: torch.Tensor) -> None:
         # Device-side only; the single host read is the periodic log line.
