@@ -1517,11 +1517,17 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         layout,
         req_rows: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         """kpool pieces of a ragged verify: the per-row token table for the PAGED top-k mapping,
         the per-request tail-write plan, and the packed -> padded row map for the tail write."""
         page_table_1 = metadata.page_table_1
-        page_table_1.copy_(self.req_to_token[req_rows.long(), : page_table_1.shape[1]])
+        # A row only maps top-k slots below its own kv length, so columns past the batch's longest
+        # kv are never read; the host bound skips copying the graph table's full width.
+        cols = page_table_1.shape[1]
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            cols = min(cols, int(seq_lens_cpu.max()) + 2 * self.speculative_num_draft_tokens)
+        page_table_1[:, :cols].copy_(self.req_to_token[req_rows.long(), :cols])
         qo = layout.qo_indptr_device
         num_real = min(qo.shape[0] - 1, req_pool_indices.shape[0], seq_lens.shape[0])
         fill_ragged_kpool_write_plan(
@@ -1550,6 +1556,7 @@ class DeepseekSparseAttnBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         layout,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Replay-prep (out of graph): rewrite the per-row tensors of a captured ragged-verify tier."""
         kv, req_rows = _ragged_verify_rows(
@@ -1588,6 +1595,7 @@ class DeepseekSparseAttnBackend(
                 seq_lens=seq_lens,
                 layout=layout,
                 req_rows=req_rows,
+                seq_lens_cpu=seq_lens_cpu,
             )
 
     def _build_forward_metadata_cuda_graph(
@@ -1809,6 +1817,7 @@ class DeepseekSparseAttnBackend(
                     req_pool_indices=req_pool_indices,
                     seq_lens=seq_lens,
                     layout=ragged_layout,
+                    seq_lens_cpu=seq_lens_cpu,
                 )
             self.forward_metadata = metadata
             return
