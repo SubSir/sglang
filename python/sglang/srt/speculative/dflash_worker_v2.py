@@ -228,6 +228,8 @@ class _VerifyOut(msgspec.Struct):
     can_run_cuda_graph: bool
     routed_experts_output: object = None
     indexer_topk_output: object = None
+    # Strided greedy argmax ids when compact verify skipped the full-vocab logits.
+    target_predict: object = None
 
 
 def _commit_accept(candidates, accept_len, bonus_tokens):
@@ -624,6 +626,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._init_dynamic_verify()
+
+    def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
+        """An all-greedy batch whose verify logits feed nothing but the argmax."""
+        if (
+            self._selector_sample is not None
+            or batch.has_grammar
+            or batch.return_logprob
+        ):
+            return False
+        if sampling_info is None:
+            return True
+        penalizer = sampling_info.penalizer_orchestrator
+        return (
+            sampling_info.is_all_greedy
+            and not sampling_info.has_custom_logit_processor
+            and (penalizer is None or not penalizer.is_required)
+            and sampling_info.grammar_mask is None
+            and sampling_info.logit_bias is None
+            and sampling_info.sampling_mask_batch_indices is None
+        )
 
     def _init_dynamic_verify(self) -> None:
         """Batch-shared ragged verify, reusing DSpark's planner and target-verify
@@ -2270,13 +2292,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
     ):
         """Returns (correct drafts, commit lens, bonus, out tokens, new seq lens or
         None, cap-trim lens or None). With a cutoff, a request accepts at most
         verify_len - 1 drafts and its bonus comes from the last verified row."""
         new_seq_lens = None
-        target_predict = None
         cap_trim_lens = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
@@ -2298,6 +2320,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_logits=next_token_logits,
                 verify_num_draft_tokens=int(self.block_size),
                 cutoff_verify_lens=cutoff_verify_lens,
+                target_predict=target_predict,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, bonus)
@@ -3017,6 +3040,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            target_predict=target_out.target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
         return self._finish_verify_step(
@@ -3120,10 +3144,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             device=self.device,
             sampling_info=sampling_info,
             verify_window=verify_window,
+            # Greedy, no grammar/logprob/sampling-mask/trace consumer: ids only, no
+            # [bs * block, vocab] strided logits.
+            greedy_predict_only=(
+                self._can_skip_verify_logits(batch, sampling_info)
+                and not self._step_trace.enabled
+            ),
         )
         return _VerifyOut(
             logits_output=target_verify.logits_output,
             can_run_cuda_graph=target_verify.can_run_cuda_graph,
+            target_predict=target_verify.target_predict,
         )
 
     def _step_confidence(

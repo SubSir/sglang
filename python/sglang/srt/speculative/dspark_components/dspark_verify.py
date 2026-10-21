@@ -77,6 +77,9 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    # Strided [bs * stride] greedy argmax ids when run_compact(greedy_predict_only=True)
+    # skipped the full-vocab strided logits (next_token_logits is then None).
+    target_predict: object = None
 
 
 def candidate_request_length_bound(
@@ -441,7 +444,11 @@ class TargetVerifyExecutor:
         sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
+        greedy_predict_only: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
+        """``greedy_predict_only``: an all-greedy batch with no logits consumer; argmax
+        runs on the packed rows and only the token ids are scattered to [bs * stride]
+        (returned as target_predict; next_token_logits is None)."""
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
             layout=layout,
@@ -464,6 +471,7 @@ class TargetVerifyExecutor:
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
+        strided_predict = None
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
@@ -475,12 +483,23 @@ class TargetVerifyExecutor:
             hidden_strided = hidden_strided[: bs * stride]
         else:
             compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
+            if greedy_predict_only:
+                # ponytail: TP>1 still gathers the full vocab before this argmax; a
+                # sharded argmax would skip that gather too.
+                strided_predict = ScatterCompactToStrided.execute(
+                    compact=torch.argmax(compact_logits, dim=-1, keepdim=True),
+                    layout=layout,
+                    fill_value=0,  # argmax of the zero-filled logits row
+                    verify_num_draft_tokens=stride,
+                ).view(-1)
+                strided_logits = None
+            else:
+                strided_logits = ScatterCompactToStrided.execute(
+                    compact=compact_logits,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
                 raise RuntimeError(
@@ -492,13 +511,18 @@ class TargetVerifyExecutor:
                 fill_value=0.0,
                 verify_num_draft_tokens=stride,
             )
-        apply_logits_adjustments_strided(
-            next_token_logits=strided_logits,
-            sampling_info=sampling_info,
-            verify_num_draft_tokens=stride,
-        )
+        if strided_logits is not None:
+            apply_logits_adjustments_strided(
+                next_token_logits=strided_logits,
+                sampling_info=sampling_info,
+                verify_num_draft_tokens=stride,
+            )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
+        if strided_predict is not None:
+            target_verify = msgspec.structs.replace(
+                target_verify, target_predict=strided_predict
+            )
         return target_verify, hidden_strided
 
     def _verify_backend_self_adds_seq_lens(self) -> bool:
