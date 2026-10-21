@@ -691,11 +691,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         out = self._dense_buf("chain_o", seq_len, H * V, value, T)
         if st["wy"]:
             # q/k/v are row-strided views of the conv output: let FlashInfer read them in place instead of
-            # copying each to contiguous (read once, at its first import).
-            os.environ.setdefault("SGLANG_GDN_WY_STRIDED_QKV", "1")
-            from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache import (
-                gated_delta_rule_mtp_ucache,
-            )
+            # copying each to contiguous. FlashInfer reads SGLANG_GDN_WY_STRIDED_QKV once at import, and
+            # flashinfer.gdn_kernels is imported long before this point, so set its module flag directly
+            # (still off with SGLANG_GDN_WY_STRIDED_QKV=0).
+            import flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache as fi_wy_ucache
+
+            fi_wy_ucache._STRIDED_QKV = os.environ.get("SGLANG_GDN_WY_STRIDED_QKV", "1") != "0"
+            gated_delta_rule_mtp_ucache = fi_wy_ucache.gated_delta_rule_mtp_ucache
 
             # The kernel runs T in {4, 8}: shorter blocks pad up (the WY cost barely depends on T).
             TW = 4 if T <= 4 else 8
