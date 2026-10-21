@@ -1480,6 +1480,9 @@ class Envs:
     # Dense chain verify via FlashInfer's CuTe WY kernel (bf16 state, T in {4, 8}); it appends the
     # normalized k, u and cumulative gate to a per-slot ring that the closed-form commit reads.
     SGLANG_GDN_WY_VERIFY = EnvBool(False)
+    # Compact WY verify: the conv writes [bs, T] directly (no per-layer q/k/v scatter); pair with
+    # SGLANG_GDN_WY_STRIDED_QKV=1 so FlashInfer reads the strided q/k/v in place.
+    SGLANG_GDN_WY_DENSE_CONV = EnvBool(False)
     # Verify planner confidence for greedy rows from the temperature-1 selector q (not the point mass).
     SGLANG_SPEC_GREEDY_CONF_T1 = EnvBool(False)
     # Test knob: with spec_fixed_verify_len set, cycle these verify lengths over the batch ("1,8").

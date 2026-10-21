@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Union
 
+import os
 import msgspec
 import torch
 
@@ -631,7 +632,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.tree_stash["u_stash"]
                 and envs.SGLANG_GDN_WY_VERIFY.get()
                 and temporal.dtype == torch.bfloat16
-                and T in (4, 8)
+                and T <= 8
             ):
                 # FlashInfer's ring is indexed by state-pool slot: [layers, pool, heads, 16, dim].
                 pool = temporal.shape[1]
@@ -689,44 +690,84 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Persistent output: rows no request covers (graph padding) stay finite.
         out = self._dense_buf("chain_o", seq_len, H * V, value, T)
         if st["wy"]:
+            # q/k/v are row-strided views of the conv output: let FlashInfer read them in place instead of
+            # copying each to contiguous (read once, at its first import).
+            os.environ.setdefault("SGLANG_GDN_WY_STRIDED_QKV", "1")
             from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache import (
                 gated_delta_rule_mtp_ucache,
             )
 
-            nd = bs * T
+            # The kernel runs T in {4, 8}: shorter blocks pad up (the WY cost barely depends on T).
+            TW = 4 if T <= 4 else 8
+            nd = bs * TW
             ragged = seq_len != nd
+            ab_rows = a.reshape(-1, H).shape[0]
+            if not ragged and ab_rows != nd:
+                # Dense q/k/v from the conv, packed a/b and output (compact verify, wy_dense).
+                if ordinal == 0 or getattr(self, "_wy_dense_idx", None) is None:
+                    self._wy_dense_idx = ragged_verify_dense_scatter_indices(
+                        query_start_loc=query_start_loc, seq_len=ab_rows, draft_token_num=TW
+                    )
+                idx = self._wy_dense_idx
+
+                def dense_ab(name, x):
+                    buf = self._dense_buf("wy_" + name, nd + 1, H, x, TW)
+                    buf.index_copy_(0, idx, x.reshape(ab_rows, H))
+                    return buf[:nd]
+
+                o_full = self._dense_buf("wy_o", nd + 1, H * V, value, TW)
+                gated_delta_rule_mtp_ucache(
+                    A_log=layer.A_log.detach(),
+                    a=dense_ab("a", a).reshape(bs, TW, H),
+                    dt_bias=layer.dt_bias.detach(),
+                    q=query.reshape(bs, TW, Hg, K),
+                    k=key.reshape(bs, TW, Hg, K),
+                    v=value.reshape(bs, TW, H, V),
+                    b=dense_ab("b", b).reshape(bs, TW, H),
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    scale=K**-0.5,
+                    output=o_full[:nd].view(bs, TW, H, V),
+                    k_cache=st["kc"][ordinal],
+                    u_cache=st["uc"][ordinal],
+                    g_cache=st["gc"][ordinal],
+                    hist_len=st["hist"][:bs],
+                )
+                out_p = self._dense_buf("chain_op", ab_rows, H * V, value, TW)
+                torch.index_select(o_full, 0, idx, out=out_p)
+                return out_p.view(1, ab_rows, H, V)
             if ragged:
                 # Compact verify: scatter packed tokens to [bs, T]. The WY cost barely depends on T, pad
                 # rows only feed later (pad) rows, and the commit never reads past the accepted prefix.
                 if ordinal == 0 or getattr(self, "_wy_dense_idx", None) is None:
                     self._wy_dense_idx = ragged_verify_dense_scatter_indices(
-                        query_start_loc=query_start_loc, seq_len=seq_len, draft_token_num=T
+                        query_start_loc=query_start_loc, seq_len=seq_len, draft_token_num=TW
                     )
                 idx = self._wy_dense_idx
 
                 def dense(name, x, cols):
-                    buf = self._dense_buf("wy_" + name, nd + 1, cols, x, T)
+                    buf = self._dense_buf("wy_" + name, nd + 1, cols, x, TW)
                     buf.index_copy_(0, idx, x.reshape(seq_len, cols))
                     return buf[:nd]
 
                 q_d, k_d = dense("q", query, Hg * K), dense("k", key, Hg * K)
                 v_d, a_d, b_d = dense("v", value, H * V), dense("a", a, H), dense("b", b, H)
-                o_full = self._dense_buf("wy_o", nd + 1, H * V, value, T)
+                o_full = self._dense_buf("wy_o", nd + 1, H * V, value, TW)
                 o_d = o_full[:nd]
             else:
                 q_d, k_d, v_d, a_d, b_d, o_d = query, key, value, a, b, out
             gated_delta_rule_mtp_ucache(
                 A_log=layer.A_log.detach(),
-                a=a_d.reshape(bs, T, H),
+                a=a_d.reshape(bs, TW, H),
                 dt_bias=layer.dt_bias.detach(),
-                q=q_d.reshape(bs, T, Hg, K),
-                k=k_d.reshape(bs, T, Hg, K),
-                v=v_d.reshape(bs, T, H, V),
-                b=b_d.reshape(bs, T, H),
+                q=q_d.reshape(bs, TW, Hg, K),
+                k=k_d.reshape(bs, TW, Hg, K),
+                v=v_d.reshape(bs, TW, H, V),
+                b=b_d.reshape(bs, TW, H),
                 initial_state_source=ssm_states,
                 initial_state_indices=cache_indices,
                 scale=K**-0.5,
-                output=o_d.view(bs, T, H, V),
+                output=o_d.view(bs, TW, H, V),
                 k_cache=st["kc"][ordinal],
                 u_cache=st["uc"][ordinal],
                 g_cache=st["gc"][ordinal],
@@ -1371,6 +1412,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and not use_replayssm_spec
             )
             chain_packed = False
+            wy_dense = False
             # getattr: verify inputs without the ragged field are dense.
             if getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None:
                 batch_size = seq_len // draft_token_num
@@ -1382,6 +1424,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 batch_size = query_start_loc.shape[0] - 1
                 num_dense_tokens = batch_size * draft_token_num
                 chain_packed = chain
+                # WY verify reads [bs, T]: let the conv write that layout instead of packed rows.
+                wy_dense = (
+                    chain
+                    and envs.SGLANG_GDN_WY_VERIFY.get()
+                    and envs.SGLANG_GDN_WY_DENSE_CONV.get()
+                    and ssm_states.dtype == torch.bfloat16
+                    and draft_token_num in (4, 8)
+                )
                 # Built at the first GDN layer of every forward, reused by the rest: the
                 # build then sits inside a graph capture (not in a warmup run that
                 # shares the metadata object) and in every eager forward.
@@ -1429,7 +1479,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer.activation,
                     query_start_loc=query_start_loc,
                     max_seqlen=draft_token_num,
-                    out_packed=chain_packed,
+                    out_packed=chain_packed and not wy_dense,
                     **conv_kwargs,
                 )
             else:
@@ -1441,7 +1491,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer.activation,
                     **conv_kwargs,
                 )
-            if chain_packed:
+            if chain_packed and not wy_dense:
                 mixed_qkv_flat = mixed_qkv_processed  # [num_tokens, dim], packed
             else:
                 mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
