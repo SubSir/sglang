@@ -2908,7 +2908,7 @@ def gated_delta_rule_mtp_ucache_varlen(
     cu_seqlens, max_len, k_cache, u_cache, g_cache, hist_len, output, scale=None,
 ):
     """qkv [N, conv_dim] bf16 compact (q | k | v columns, q/k: H heads x K, v: HV heads x V), a/b [N, HV]
-    (compact), cu_seqlens [B + 1] int32 with every length <= max_len (T kernel = 4, 8 or 16), output [N, HV, V]
+    (compact), cu_seqlens [B + 1] int32 with every length <= max_len (T kernel = 4 or 8; FlashInfer's T=16 ucache path only writes 8 ring rows), output [N, HV, V]
     compact. Rows past a request length are neither read nor written. Ring/state contract as the dense kernel."""
     assert qkv.dtype == torch.bfloat16 and qkv.is_contiguous() and qkv.dim() == 2
     HV, V_dim = output.shape[1], output.shape[2]
@@ -2917,8 +2917,8 @@ def gated_delta_rule_mtp_ucache_varlen(
     device = qkv.device
     cu_seqlens = cu_seqlens.to(torch.int32)
     B = initial_state_indices.shape[0]
-    T = 4 if max_len <= 4 else (8 if max_len <= 8 else 16)
-    assert max_len <= 16
+    T = 4 if max_len <= 4 else 8
+    assert max_len <= 8, max_len
     conv_dim = qkv.shape[1]
     if scale is None:
         scale = 1.0 / math.sqrt(K_DIM)
