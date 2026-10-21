@@ -3062,6 +3062,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
         return self._finish_verify_step(
+            candidates=candidates,
             batch=batch,
             draft_input=draft_input,
             on_publish=on_publish,
@@ -3268,6 +3269,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_entropy: Optional[torch.Tensor],
         confidence: Optional[torch.Tensor],
         sampling_info,
+        candidates: torch.Tensor,
     ) -> GenerationBatchResult:
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
