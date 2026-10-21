@@ -910,6 +910,8 @@ class GdnDecodeUCacheKernel:
         if const_expr(self._varlen):
             _row0 = gQsl.iterator[pid_b]
             _n_b = gQsl.iterator[pid_b + 1] - _row0
+            # Graph padding slots carry no tokens: retire the CTA like a pad row (CTA-uniform, before any smem).
+            _exit_cta_if_neg(_n_b - Int32(1))
         else:
             _row0 = Int32(0)
             _n_b = Int32(_ab_rows)  # dense: the a/b rows present
@@ -2220,7 +2222,7 @@ class GdnDecodeUCacheKernel:
         # stale-but-finite — safe: the U GEMM's A (sTmat) has exact-zero
         # cols >= t, so those rows cannot propagate.
         if const_expr(self._varlen):
-            for _zr in cutlass.range_constexpr(8):
+            for _zr in cutlass.range_constexpr(T):
                 if Int32(_zr) >= _n_b:
                     sV.iterator[_zr * V_PADDED + tidx] = io(0.0)
         elif const_expr(self._n_valid < T):
@@ -2906,7 +2908,7 @@ def gated_delta_rule_mtp_ucache_varlen(
     cu_seqlens, max_len, k_cache, u_cache, g_cache, hist_len, output, scale=None,
 ):
     """qkv [N, conv_dim] bf16 compact (q | k | v columns, q/k: H heads x K, v: HV heads x V), a/b [N, HV]
-    (compact), cu_seqlens [B + 1] int32 with every length <= max_len (T kernel = 4 or 8), output [N, HV, V]
+    (compact), cu_seqlens [B + 1] int32 with every length <= max_len (T kernel = 4, 8 or 16), output [N, HV, V]
     compact. Rows past a request length are neither read nor written. Ring/state contract as the dense kernel."""
     assert qkv.dtype == torch.bfloat16 and qkv.is_contiguous() and qkv.dim() == 2
     HV, V_dim = output.shape[1], output.shape[2]
@@ -2915,8 +2917,8 @@ def gated_delta_rule_mtp_ucache_varlen(
     device = qkv.device
     cu_seqlens = cu_seqlens.to(torch.int32)
     B = initial_state_indices.shape[0]
-    T = 4 if max_len <= 4 else 8
-    assert max_len <= 8
+    T = 4 if max_len <= 4 else (8 if max_len <= 8 else 16)
+    assert max_len <= 16
     conv_dim = qkv.shape[1]
     if scale is None:
         scale = 1.0 / math.sqrt(K_DIM)

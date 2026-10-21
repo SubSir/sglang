@@ -676,6 +676,10 @@ def _causal_conv1d_update_kernel(
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
+    if IS_VARLEN_X and OUT_PACKED:
+        # Packed in and out: a slot with no tokens (graph padding) has nothing to read or write.
+        if tl.load(query_start_loc_ptr + idx_seq + 1) == tl.load(query_start_loc_ptr + idx_seq):
+            return
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
