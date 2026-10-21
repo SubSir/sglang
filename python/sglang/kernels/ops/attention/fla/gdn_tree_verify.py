@@ -754,6 +754,7 @@ def tree_verify_state_advance_kernel(
     HAS_TRACK: tl.constexpr,
     RECURRENT_STASH: tl.constexpr = False,
     U_STASH: tl.constexpr = False,
+    BTC: tl.constexpr = 16,
 ):
     """Commit SSM states after verification by replaying the delta rule along
     each request's accept path (root -> last correct draft).
@@ -829,11 +830,34 @@ def tree_verify_state_advance_kernel(
     b_acc = tl.zeros((BK, BV), dtype=tl.float32)
     b_dec = tl.full((), 1.0, tl.float32)
     if U_STASH:
-        n_u = T
+        if HAS_TRACK:
+            n_u = T
+        else:
+            n_u = 0
         n_seq = 0
     else:
         n_u = 0
         n_seq = T
+    if U_STASH and not HAS_TRACK:
+        # All accepted tokens at once: w_i = prod_{j>i, j on path} alpha_j, acc = K^T diag(w) U.
+        o_t = tl.arange(0, BTC)
+        word0 = tl.sum(tl.where(o_w == 0, path_words, 0))
+        on_t = (((word0 >> o_t) & 1) != 0) & (o_t < T)
+        g_t = tl.load(g_stash + i_l * stride_gl + i_n * T * H + o_t * H + i_hv, mask=on_t, other=0.0).to(tl.float32)
+        G_t = tl.cumsum(g_t, 0)
+        G_L = tl.sum(g_t, 0)
+        w_t = tl.where(on_t, tl.exp(G_L - G_t), 0.0)
+        Kt = tl.load(
+            k_stash + i_l * stride_kl + i_n * T * Hg * K + i_h * K + o_t[:, None] * (Hg * K) + o_k[None, :],
+            mask=on_t[:, None] & mask_k[None, :], other=0.0,
+        )
+        Ut = tl.load(
+            v_stash + i_l * stride_vl + i_n * T * H * V + i_hv * V + o_t[:, None] * (H * V) + o_v[None, :],
+            mask=on_t[:, None] & mask_v[None, :], other=0.0,
+        ).to(tl.float32)
+        Uw = (Ut * w_t[:, None]).to(Kt.dtype)
+        b_acc = tl.dot(tl.trans(Kt), Uw)
+        b_dec = tl.exp(G_L)
     for t in range(0, n_u):
         word = tl.sum(tl.where(o_w == (t // 64), path_words, 0))
         on_path = ((word >> (t % 64)) & 1) != 0
@@ -958,7 +982,8 @@ def advance_ssm_states_along_accept_paths(
         HAS_TRACK=track_steps is not None,
         RECURRENT_STASH=recurrent_stash,
         U_STASH=u_stash,
-        num_warps=1,
+        BTC=max(16, triton.next_power_of_2(T)),
+        num_warps=4 if (u_stash and track_steps is None) else 1,
         num_stages=2,
     )
 
