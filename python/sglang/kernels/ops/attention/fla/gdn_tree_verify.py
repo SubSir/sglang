@@ -830,15 +830,12 @@ def tree_verify_state_advance_kernel(
     b_acc = tl.zeros((BK, BV), dtype=tl.float32)
     b_dec = tl.full((), 1.0, tl.float32)
     if U_STASH:
-        if HAS_TRACK:
-            n_u = T
-        else:
-            n_u = 0
+        n_u = 0
         n_seq = 0
     else:
         n_u = 0
         n_seq = T
-    if U_STASH and not HAS_TRACK:
+    if U_STASH:
         # All accepted tokens at once: w_i = prod_{j>i, j on path} alpha_j, acc = K^T diag(w) U.
         o_t = tl.arange(0, BTC)
         word0 = tl.sum(tl.where(o_w == 0, path_words, 0))
@@ -858,6 +855,23 @@ def tree_verify_state_advance_kernel(
         Uw = (Ut * w_t[:, None]).to(Kt.dtype)
         b_acc = tl.dot(tl.trans(Kt), Uw)
         b_dec = tl.exp(G_L)
+        if HAS_TRACK:
+            # Snapshot after track_step (only if it is on the accept path): same sum truncated there.
+            tr_on = (track_step >= 0) & (track_step < T) & (((word0 >> track_step) & 1) != 0)
+            if tr_on:
+                on_tr = on_t & (o_t <= track_step)
+                G_tr = tl.sum(tl.where(on_tr, g_t, 0.0), 0)
+                w_tr = tl.where(on_tr, tl.exp(G_tr - G_t), 0.0)
+                acc_tr = tl.dot(tl.trans(Kt), (Ut * w_tr[:, None]).to(Kt.dtype))
+                p_track = (
+                    ssm_states
+                    + i_l * stride_sl
+                    + track_slot * H * K * V
+                    + i_hv * K * V
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                tl.store(p_track, (tl.exp(G_tr) * b_h + acc_tr).to(p_track.dtype.element_ty), mask=mask_h)
     for t in range(0, n_u):
         word = tl.sum(tl.where(o_w == (t // 64), path_words, 0))
         on_path = ((word >> (t % 64)) & 1) != 0
@@ -983,7 +997,7 @@ def advance_ssm_states_along_accept_paths(
         RECURRENT_STASH=recurrent_stash,
         U_STASH=u_stash,
         BTC=max(16, triton.next_power_of_2(T)),
-        num_warps=4 if (u_stash and track_steps is None) else 1,
+        num_warps=4 if u_stash else 1,
         num_stages=2,
     )
 
