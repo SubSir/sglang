@@ -1480,6 +1480,8 @@ class Envs:
     # Dense chain verify via FlashInfer's CuTe WY kernel (bf16 state, T in {4, 8}); it appends the
     # normalized k, u and cumulative gate to a per-slot ring that the closed-form commit reads.
     SGLANG_GDN_WY_VERIFY = EnvBool(False)
+    # Verify planner confidence for greedy rows from the temperature-1 selector q (not the point mass).
+    SGLANG_SPEC_GREEDY_CONF_T1 = EnvBool(False)
     # Test knob: with spec_fixed_verify_len set, cycle these verify lengths over the batch ("1,8").
     SGLANG_SPEC_FIXED_VERIFY_PATTERN = EnvStr("")
     # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).

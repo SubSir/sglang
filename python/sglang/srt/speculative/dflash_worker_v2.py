@@ -331,6 +331,14 @@ class _SelectorDraftSampler:
             temperatures=self.temperatures[:bs],
             greedy_mask=self.greedy_mask[:bs],
         )
+        if envs.SGLANG_SPEC_GREEDY_CONF_T1.get():
+            # Same as the eager walk: greedy rows hand the planner the T=1 q along the walked path.
+            path = (candidate_ids == tokens.view(bs, -1, 1)).int().argmax(dim=-1)
+            sc = scores.float()
+            first = torch.softmax(sc[:, 0, 0], dim=-1)
+            rows = sc[:, 1:].gather(2, path[:, :-1, None, None].expand(-1, -1, 1, sc.shape[-1]))[:, :, 0]
+            t1 = torch.cat((first.unsqueeze(1), torch.softmax(rows, dim=-1)), dim=1).to(q_rows.dtype)
+            q_rows = torch.where(self.greedy_mask[:bs].view(-1, 1, 1), t1, q_rows)
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
@@ -1612,7 +1620,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
-        self._selector_step_q = (candidate_ids, q_rows)
+        q_conf = q_rows
+        if envs.SGLANG_SPEC_GREEDY_CONF_T1.get():
+            # Path index of each drafted token among its K candidates, then the T=1 softmax row the
+            # walk took (step 0 from the root row, step t from the row of the token at t - 1).
+            path = (candidate_ids == tokens.view(bs, num_pred, 1)).int().argmax(dim=-1)
+            s = scores.float()
+            first = torch.softmax(s[:, 0, 0], dim=-1)
+            rows = s[:, 1:].gather(2, path[:, :-1, None, None].expand(-1, -1, 1, s.shape[-1]))[:, :, 0]
+            t1 = torch.cat((first.unsqueeze(1), torch.softmax(rows, dim=-1)), dim=1).to(q_rows.dtype)
+            q_conf = torch.where(greedy_mask.view(-1, 1, 1), t1, q_rows)
+        self._selector_step_q = (candidate_ids, q_conf)
         return tokens.view(bs, num_pred)
 
     def _selector_sampling_accept(
