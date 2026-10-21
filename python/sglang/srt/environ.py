@@ -1477,6 +1477,9 @@ class Envs:
     # Chain verify stashes u_t = beta*(v - decayed_state @ k) and the normalized k, so the commit is
     # S_L = prod(alpha) * S_0 + acc_L with acc_t = alpha_t * acc_{t-1} + k_t u_t^T (no per-step S @ k).
     SGLANG_GDN_CHAIN_UCOMMIT = EnvBool(True)
+    # Dense chain verify via FlashInfer's CuTe WY kernel (bf16 state, T in {4, 8}); it appends the
+    # normalized k, u and cumulative gate to a per-slot ring that the closed-form commit reads.
+    SGLANG_GDN_WY_VERIFY = EnvBool(False)
     # Test knob: with spec_fixed_verify_len set, cycle these verify lengths over the batch ("1,8").
     SGLANG_SPEC_FIXED_VERIFY_PATTERN = EnvStr("")
     # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).

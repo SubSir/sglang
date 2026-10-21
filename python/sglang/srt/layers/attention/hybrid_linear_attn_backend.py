@@ -1603,10 +1603,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
             Hg, K, V = st["dims"]
             has_track = mamba_track_indices is not None
+            wy = st.get("wy", False)
             advance_ssm_states_along_accept_paths(
-                st["k"],
-                st["v"],
-                st["g"],
+                st["kc"] if wy else st["k"],
+                st["uc"] if wy else st["v"],
+                st["gc"] if wy else st["g"],
                 st["beta"],
                 mamba_caches.temporal,
                 state_indices_tensor,
@@ -1620,6 +1621,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 track_slots=mamba_track_indices if has_track else None,
                 recurrent_stash=st.get("recurrent", False),
                 u_stash=st.get("u_stash", False),
+                ring=wy,
             )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,

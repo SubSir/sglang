@@ -755,6 +755,8 @@ def tree_verify_state_advance_kernel(
     RECURRENT_STASH: tl.constexpr = False,
     U_STASH: tl.constexpr = False,
     BTC: tl.constexpr = 16,
+    RING: tl.constexpr = False,
+    RW: tl.constexpr = 16,
 ):
     """Commit SSM states after verification by replaying the delta rule along
     each request's accept path (root -> last correct draft).
@@ -840,18 +842,32 @@ def tree_verify_state_advance_kernel(
         o_t = tl.arange(0, BTC)
         word0 = tl.sum(tl.where(o_w == 0, path_words, 0))
         on_t = (((word0 >> o_t) & 1) != 0) & (o_t < T)
-        g_t = tl.load(g_stash + i_l * stride_gl + i_n * T * H + o_t * H + i_hv, mask=on_t, other=0.0).to(tl.float32)
-        G_t = tl.cumsum(g_t, 0)
-        G_L = tl.sum(g_t, 0)
+        if RING:
+            # FlashInfer WY ring of the pool slot: [pool, Hg, RW, K] k, [pool, H, RW, V] u and the
+            # cumulative gate [pool, H, RW] from 0 at the first verify token.
+            G_t = tl.load(g_stash + i_l * stride_gl + slot * H * RW + i_hv * RW + o_t, mask=on_t, other=0.0)
+            G_L = tl.sum(tl.where(o_t == leaf, G_t, 0.0), 0)
+            Kt = tl.load(
+                k_stash + i_l * stride_kl + slot * Hg * RW * K + i_h * RW * K + o_t[:, None] * K + o_k[None, :],
+                mask=on_t[:, None] & mask_k[None, :], other=0.0,
+            )
+            Ut = tl.load(
+                v_stash + i_l * stride_vl + slot * H * RW * V + i_hv * RW * V + o_t[:, None] * V + o_v[None, :],
+                mask=on_t[:, None] & mask_v[None, :], other=0.0,
+            ).to(tl.float32)
+        else:
+            g_t = tl.load(g_stash + i_l * stride_gl + i_n * T * H + o_t * H + i_hv, mask=on_t, other=0.0).to(tl.float32)
+            G_t = tl.cumsum(g_t, 0)
+            G_L = tl.sum(g_t, 0)
+            Kt = tl.load(
+                k_stash + i_l * stride_kl + i_n * T * Hg * K + i_h * K + o_t[:, None] * (Hg * K) + o_k[None, :],
+                mask=on_t[:, None] & mask_k[None, :], other=0.0,
+            )
+            Ut = tl.load(
+                v_stash + i_l * stride_vl + i_n * T * H * V + i_hv * V + o_t[:, None] * (H * V) + o_v[None, :],
+                mask=on_t[:, None] & mask_v[None, :], other=0.0,
+            ).to(tl.float32)
         w_t = tl.where(on_t, tl.exp(G_L - G_t), 0.0)
-        Kt = tl.load(
-            k_stash + i_l * stride_kl + i_n * T * Hg * K + i_h * K + o_t[:, None] * (Hg * K) + o_k[None, :],
-            mask=on_t[:, None] & mask_k[None, :], other=0.0,
-        )
-        Ut = tl.load(
-            v_stash + i_l * stride_vl + i_n * T * H * V + i_hv * V + o_t[:, None] * (H * V) + o_v[None, :],
-            mask=on_t[:, None] & mask_v[None, :], other=0.0,
-        ).to(tl.float32)
         Uw = (Ut * w_t[:, None]).to(Kt.dtype)
         b_acc = tl.dot(tl.trans(Kt), Uw)
         b_dec = tl.exp(G_L)
@@ -860,7 +876,10 @@ def tree_verify_state_advance_kernel(
             tr_on = (track_step >= 0) & (track_step < T) & (((word0 >> track_step) & 1) != 0)
             if tr_on:
                 on_tr = on_t & (o_t <= track_step)
-                G_tr = tl.sum(tl.where(on_tr, g_t, 0.0), 0)
+                if RING:
+                    G_tr = tl.sum(tl.where(o_t == track_step, G_t, 0.0), 0)
+                else:
+                    G_tr = tl.sum(tl.where(on_tr, g_t, 0.0), 0)
                 w_tr = tl.where(on_tr, tl.exp(G_tr - G_t), 0.0)
                 acc_tr = tl.dot(tl.trans(Kt), (Ut * w_tr[:, None]).to(Kt.dtype))
                 p_track = (
@@ -949,6 +968,7 @@ def advance_ssm_states_along_accept_paths(
     track_slots: torch.Tensor = None,
     recurrent_stash: bool = False,
     u_stash: bool = False,
+    ring: bool = False,
 ):
     """Advance pooled SSM states along each request's accept path.
 
@@ -997,6 +1017,7 @@ def advance_ssm_states_along_accept_paths(
         RECURRENT_STASH=recurrent_stash,
         U_STASH=u_stash,
         BTC=max(16, triton.next_power_of_2(T)),
+        RING=ring,
         num_warps=4 if u_stash else 1,
         num_stages=2,
     )

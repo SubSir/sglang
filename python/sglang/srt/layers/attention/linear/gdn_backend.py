@@ -624,7 +624,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # The chain path stashes rounded beta (see advance_ssm_states_along_accept_paths).
                 recurrent=self.chain_verify,
                 u_stash=self.chain_verify and envs.SGLANG_GDN_CHAIN_UCOMMIT.get(),
+                wy=False,
             )
+            temporal = self.req_to_token_pool.mamba_pool.mamba_cache.temporal
+            if (
+                self.tree_stash["u_stash"]
+                and envs.SGLANG_GDN_WY_VERIFY.get()
+                and temporal.dtype == torch.bfloat16
+                and T in (4, 8)
+            ):
+                # FlashInfer's ring is indexed by state-pool slot: [layers, pool, heads, 16, dim].
+                pool = temporal.shape[1]
+                self.tree_stash.update(
+                    wy=True,
+                    kc=torch.zeros(layers, pool, Hg, 16, K, dtype=torch.bfloat16, device=dev),
+                    uc=torch.zeros(layers, pool, H, 16, V, dtype=torch.bfloat16, device=dev),
+                    gc=torch.zeros(layers, pool, H, 16, dtype=torch.float32, device=dev),
+                    hist=torch.zeros(rows, dtype=torch.int32, device=dev),
+                )
+                __import__("logging").getLogger(__name__).info(f"GDN WY verify: ring for {pool} slots x {layers} layers")
             # Node j's parent is j - 1; the root's entry is never read.
             self._chain_parents = (
                 (torch.arange(T, device=dev) - 1).clamp(min=0).expand(rows, T).contiguous()
@@ -670,6 +688,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
         seq_len = value.shape[-3]
         # Persistent output: rows no request covers (graph padding) stay finite.
         out = self._dense_buf("chain_o", seq_len, H * V, value, T)
+        if st["wy"]:
+            from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache import (
+                gated_delta_rule_mtp_ucache,
+            )
+
+            # ponytail: dense only; compact verify would scatter to [bs, T] first.
+            assert seq_len == bs * T, (seq_len, bs, T)
+            gated_delta_rule_mtp_ucache(
+                A_log=layer.A_log.detach(),
+                a=a.reshape(bs, T, H),
+                dt_bias=layer.dt_bias.detach(),
+                q=query.reshape(bs, T, Hg, K),
+                k=key.reshape(bs, T, Hg, K),
+                v=value.reshape(bs, T, H, V),
+                b=b.reshape(bs, T, H),
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                scale=K**-0.5,
+                output=out.view(bs, T, H, V),
+                k_cache=st["kc"][ordinal],
+                u_cache=st["uc"][ordinal],
+                g_cache=st["gc"][ordinal],
+                hist_len=st["hist"][:bs],
+            )
+            return out.view(1, seq_len, H, V)
         o = fused_sigmoid_gating_delta_rule_update(
             A_log=layer.A_log,
             a=a.reshape(-1, H),
