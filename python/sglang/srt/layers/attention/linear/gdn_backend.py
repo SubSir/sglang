@@ -693,25 +693,47 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 gated_delta_rule_mtp_ucache,
             )
 
-            # ponytail: dense only; compact verify would scatter to [bs, T] first.
-            assert seq_len == bs * T, (seq_len, bs, T)
+            nd = bs * T
+            ragged = seq_len != nd
+            if ragged:
+                # Compact verify: scatter packed tokens to [bs, T]. The WY cost barely depends on T, pad
+                # rows only feed later (pad) rows, and the commit never reads past the accepted prefix.
+                if ordinal == 0 or getattr(self, "_wy_dense_idx", None) is None:
+                    self._wy_dense_idx = ragged_verify_dense_scatter_indices(
+                        query_start_loc=query_start_loc, seq_len=seq_len, draft_token_num=T
+                    )
+                idx = self._wy_dense_idx
+
+                def dense(name, x, cols):
+                    buf = self._dense_buf("wy_" + name, nd + 1, cols, x, T)
+                    buf.index_copy_(0, idx, x.reshape(seq_len, cols))
+                    return buf[:nd]
+
+                q_d, k_d = dense("q", query, Hg * K), dense("k", key, Hg * K)
+                v_d, a_d, b_d = dense("v", value, H * V), dense("a", a, H), dense("b", b, H)
+                o_full = self._dense_buf("wy_o", nd + 1, H * V, value, T)
+                o_d = o_full[:nd]
+            else:
+                q_d, k_d, v_d, a_d, b_d, o_d = query, key, value, a, b, out
             gated_delta_rule_mtp_ucache(
                 A_log=layer.A_log.detach(),
-                a=a.reshape(bs, T, H),
+                a=a_d.reshape(bs, T, H),
                 dt_bias=layer.dt_bias.detach(),
-                q=query.reshape(bs, T, Hg, K),
-                k=key.reshape(bs, T, Hg, K),
-                v=value.reshape(bs, T, H, V),
-                b=b.reshape(bs, T, H),
+                q=q_d.reshape(bs, T, Hg, K),
+                k=k_d.reshape(bs, T, Hg, K),
+                v=v_d.reshape(bs, T, H, V),
+                b=b_d.reshape(bs, T, H),
                 initial_state_source=ssm_states,
                 initial_state_indices=cache_indices,
                 scale=K**-0.5,
-                output=out.view(bs, T, H, V),
+                output=o_d.view(bs, T, H, V),
                 k_cache=st["kc"][ordinal],
                 u_cache=st["uc"][ordinal],
                 g_cache=st["gc"][ordinal],
                 hist_len=st["hist"][:bs],
             )
+            if ragged:
+                torch.index_select(o_full, 0, idx, out=out)
             return out.view(1, seq_len, H, V)
         o = fused_sigmoid_gating_delta_rule_update(
             A_log=layer.A_log,
