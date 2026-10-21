@@ -1483,6 +1483,7 @@ class Envs:
     # Compact WY verify: the conv writes [bs, T] directly (no per-layer q/k/v scatter); pair with
     # SGLANG_GDN_WY_STRIDED_QKV=1 so FlashInfer reads the strided q/k/v in place.
     SGLANG_GDN_WY_DENSE_CONV = EnvBool(False)
+    SGLANG_GDN_WY_VARLEN = EnvBool(True)
     # Verify planner confidence for greedy rows from the temperature-1 selector q (not the point mass).
     SGLANG_SPEC_GREEDY_CONF_T1 = EnvBool(False)
     # Test knob: with spec_fixed_verify_len set, cycle these verify lengths over the batch ("1,8").

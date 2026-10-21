@@ -736,6 +736,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 out_p = self._dense_buf("chain_op", ab_rows, H * V, value, TW)
                 torch.index_select(o_full, 0, idx, out=out_p)
                 return out_p.view(1, ab_rows, H, V)
+            rs = query.stride(-3)
+            if (
+                ragged
+                and envs.SGLANG_GDN_WY_VARLEN.get()
+                and key.stride(-3) == value.stride(-3) == rs
+                and key.storage_offset() - query.storage_offset() == Hg * K
+                and value.storage_offset() - query.storage_offset() == 2 * Hg * K
+            ):
+                # Compact verify on packed tokens: the varlen kernel reads q/k/v from the fused conv
+                # output rows [query_start_loc[b], query_start_loc[b + 1]) and writes the output in place.
+                from sglang.kernels.ops.attention.fla.gdn_wy_ucache_varlen import (
+                    gated_delta_rule_mtp_ucache_varlen,
+                )
+
+                gated_delta_rule_mtp_ucache_varlen(
+                    A_log=layer.A_log.detach(),
+                    dt_bias=layer.dt_bias.detach(),
+                    qkv=query.as_strided((seq_len, rs), (rs, 1)),
+                    k_col=Hg * K,
+                    v_col=2 * Hg * K,
+                    H=Hg,
+                    a=a.reshape(seq_len, H).contiguous(),
+                    b=b.reshape(seq_len, H).contiguous(),
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    max_len=TW,
+                    k_cache=st["kc"][ordinal],
+                    u_cache=st["uc"][ordinal],
+                    g_cache=st["gc"][ordinal],
+                    hist_len=st["hist"][:bs],
+                    output=out.view(seq_len, H, V),
+                    scale=K**-0.5,
+                )
+                return out.view(1, seq_len, H, V)
             if ragged:
                 # Compact verify: scatter packed tokens to [bs, T]. The WY cost barely depends on T, pad
                 # rows only feed later (pad) rows, and the commit never reads past the accepted prefix.
