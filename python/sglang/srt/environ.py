@@ -1477,6 +1477,8 @@ class Envs:
     # Chain verify stashes u_t = beta*(v - decayed_state @ k) and the normalized k, so the commit is
     # S_L = prod(alpha) * S_0 + acc_L with acc_t = alpha_t * acc_{t-1} + k_t u_t^T (no per-step S @ k).
     SGLANG_GDN_CHAIN_UCOMMIT = EnvBool(True)
+    # Test knob: with spec_fixed_verify_len set, cycle these verify lengths over the batch ("1,8").
+    SGLANG_SPEC_FIXED_VERIFY_PATTERN = EnvStr("")
     # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).
     SGLANG_SPEC_FUSED_CONFIDENCE = EnvBool(True)
     # Dynamic verify: build the compact verify window (positions, KV slots, token ids) in one launch.

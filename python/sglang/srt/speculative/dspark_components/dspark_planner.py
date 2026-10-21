@@ -85,6 +85,10 @@ class DSparkVerifyPlanner:
         # so a head-less draft may still schedule a verify budget.
         self._external_confidence = external_confidence
         self._fixed_verify_len: Optional[int] = None
+        pattern = envs.SGLANG_SPEC_FIXED_VERIFY_PATTERN.get().strip()
+        self._fixed_pattern = tuple(int(x) for x in pattern.split(",")) if pattern else None
+        if self._fixed_pattern is not None:
+            assert all(1 <= x <= self.verify_num_draft_tokens for x in self._fixed_pattern), self._fixed_pattern
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
@@ -409,6 +413,9 @@ class DSparkVerifyPlanner:
 
     def _fixed_budget(self, *, num_reqs: int) -> int:
         floor = max(self._schedule_cfg.min_verify_len, 1)
+        if self._fixed_pattern is not None:
+            p = self._fixed_pattern
+            return sum(max(p[i % len(p)] - floor, 0) for i in range(num_reqs))
         return num_reqs * max(self._fixed_verify_len - floor, 0)
 
     def schedule_layout(
@@ -581,8 +588,12 @@ class DSparkVerifyPlanner:
         if self._budget_planner is None:
             return None
         if self._fixed_verify_len is not None:
+            n = int(req_pool_indices.shape[0])
+            if self._fixed_pattern is not None:
+                p = torch.tensor(self._fixed_pattern, dtype=torch.int32)
+                return p.repeat((n + len(p) - 1) // len(p))[:n].to(device=device)
             return torch.full(
-                (int(req_pool_indices.shape[0]),),
+                (n,),
                 self._fixed_verify_len,
                 dtype=torch.int32,
                 device=device,
