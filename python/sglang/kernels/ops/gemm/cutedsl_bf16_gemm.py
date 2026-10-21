@@ -1384,6 +1384,11 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return m_range[0] <= m <= m_range[1]
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
+    if m <= 16 and n >= 1024:
+        # Decode-size batches only stream the weight, and TGV starts streaming it while it waits on the
+        # previous kernel (PDL); it beat cuBLAS on every dense decode shape swept, including k > 6144
+        # (the Qwen3.8 MLP down projection). Rule from the EAGLE-4 SGLang fork (Apache-2.0).
+        return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
     ragged = m % 16 != 0
