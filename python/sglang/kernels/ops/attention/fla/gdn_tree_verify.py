@@ -752,6 +752,7 @@ def tree_verify_state_advance_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    RECURRENT_STASH: tl.constexpr = False,
 ):
     """Commit SSM states after verification by replaying the delta rule along
     each request's accept path (root -> last correct draft).
@@ -766,7 +767,9 @@ def tree_verify_state_advance_kernel(
     (T full states per layer per request) with one state read + one write.
 
     k_stash holds raw k (l2-normalized here in fp32), beta_stash raw b (sigmoid here);
-    g_stash is the gate.
+    g_stash is the gate. RECURRENT_STASH: the stash came from the recurrent chain verify
+    (fused_sigmoid_gating_delta_rule_update), beta_stash holds its rounded beta and k is
+    normalized with its reciprocal multiply, so the replay repeats its update exactly.
     Stash layout per layer l (leading stride stride_*l):
       k_stash: [B, T, Hg*K], v_stash: [B, T, H*V], g/beta_stash: [B, T, H]
     ssm_states: [L, pool, H, V, K] with per-layer stride stride_sl.
@@ -825,10 +828,14 @@ def tree_verify_state_advance_kernel(
         on_path = ((word >> (t % 64)) & 1) != 0
         if on_path:
             b_k = tl.load(p_k + t * Hg * K, mask=mask_k, other=0).to(tl.float32)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
             b_v = tl.load(p_v + t * H * V, mask=mask_v, other=0).to(tl.float32)
             b_g = tl.load(p_g + t * H).to(tl.float32)
-            b_beta = 1.0 / (1.0 + tl.exp(-tl.load(p_b + t * H).to(tl.float32)))
+            if RECURRENT_STASH:
+                b_k *= 1.0 / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+                b_beta = tl.load(p_b + t * H).to(tl.float32)
+            else:
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+                b_beta = 1.0 / (1.0 + tl.exp(-tl.load(p_b + t * H).to(tl.float32)))
 
             b_h *= tl.exp(b_g)
             b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -867,6 +874,7 @@ def advance_ssm_states_along_accept_paths(
     V: int,
     track_steps: torch.Tensor = None,
     track_slots: torch.Tensor = None,
+    recurrent_stash: bool = False,
 ):
     """Advance pooled SSM states along each request's accept path.
 
@@ -912,6 +920,7 @@ def advance_ssm_states_along_accept_paths(
         BK=BK,
         BV=BV,
         HAS_TRACK=track_steps is not None,
+        RECURRENT_STASH=recurrent_stash,
         num_warps=1,
         num_stages=2,
     )

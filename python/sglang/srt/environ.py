@@ -1470,6 +1470,10 @@ class Envs:
     # Compact fused GDN verify reads packed tokens in the conv and writes packed output from the
     # verify kernel (False = scatter to the dense [bs, T] layout and gather back).
     SGLANG_GDN_PACKED_VERIFY = EnvBool(True)
+    # Chain target verify on GDN through the varlen recurrent kernel: each request loops only
+    # over its own tokens, no per-step SSM snapshots (raw k/v/g/beta stashed for the commit's
+    # replay), packed conv output under compact verify. Takes precedence over the fused tree path.
+    SGLANG_GDN_CHAIN_VERIFY = EnvBool(False)
     # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).
     SGLANG_SPEC_FUSED_CONFIDENCE = EnvBool(True)
     # Dynamic verify: build the compact verify window (positions, KV slots, token ids) in one launch.

@@ -666,6 +666,7 @@ def _causal_conv1d_update_kernel(
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     IS_VARLEN_X: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    OUT_PACKED: tl.constexpr = False,
 ):
     # ruff: noqa: E501
     if USE_GDC:
@@ -996,24 +997,38 @@ def _causal_conv1d_update_kernel(
                     + idx_token * stride_inter_step
                     + idx_feats * stride_inter_dim
                 )
+                # Packed x: slots past a sequence's length are never committed; skip them.
+                if IS_VARLEN_X:
+                    mask_win = mask_w & (idx_token < x_len)
+                else:
+                    mask_win = mask_w
                 if KERNEL_WIDTH >= 2:
-                    tl.store(base_ptr + 0 * stride_inter_win, col0, mask=mask_w)
+                    tl.store(base_ptr + 0 * stride_inter_win, col0, mask=mask_win)
                 if KERNEL_WIDTH >= 3:
-                    tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_w)
+                    tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_win)
                 if KERNEL_WIDTH >= 4:
-                    tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
+                    tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_win)
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
         mask_1d = (idx_token < seqlen) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (idx_seq) * stride_o_seq
-            + idx_token * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if OUT_PACKED:
+            # Packed out: only real tokens, at the same packed rows as x.
+            mask_1d = mask_1d & (idx_token < x_len)
+            o_ptrs = (
+                o_ptr
+                + (x_start + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (idx_seq) * stride_o_seq
+                + idx_token * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
@@ -1047,6 +1062,7 @@ def causal_conv1d_update(
     validate_data=False,
     query_start_loc: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
+    out_packed: bool = False,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1074,6 +1090,8 @@ def causal_conv1d_update(
     query_start_loc: (batch + 1,) int32. If not None, x is packed (num_tokens, dim) with
         sequence i at rows [query_start_loc[i], query_start_loc[i+1]); out is still the dense
         (batch, dim, max_seqlen) layout, slots past a sequence's length computed from zeros.
+    out_packed: with query_start_loc, out is packed (num_tokens, dim) like x; rows no
+        sequence covers are left unwritten.
     """
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
@@ -1119,15 +1137,23 @@ def causal_conv1d_update(
 
     stride_w_dim, stride_w_width = weight.stride()
     if query_start_loc is not None:
-        # Token-major like the dense callers' (batch, seqlen, dim).transpose(1, 2).
-        out = x.new_empty(batch, seqlen, dim).transpose(1, 2)
+        if out_packed:
+            out = x.new_empty(x.shape[0], dim)
+        else:
+            # Token-major like the dense callers' (batch, seqlen, dim).transpose(1, 2).
+            out = x.new_empty(batch, seqlen, dim).transpose(1, 2)
         stride_x_seq, stride_x_dim, stride_x_token = 0, x.stride(1), x.stride(0)
     else:
+        assert not out_packed, "out_packed needs packed x (query_start_loc)"
+
         # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
         out = torch.empty_like(x)
         stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
 
-    stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    if out_packed:
+        stride_o_seq, (stride_o_token, stride_o_dim) = 0, out.stride()
+    else:
+        stride_o_seq, stride_o_dim, stride_o_token = out.stride()
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
@@ -1251,6 +1277,7 @@ def causal_conv1d_update(
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         IS_VARLEN_X=query_start_loc is not None,
+        OUT_PACKED=out_packed,
         **pdl_kwargs,
     )
     if unsqueeze:

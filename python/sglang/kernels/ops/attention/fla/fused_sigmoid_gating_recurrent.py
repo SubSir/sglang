@@ -199,6 +199,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
+    # Compact chain verify stash (GDN only): raw k/v, gate and beta of every real token,
+    # at [request row, step] of per-layer [rows, T, *] views, for the commit's replay.
+    stash_k=None,
+    stash_v=None,
+    stash_g=None,
+    stash_beta=None,
+    stride_sk_n=0,
+    stride_sv_n=0,
+    stride_sg_n=0,
+    CACHE_STASH: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -423,6 +433,24 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                             b_beta,
                         )
 
+        # Same point as the ring-write: k pre-norm, v pre-delta, gate and (rounded) beta formed.
+        if CACHE_STASH:
+            row = i_n.to(tl.int64)
+            tl.store(
+                stash_v + row * stride_sv_n + step_idx * (HV * V) + i_hv * V + o_v,
+                b_v.to(stash_v.dtype.element_ty),
+                mask=mask_v,
+            )
+            if i_v == 0:
+                tl.store(stash_g + row * stride_sg_n + step_idx * HV + i_hv, b_g)
+                tl.store(stash_beta + row * stride_sg_n + step_idx * HV + i_hv, b_beta)
+                if i_hv % (HV // H) == 0:
+                    tl.store(
+                        stash_k + row * stride_sk_n + step_idx * (H * K) + i_h * K + o_k,
+                        b_k.to(stash_k.dtype.element_ty),
+                        mask=mask_k,
+                    )
+
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
             if MATCH_CUTEDSL_DECODE:
@@ -565,6 +593,10 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    # Chain verify stash ([rows, T, *] per-layer views, contiguous per row) and an
+    # optional preallocated output (rows no sequence covers keep their old values).
+    stash: Optional[tuple] = None,
+    output: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -620,7 +652,13 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    o = q.new_empty(NK, *v.shape) if output is None else output.view(NK, *v.shape)
+    if stash is not None:
+        assert not is_kda and cu_seqlens is not None and NK == 1
+        stash_k, stash_v, stash_g, stash_beta = stash
+        assert stash_g.stride() == stash_beta.stride()
+        assert stash_k.stride(1) == H * K and stash_v.stride(1) == HV * V
+        assert stash_g.stride(1) == HV
 
     # Prepare retrieve_parent_token strides
     if retrieve_parent_token is not None:
@@ -742,6 +780,14 @@ def fused_sigmoid_gating_delta_rule_update(
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
         ROUND_STATE_TO_BF16=round_state_to_bf16,
+        stash_k=stash[0] if stash is not None else None,
+        stash_v=stash[1] if stash is not None else None,
+        stash_g=stash[2] if stash is not None else None,
+        stash_beta=stash[3] if stash is not None else None,
+        stride_sk_n=stash[0].stride(0) if stash is not None else 0,
+        stride_sv_n=stash[1].stride(0) if stash is not None else 0,
+        stride_sg_n=stash[2].stride(0) if stash is not None else 0,
+        CACHE_STASH=stash is not None,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

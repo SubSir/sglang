@@ -535,6 +535,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # backend built without __init__ on the snapshot verify path.
     tree_fused_verify: bool = False
     tree_stash: Optional[dict] = None
+    chain_verify: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -570,6 +571,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             envs.SGLANG_ENABLE_GDN_FUSED_VERIFY.get() and not model_runner.is_draft_worker
         )
         self.tree_stash = None
+        # Varlen recurrent chain verify (SGLANG_GDN_CHAIN_VERIFY): same stash/commit
+        # contract, work proportional to each request's own verify length.
+        self.chain_verify = (
+            envs.SGLANG_GDN_CHAIN_VERIFY.get() and not model_runner.is_draft_worker
+        )
         self.packed_fused_verify = envs.SGLANG_GDN_PACKED_VERIFY.get()
         self._chain_parents: Optional[torch.Tensor] = None
         # Compact + fused: dense [bs, T] staging reused by every GDN layer and step. Pad
@@ -588,6 +594,102 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._dense_bufs[name] = buf
         assert rows <= buf.shape[0], (rows, buf.shape)
         return buf[:rows]
+
+    def _ensure_tree_stash(
+        self, layer: RadixLinearAttention, T: int, query: torch.Tensor, value: torch.Tensor
+    ) -> dict:
+        """Per-layer [rows, T, *] stash of the raw verify inputs the commit replays, plus
+        the chain's ancestor masks; allocated once, shared by the fused and chain paths."""
+        from sglang.kernels.ops.attention.fla.gdn_tree_verify import tree_mask_capacity
+
+        if self.tree_stash is None:
+            H, V = layer.num_v_heads, layer.head_v_dim
+            Hg, K = layer.num_k_heads, layer.head_k_dim
+            rows = self.verify_intermediate_state_indices.numel()
+            layers = len(self.req_to_token_pool.mamba_map)
+            dev = query.device
+            self.tree_stash = dict(
+                k=torch.zeros(layers, rows, T, Hg * K, dtype=query.dtype, device=dev),
+                v=torch.zeros(layers, rows, T, H * V, dtype=value.dtype, device=dev),
+                g=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
+                beta=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
+                anc=torch.zeros(
+                    rows,
+                    tree_mask_capacity(T),
+                    tree_mask_capacity(T) // 64,
+                    dtype=torch.int64,
+                    device=dev,
+                ),
+                dims=(Hg, K, V),
+                # The chain path stashes rounded beta (see advance_ssm_states_along_accept_paths).
+                recurrent=self.chain_verify,
+            )
+            # Node j's parent is j - 1; the root's entry is never read.
+            self._chain_parents = (
+                (torch.arange(T, device=dev) - 1).clamp(min=0).expand(rows, T).contiguous()
+            )
+        return self.tree_stash
+
+    def _chain_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        batch_size: int,
+        draft_token_num: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Chain verify with the varlen recurrent kernel on packed tokens (dense static
+        verify is the uniform-length case). Each (request, v-head, v-block) program loops
+        over that request's own tokens only; no SSM state is written. The kernel stashes
+        the raw k/v, gate and beta of every real token and the commit replays the
+        accepted prefix (hybrid_linear_attn_backend.update_mamba_state_after_mtp_verify)."""
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        from sglang.kernels.ops.attention.fla.gdn_tree_verify import (
+            build_tree_ancestor_masks,
+        )
+
+        bs, T = batch_size, draft_token_num
+        H, V = layer.num_v_heads, layer.head_v_dim
+        Hg, K = layer.num_k_heads, layer.head_k_dim
+        ordinal = self.req_to_token_pool.mamba_map[layer.layer_id]
+        st = self._ensure_tree_stash(layer, T, query, value)
+        if ordinal == 0:
+            # Once per verify, shared by every GDN layer (recorded in the graph).
+            build_tree_ancestor_masks(self._chain_parents[:bs], T, out=st["anc"])
+        # q/k/v are [1, seq, heads, dim], contiguous or row-strided views of the conv output.
+        seq_len = value.shape[-3]
+        # Persistent output: rows no request covers (graph padding) stay finite.
+        out = self._dense_buf("chain_o", seq_len, H * V, value, T)
+        o = fused_sigmoid_gating_delta_rule_update(
+            A_log=layer.A_log,
+            a=a.reshape(-1, H),
+            dt_bias=layer.dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=query.view(1, seq_len, Hg, K),
+            k=key.view(1, seq_len, Hg, K),
+            v=value.view(1, seq_len, H, V),
+            b=b.reshape(-1, H),
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=query_start_loc,
+            is_kda=False,
+            disable_state_update=True,
+            stash=(st["k"][ordinal], st["v"][ordinal], st["g"][ordinal], st["beta"][ordinal]),
+            output=out,
+        )
+        return o.view(1, seq_len, H, V)
 
     def _tree_fused_target_verify(
         self,
@@ -622,32 +724,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         H, V = layer.num_v_heads, layer.head_v_dim
         Hg, K = layer.num_k_heads, layer.head_k_dim
         ordinal = self.req_to_token_pool.mamba_map[layer.layer_id]
-        if self.tree_stash is None:
-            rows = self.verify_intermediate_state_indices.numel()
-            layers = len(self.req_to_token_pool.mamba_map)
-            dev = query.device
-            self.tree_stash = dict(
-                k=torch.zeros(layers, rows, T, Hg * K, dtype=query.dtype, device=dev),
-                v=torch.zeros(layers, rows, T, H * V, dtype=value.dtype, device=dev),
-                g=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
-                beta=torch.zeros(layers, rows, T, H, dtype=torch.float32, device=dev),
-                anc=torch.zeros(
-                    rows,
-                    tree_mask_capacity(T),
-                    tree_mask_capacity(T) // 64,
-                    dtype=torch.int64,
-                    device=dev,
-                ),
-                struct=alloc_tree_structure_buffers(rows, T, T - 1, dev),
-                dims=(Hg, K, V),
-            )
-        st = self.tree_stash
-        if self._chain_parents is None:
-            # Node j's parent is j - 1; the root's entry is never read.
-            rows = st["k"].shape[1]
-            self._chain_parents = (
-                (torch.arange(T, device=query.device) - 1).clamp(min=0).expand(rows, T).contiguous()
-            )
+        st = self._ensure_tree_stash(layer, T, query, value)
+        if "struct" not in st:
+            st["struct"] = alloc_tree_structure_buffers(st["k"].shape[1], T, T - 1, query.device)
         packed = self.packed_fused_verify
         if dense_token_indices is not None and not packed:
             # q/k/v come dense from the conv path; only the gate inputs are packed.
@@ -837,6 +916,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if use_replayssm_fold:
             return not self._replayssm_fold_uses_cutedsl(ssm_dtype, draft_token_num)
         if use_replayssm_spec:
+            return True
+        if self.chain_verify and retrieve_parent_token is None:
+            # The recurrent kernel reads q/k/v as row-strided views of the conv output.
             return True
         return self.kernel_dispatcher.target_verify_supports_strided_qkv(
             retrieve_parent_token
@@ -1208,12 +1290,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             draft_token_num = forward_batch.spec_info.draft_token_num
             dense_token_indices = None
-            fused_dense = (
-                self.tree_fused_verify
+            chain = (
+                self.chain_verify
                 and retrieve_parent_token is None
                 and not use_replayssm_fold
                 and not use_replayssm_spec
             )
+            fused_dense = (
+                self.tree_fused_verify
+                and not chain
+                and retrieve_parent_token is None
+                and not use_replayssm_fold
+                and not use_replayssm_spec
+            )
+            chain_packed = False
             # getattr: verify inputs without the ragged field are dense.
             if getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None:
                 batch_size = seq_len // draft_token_num
@@ -1224,21 +1314,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # KDAAttnBackend: scatter to step slots, gather back after.
                 batch_size = query_start_loc.shape[0] - 1
                 num_dense_tokens = batch_size * draft_token_num
+                chain_packed = chain
                 # Built at the first GDN layer of every forward, reused by the rest: the
                 # build then sits inside a graph capture (not in a warmup run that
                 # shares the metadata object) and in every eager forward.
                 if self._first_gdn_layer_id is None:
                     self._first_gdn_layer_id = layer.layer_id
                 dense_token_indices = forward_metadata.ragged_dense_token_indices
-                if layer.layer_id == self._first_gdn_layer_id or dense_token_indices is None:
+                if chain_packed:
+                    # The conv reads and writes packed tokens; nothing is dense.
+                    dense_token_indices = None
+                elif layer.layer_id == self._first_gdn_layer_id or dense_token_indices is None:
                     dense_token_indices = ragged_verify_dense_scatter_indices(
                         query_start_loc=query_start_loc,
                         seq_len=seq_len,
                         draft_token_num=draft_token_num,
                     )
                     forward_metadata.ragged_dense_token_indices = dense_token_indices
-                if fused_dense and self.packed_fused_verify:
-                    # The conv reads the packed tokens itself and writes the dense layout.
+                if chain_packed or (fused_dense and self.packed_fused_verify):
+                    # The conv reads the packed tokens itself (and writes packed for chain).
                     mixed_qkv_dense = None
                 else:
                     if fused_dense:
@@ -1268,6 +1362,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer.activation,
                     query_start_loc=query_start_loc,
                     max_seqlen=draft_token_num,
+                    out_packed=chain_packed,
                     **conv_kwargs,
                 )
             else:
@@ -1279,9 +1374,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer.activation,
                     **conv_kwargs,
                 )
-            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
-                batch_size * draft_token_num, -1
-            )
+            if chain_packed:
+                mixed_qkv_flat = mixed_qkv_processed  # [num_tokens, dim], packed
+            else:
+                mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                    batch_size * draft_token_num, -1
+                )
             if dense_token_indices is None or fused_dense:
                 # The fused verify reads q/k/v in the dense layout: no gather back.
                 mixed_qkv = mixed_qkv_flat
@@ -1367,6 +1465,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            elif chain:
+                core_attn_out = self._chain_target_verify(
+                    layer=layer,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
                 )
             elif self.tree_fused_verify and retrieve_parent_token is None:
                 core_attn_out = self._tree_fused_target_verify(
