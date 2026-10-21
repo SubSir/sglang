@@ -1619,6 +1619,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 track_steps=mamba_steps_to_track if has_track else None,
                 track_slots=mamba_track_indices if has_track else None,
                 recurrent_stash=st.get("recurrent", False),
+                u_stash=st.get("u_stash", False),
             )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,

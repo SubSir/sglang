@@ -623,6 +623,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dims=(Hg, K, V),
                 # The chain path stashes rounded beta (see advance_ssm_states_along_accept_paths).
                 recurrent=self.chain_verify,
+                u_stash=self.chain_verify and envs.SGLANG_GDN_CHAIN_UCOMMIT.get(),
             )
             # Node j's parent is j - 1; the root's entry is never read.
             self._chain_parents = (
@@ -688,6 +689,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             disable_state_update=True,
             stash=(st["k"][ordinal], st["v"][ordinal], st["g"][ordinal], st["beta"][ordinal]),
             output=out,
+            stash_u=st["u_stash"],
         )
         return o.view(1, seq_len, H, V)
 

@@ -753,6 +753,7 @@ def tree_verify_state_advance_kernel(
     BV: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     RECURRENT_STASH: tl.constexpr = False,
+    U_STASH: tl.constexpr = False,
 ):
     """Commit SSM states after verification by replaying the delta rule along
     each request's accept path (root -> last correct draft).
@@ -823,7 +824,39 @@ def tree_verify_state_advance_kernel(
     p_g = g_stash + i_l * stride_gl + i_n * T * H + i_hv
     p_b = beta_stash + i_l * stride_bl + i_n * T * H + i_hv
 
-    for t in range(0, T):
+    # U_STASH: the stash holds u_t and the normalized k, so S_t = alpha_t * S_{t-1} + k_t u_t^T and
+    # S_L = prod(alpha) * S_0 + acc_L, acc_t = alpha_t * acc_{t-1} + k_t u_t^T: no S @ k per step.
+    b_acc = tl.zeros((BK, BV), dtype=tl.float32)
+    b_dec = tl.full((), 1.0, tl.float32)
+    if U_STASH:
+        n_u = T
+        n_seq = 0
+    else:
+        n_u = 0
+        n_seq = T
+    for t in range(0, n_u):
+        word = tl.sum(tl.where(o_w == (t // 64), path_words, 0))
+        on_path = ((word >> (t % 64)) & 1) != 0
+        if on_path:
+            b_k = tl.load(p_k + t * Hg * K, mask=mask_k, other=0).to(tl.float32)
+            b_u = tl.load(p_v + t * H * V, mask=mask_v, other=0).to(tl.float32)
+            b_a = tl.exp(tl.load(p_g + t * H).to(tl.float32))
+            b_acc = b_acc * b_a + b_k[:, None] * b_u[None, :]
+            b_dec = b_dec * b_a
+            if HAS_TRACK:
+                if t == track_step:
+                    p_track = (
+                        ssm_states
+                        + i_l * stride_sl
+                        + track_slot * H * K * V
+                        + i_hv * K * V
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    tl.store(
+                        p_track, (b_dec * b_h + b_acc).to(p_track.dtype.element_ty), mask=mask_h
+                    )
+    for t in range(0, n_seq):
         word = tl.sum(tl.where(o_w == (t // 64), path_words, 0))
         on_path = ((word >> (t % 64)) & 1) != 0
         if on_path:
@@ -856,6 +889,8 @@ def tree_verify_state_advance_kernel(
                         p_track, b_h.to(p_track.dtype.element_ty), mask=mask_h
                     )
 
+    if U_STASH:
+        b_h = b_dec * b_h + b_acc
     tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
 
 
@@ -875,6 +910,7 @@ def advance_ssm_states_along_accept_paths(
     track_steps: torch.Tensor = None,
     track_slots: torch.Tensor = None,
     recurrent_stash: bool = False,
+    u_stash: bool = False,
 ):
     """Advance pooled SSM states along each request's accept path.
 
@@ -921,6 +957,7 @@ def advance_ssm_states_along_accept_paths(
         BV=BV,
         HAS_TRACK=track_steps is not None,
         RECURRENT_STASH=recurrent_stash,
+        U_STASH=u_stash,
         num_warps=1,
         num_stages=2,
     )

@@ -1474,6 +1474,9 @@ class Envs:
     # over its own tokens, no per-step SSM snapshots (raw k/v/g/beta stashed for the commit's
     # replay), packed conv output under compact verify. Takes precedence over the fused tree path.
     SGLANG_GDN_CHAIN_VERIFY = EnvBool(False)
+    # Chain verify stashes u_t = beta*(v - decayed_state @ k) and the normalized k, so the commit is
+    # S_L = prod(alpha) * S_0 + acc_L with acc_t = alpha_t * acc_{t-1} + k_t u_t^T (no per-step S @ k).
+    SGLANG_GDN_CHAIN_UCOMMIT = EnvBool(True)
     # Dynamic verify: entropy confidence in one fused Triton launch (False = the torch reference path).
     SGLANG_SPEC_FUSED_CONFIDENCE = EnvBool(True)
     # Dynamic verify: build the compact verify window (positions, KV slots, token ids) in one launch.
