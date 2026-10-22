@@ -951,6 +951,111 @@ def tree_verify_state_advance_kernel(
     tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
 
 
+@triton.jit
+def wy_lazy_commit_prep_kernel(cache_indices, last_correct_steps, hist_slot, hist_rows, fold_rows, LIMIT: tl.constexpr):
+    """Per request: P = unfolded ring rows, n = P + accepted. Fold (and restart the ring) when
+    the next verify could not append its tokens after n rows, else just keep n rows."""
+    i = tl.program_id(0)
+    slot = tl.load(cache_indices + i)
+    if slot < 0:
+        tl.store(fold_rows + i, 0)
+        return
+    p = tl.load(hist_slot + slot)
+    n = p + tl.load(last_correct_steps + i).to(tl.int32) + 1
+    tl.store(hist_rows + i, p)
+    tl.store(fold_rows + i, (n > LIMIT).to(tl.int32))
+    tl.store(hist_slot + slot, tl.where(n > LIMIT, 0, n))
+
+
+@triton.jit
+def wy_ring_commit_kernel(
+    k_ring,  # [L, pool, Hg, RW, K]
+    u_ring,  # [L, pool, H, RW, V]
+    g_ring,  # [L, pool, H, RW] cumulative log-decay from ring row 0
+    ssm_states,  # [L, pool, H, V, K]
+    cache_indices,
+    last_correct_steps,
+    hist_rows,
+    fold_rows,
+    stride_kl,
+    stride_ul,
+    stride_gl,
+    stride_sl,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    HB: tl.constexpr,
+    RW: tl.constexpr,
+    HIST: tl.constexpr,
+):
+    """Chain commit from the WY ring: S <- e^{G_n} S + sum_{t<=n} e^{G_n - G_t} k_t u_t^T, n = (hist +)
+    last accepted row. Same math as tree_verify_state_advance_kernel(U_STASH, RING), but one CTA
+    covers HB heads x all of V of one (request, layer): rows that do not fold (HIST) retire after
+    two scalar loads, so the lazy commit costs ~ the folding rows only."""
+    i_n, i_l, i_g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    slot = tl.load(cache_indices + i_n).to(tl.int64)
+    if slot < 0:
+        return
+    if HIST:
+        if tl.load(fold_rows + i_n) == 0:
+            return
+    leaf = tl.maximum(tl.load(last_correct_steps + i_n).to(tl.int64), 0)
+    if HIST:
+        leaf += tl.load(hist_rows + i_n).to(tl.int64)
+    i_l = i_l.to(tl.int64)
+    o_t = tl.arange(0, RW)
+    o_k = tl.arange(0, K)
+    on_t = o_t <= leaf
+    for j in range(HB):
+        i_hv = i_g * HB + j
+        i_h = i_hv // (H // Hg)
+        G_t = tl.load(g_ring + i_l * stride_gl + slot * H * RW + i_hv * RW + o_t, mask=on_t, other=0.0)
+        G_L = tl.sum(tl.where(o_t == leaf, G_t, 0.0), 0)
+        w_t = tl.where(on_t, tl.exp(G_L - G_t), 0.0)
+        b_dec = tl.exp(G_L)
+        Kt = tl.load(
+            k_ring + i_l * stride_kl + slot * Hg * RW * K + i_h * RW * K + o_t[:, None] * K + o_k[None, :],
+            mask=on_t[:, None], other=0.0,
+        )
+        for i_v in tl.static_range(V // BV):
+            o_v = i_v * BV + tl.arange(0, BV)
+            Ut = tl.load(
+                u_ring + i_l * stride_ul + slot * H * RW * V + i_hv * RW * V + o_t[:, None] * V + o_v[None, :],
+                mask=on_t[:, None], other=0.0,
+            ).to(tl.float32)
+            b_acc = tl.dot(tl.trans(Kt), (Ut * w_t[:, None]).to(Kt.dtype))
+            p_h = ssm_states + i_l * stride_sl + slot * H * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
+            b_h = tl.load(p_h).to(tl.float32)
+            tl.store(p_h, (b_dec * b_h + b_acc).to(p_h.dtype.element_ty))
+
+
+def wy_ring_commit(
+    k_ring, u_ring, g_ring, ssm_states, cache_indices, last_correct_steps,
+    hist_slot=None, ring_limit=8, bv=32, hb=6, num_warps=4,
+):
+    """Commit the accepted WY-ring rows of every layer (one launch). hist_slot: lazy mode, see
+    advance_ssm_states_along_accept_paths. bv/hb/num_warps: tile knobs (bench them)."""
+    L, _, H, V, K = ssm_states.shape
+    Hg, RW = k_ring.shape[2], k_ring.shape[3]
+    B = cache_indices.shape[0]
+    assert H % hb == 0 and V % bv == 0
+    hist_rows = fold_rows = cache_indices  # unused unless HIST
+    if hist_slot is not None:
+        hist_rows = torch.empty(B, dtype=torch.int32, device=cache_indices.device)
+        fold_rows = torch.empty_like(hist_rows)
+        wy_lazy_commit_prep_kernel[(B,)](
+            cache_indices, last_correct_steps, hist_slot, hist_rows, fold_rows, LIMIT=ring_limit
+        )
+    wy_ring_commit_kernel[(B, L, H // hb)](
+        k_ring, u_ring, g_ring, ssm_states, cache_indices, last_correct_steps, hist_rows, fold_rows,
+        k_ring.stride(0), u_ring.stride(0), g_ring.stride(0), ssm_states.stride(0),
+        H=H, Hg=Hg, K=K, V=V, BV=bv, HB=hb, RW=RW, HIST=hist_slot is not None,
+        num_warps=num_warps, num_stages=2,
+    )
+
+
 def advance_ssm_states_along_accept_paths(
     k_stash: torch.Tensor,
     v_stash: torch.Tensor,
@@ -969,6 +1074,8 @@ def advance_ssm_states_along_accept_paths(
     recurrent_stash: bool = False,
     u_stash: bool = False,
     ring: bool = False,
+    hist_slot: torch.Tensor = None,
+    ring_limit: int = 8,
 ):
     """Advance pooled SSM states along each request's accept path.
 
@@ -978,7 +1085,20 @@ def advance_ssm_states_along_accept_paths(
 
     track_steps/track_slots optionally snapshot the state right after a given
     accepted tree slot into another pool slot (mamba prefix-cache tracking).
+
+    hist_slot (ring=True, chain): per-pool-slot count of accepted ring rows not yet folded,
+    read by the next WY verify as hist_len. A row folds only when the next verify could
+    overflow the 16-row ring (hist + accepted > ring_limit = 16 - verify width); otherwise
+    hist_slot just grows and the state is not touched. Updated in place.
     """
+    if ring and u_stash and track_steps is None:
+        # WY chain ring (no snapshot): one CTA per (request, layer, head group).
+        return wy_ring_commit(
+            k_stash, v_stash, g_stash, ssm_states, cache_indices, last_correct_steps,
+            hist_slot=hist_slot, ring_limit=ring_limit,
+        )
+    # ponytail: track snapshots would need the hist row offset; radix tracking is off with lazy.
+    assert hist_slot is None, "lazy WY commit with mamba track snapshots"
     L = ssm_states.shape[0]
     H = ssm_states.shape[2]
     B = cache_indices.shape[0]

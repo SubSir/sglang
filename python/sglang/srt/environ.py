@@ -1484,6 +1484,10 @@ class Envs:
     # SGLANG_GDN_WY_STRIDED_QKV=1 so FlashInfer reads the strided q/k/v in place.
     SGLANG_GDN_WY_DENSE_CONV = EnvBool(False)
     SGLANG_GDN_WY_VARLEN = EnvBool(True)
+    # Lazy WY commit: accepted tokens stay in the 16-row ring (read by the next verify as history) and
+    # are folded into the state only when the ring would overflow, about every 2nd step instead of
+    # every step. Requires --disable-radix-cache and no PD disaggregation.
+    SGLANG_GDN_WY_LAZY = EnvBool(False)
     # Verify planner confidence for greedy rows from the temperature-1 selector q (not the point mass).
     SGLANG_SPEC_GREEDY_CONF_T1 = EnvBool(False)
     # Test knob: with spec_fixed_verify_len set, cycle these verify lengths over the batch ("1,8").

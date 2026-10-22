@@ -578,6 +578,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             envs.SGLANG_GDN_CHAIN_VERIFY.get() and not model_runner.is_draft_worker
         )
         self.packed_fused_verify = envs.SGLANG_GDN_PACKED_VERIFY.get()
+        # Lazy WY commit keeps up to 8 accepted tokens per slot outside `temporal`: only safe when
+        # nothing but the verify reads a live slot's state (no radix/mamba snapshots, no PD transfer).
+        sa = model_runner.server_args
+        self.wy_lazy = (
+            envs.SGLANG_GDN_WY_LAZY.get()
+            and getattr(sa, "disable_radix_cache", False)
+            and getattr(sa, "disaggregation_mode", "null") in (None, "null")
+        )
         self._chain_parents: Optional[torch.Tensor] = None
         # Compact + fused: dense [bs, T] staging reused by every GDN layer and step. Pad
         # slots keep stale finite values; they only follow a request's real tokens, so
@@ -643,6 +651,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     gc=torch.zeros(layers, pool, H, 16, dtype=torch.float32, device=dev),
                     hist=torch.zeros(rows, dtype=torch.int32, device=dev),
                 )
+                if self.wy_lazy:
+                    # Unfolded ring rows per state slot (+1: pad rows map to the last, always-0 entry).
+                    self.tree_stash.update(
+                        hist_slot=torch.zeros(pool + 1, dtype=torch.int32, device=dev),
+                        ring_limit=16 - (4 if T <= 4 else 8),
+                    )
                 __import__("logging").getLogger(__name__).info(f"GDN WY verify: ring for {pool} slots x {layers} layers")
             # Node j's parent is j - 1; the root's entry is never read.
             self._chain_parents = (
@@ -685,6 +699,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if ordinal == 0:
             # Once per verify, shared by every GDN layer (recorded in the graph).
             build_tree_ancestor_masks(self._chain_parents[:bs], T, out=st["anc"])
+            if "hist_slot" in st:
+                # Lazy commit: each row's unfolded ring rows; the commit after this verify updates them.
+                hs = st["hist_slot"]
+                torch.index_select(hs, 0, cache_indices[:bs].remainder(hs.numel()), out=st["hist"][:bs])
         # q/k/v are [1, seq, heads, dim], contiguous or row-strided views of the conv output.
         seq_len = value.shape[-3]
         # Persistent output: rows no request covers (graph padding) stay finite.
@@ -1366,6 +1384,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        st = self.tree_stash
+        if (
+            not is_target_verify
+            and st is not None
+            and "hist_slot" in st
+            and self.req_to_token_pool.mamba_map[layer.layer_id] == 0
+        ):
+            # Prefill (re)writes these slots' state: a ring left by an earlier owner must not be read.
+            hs = st["hist_slot"]
+            hs.index_fill_(0, cache_indices.remainder(hs.numel()).long(), 0)
         if self.mis_metadata is not None:
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")

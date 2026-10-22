@@ -1622,6 +1622,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 recurrent_stash=st.get("recurrent", False),
                 u_stash=st.get("u_stash", False),
                 ring=wy,
+                hist_slot=st.get("hist_slot"),
+                ring_limit=st.get("ring_limit", 8),
             )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
