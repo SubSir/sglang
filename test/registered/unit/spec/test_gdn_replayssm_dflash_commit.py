@@ -16,7 +16,12 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.gdn_backend import (
+    _validate_gdn_target_verify_layout,
+)
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +145,43 @@ class TestGDNReplaySSMGenericCommit(CustomTestCase):
 
         self.assertIs(advance.call_args.kwargs["state_batch_indices"], slots)
         self.assertIs(fold.call_args.kwargs["state_batch_indices"], slots)
+
+
+class TestGDNRaggedVerifyRefusal(CustomTestCase):
+    @staticmethod
+    def _runner(algorithm, is_draft_worker=False):
+        return SimpleNamespace(
+            spec_algorithm=algorithm, is_draft_worker=is_draft_worker
+        )
+
+    def test_gdn_target_refuses_compact_verify(self):
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+            self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE=compact"),
+        ):
+            _validate_gdn_target_verify_layout(
+                self._runner(SpeculativeAlgorithm.DSPARK)
+            )
+
+    def test_dense_verify_layouts_pass(self):
+        # Cap-accept verifies the dense window and only trims acceptance.
+        for mode in ("static", "cap-accept"):
+            with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                _validate_gdn_target_verify_layout(
+                    self._runner(SpeculativeAlgorithm.DSPARK)
+                )
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            # Only ragged-verify algorithms build ragged layouts, and only
+            # the target runs the verify.
+            for algorithm in (
+                SpeculativeAlgorithm.DFLASH,
+                SpeculativeAlgorithm.EAGLE,
+                SpeculativeAlgorithm.NONE,
+            ):
+                _validate_gdn_target_verify_layout(self._runner(algorithm))
+            _validate_gdn_target_verify_layout(
+                self._runner(SpeculativeAlgorithm.DSPARK, is_draft_worker=True)
+            )
 
 
 if __name__ == "__main__":
