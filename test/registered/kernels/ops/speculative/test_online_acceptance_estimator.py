@@ -15,6 +15,7 @@ _INIT_SLOPE = 0.5
 _INIT_BIAS = -0.2
 _DAMPING = 50.0
 _L2 = 1e-3
+_MAX_SLOPE_HALVINGS = 8
 
 
 def _ref_feature(scores: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
@@ -31,10 +32,17 @@ class _RefEstimator:
     """Float64 reference of the estimator round: observation rule, IRLS
     statistics, damped Newton refit and the reset after every refit."""
 
-    def __init__(self, num_positions: int, refit_interval: int):
+    def __init__(
+        self,
+        num_positions: int,
+        refit_interval: int,
+        init_slope: float = _INIT_SLOPE,
+        max_slope_halvings: int = _MAX_SLOPE_HALVINGS,
+    ):
         self.k = num_positions
         self.refit_interval = refit_interval
-        self.slope = torch.tensor(_INIT_SLOPE, dtype=torch.float64)
+        self.max_slope_halvings = max_slope_halvings
+        self.slope = torch.tensor(init_slope, dtype=torch.float64)
         self.bias = torch.full((num_positions,), _INIT_BIAS, dtype=torch.float64)
         self.stats = torch.zeros(num_positions, 6, dtype=torch.float64)
         self.calls = 0
@@ -80,7 +88,12 @@ class _RefEstimator:
         grad = torch.cat([g0.sum()[None], g1])
         step_slope = torch.linalg.solve(hess, grad)[0]
         step_slope = step_slope * n.sum() / (n.sum() + _DAMPING)
-        if not torch.isfinite(step_slope) or self.slope + step_slope < 0:
+        # Backtrack until the slope stays positive, else drop the step.
+        for _ in range(self.max_slope_halvings):
+            if self.slope + step_slope > 0:
+                break
+            step_slope = step_slope / 2
+        if not torch.isfinite(step_slope) or self.slope + step_slope <= 0:
             step_slope = torch.zeros((), dtype=torch.float64)
         # Intercepts: exact Newton step given the (damped) slope step, damped.
         step_bias = (g1 - b * step_slope) / (c + _L2) * n / (n + _DAMPING)
@@ -306,19 +319,66 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         self.assertEqual(est._stats.abs().sum().item(), 0.0)
         self.assertEqual(est._num_calls.item(), 0)
 
-    def test_negative_slope_step_is_rejected(self):
+    def test_slope_step_backtracks_to_stay_positive(self):
         k = 2
-        est = self._estimator(k=k, refit_interval=1)
         # Confident drafts are always rejected, unsure ones always accepted, so
-        # the Newton step points to a negative slope; only the intercepts move.
+        # the full Newton step points to a negative slope.
         x = torch.tensor([[8.0, 8.0]] * 64 + [[-8.0, -8.0]] * 64, device=self.device)
         verified = torch.full((128,), 2, device=self.device)
         accepted = torch.tensor([0] * 64 + [2] * 64, device=self.device)
-        est.observe(x, verified, accepted)
-        self.assertEqual(est.slope.item(), _INIT_SLOPE)
-        self.assertFalse(
-            torch.equal(est.intercepts.cpu(), torch.full((k,), _INIT_BIAS))
+        # From 0.5 the step is halved until the slope stays positive. From 1e-4
+        # it still crosses zero after every allowed halving and is dropped.
+        for init_slope, slope_moves in [(0.5, True), (1e-4, False)]:
+            est = self._estimator(k=k, refit_interval=1)
+            est.slope.fill_(init_slope)
+            ref = _RefEstimator(k, refit_interval=1, init_slope=est.slope.item())
+            before = est.slope.clone()
+            est.observe(x, verified, accepted)
+            ref.observe(x, verified, accepted)
+            torch.testing.assert_close(
+                est.slope.cpu().double()[0], ref.slope, atol=1e-5, rtol=1e-5
+            )
+            # The intercepts take the Newton step given the slope step taken.
+            torch.testing.assert_close(
+                est.intercepts.cpu().double(), ref.bias, atol=1e-4, rtol=1e-4
+            )
+            if slope_moves:
+                self.assertGreater(est.slope.item(), 0.0)
+                self.assertLess(est.slope.item(), init_slope)
+            else:
+                self.assertTrue(torch.equal(est.slope, before))
+            self.assertFalse(
+                torch.equal(est.intercepts.cpu(), torch.full((k,), _INIT_BIAS))
+            )
+
+    def test_saturated_slope_keeps_moving(self):
+        # An overconfident slope saturates the predictions: the curvature is
+        # small and every full Newton step crosses zero. Dropping those steps
+        # pins the slope; backtracking brings it to the generating model.
+        k, bs, refit_interval, rounds = 7, 128, 4, 10
+        init_slope, true_slope = 3.0, 1.0
+        true_bias = torch.linspace(0.6, -0.6, k)
+        est = self._estimator(k=k, max_num_reqs=bs, refit_interval=refit_interval)
+        est.slope.fill_(init_slope)
+        ref = _RefEstimator(k, refit_interval, init_slope=init_slope)
+        dropped = _RefEstimator(
+            k, refit_interval, init_slope=init_slope, max_slope_halvings=0
         )
+        gen = torch.Generator().manual_seed(6)
+        for _ in range(rounds * refit_interval):
+            x, verified, accepted = _random_step(
+                gen, bs, k, true_slope, true_bias, self.device
+            )
+            for e in (est, ref, dropped):
+                e.observe(x, verified, accepted)
+            torch.testing.assert_close(
+                est.slope.cpu().double()[0], ref.slope, atol=1e-4, rtol=1e-4
+            )
+            torch.testing.assert_close(
+                est.intercepts.cpu().double(), ref.bias, atol=1e-4, rtol=1e-4
+            )
+        self.assertEqual(dropped.slope.item(), init_slope)
+        self.assertAlmostEqual(est.slope.item(), true_slope, delta=0.15)
 
     def test_empty_batch_counts_as_a_call(self):
         est = self._estimator(k=3, refit_interval=2)

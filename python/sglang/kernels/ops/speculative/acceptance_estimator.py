@@ -17,6 +17,9 @@ import triton.language as tl
 # Columns of the per-position statistics: the X^T W X arrowhead entries a, b, c,
 # the X^T r entries g0, g1, and the observation count n.
 NUM_ACCEPTANCE_STATS = 6
+# A refit halves a slope step that would make the slope non-positive at most
+# this many times before dropping it.
+_MAX_SLOPE_HALVINGS = 8
 
 
 @triton.jit
@@ -150,6 +153,7 @@ def _observe_acceptance_kernel(
     NUM_POSITIONS: tl.constexpr,
     L2: tl.constexpr,
     DAMPING: tl.constexpr,
+    MAX_SLOPE_HALVINGS: tl.constexpr,
     NUM_STATS: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -229,8 +233,15 @@ def _observe_acceptance_kernel(
         # total observation count; each intercept by its own.
         total_n = tl.sum(n_k, axis=0)
         step_slope *= total_n / (total_n + DAMPING)
-        # Drop non-finite steps and steps that would make the slope negative.
-        valid = (tl.abs(step_slope) < float("inf")) & (slope + step_slope >= 0.0)
+        # From an overconfident fit the predictions saturate, the curvature is
+        # small and the step overshoots past zero. Backtrack: halve the step
+        # until the slope stays positive. Drop non-finite steps and steps that
+        # still cross zero after MAX_SLOPE_HALVINGS halvings.
+        for _ in tl.static_range(MAX_SLOPE_HALVINGS):
+            step_slope = tl.where(
+                slope + step_slope > 0.0, step_slope, step_slope * 0.5
+            )
+        valid = (tl.abs(step_slope) < float("inf")) & (slope + step_slope > 0.0)
         step_slope = tl.where(valid, step_slope, 0.0)
         step_bias = (g1_k - b_k * step_slope) / c_reg
         step_bias *= n_k / (n_k + DAMPING)
@@ -290,6 +301,7 @@ def observe_acceptance(
         NUM_POSITIONS=num_positions,
         L2=l2,
         DAMPING=damping,
+        MAX_SLOPE_HALVINGS=_MAX_SLOPE_HALVINGS,
         NUM_STATS=NUM_ACCEPTANCE_STATS,
         BLOCK_R=block_reqs,
         BLOCK_K=triton.next_power_of_2(num_positions),
