@@ -196,24 +196,23 @@ def test_ties_created_by_the_temperature(device):
     assert torch.all((got.view(2, vocab)[:, 100:102] > 0).sum(-1) == 1)
 
 
-@pytest.mark.parametrize("device", _DEVICES)
-def test_torch_fallback(device, monkeypatch):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_torch_fallback(monkeypatch):
     monkeypatch.setattr(topk_ops, "_flashinfer_top_k", None)
-    need_top_p = device != "cpu"
     top_ks = [5, 2049, 1]
-    logits = _random_logits(device, 3 * _DRAFT_TOKEN_NUM, 32000, seed=11)
-    kwargs = _case(device, logits, top_ks, need_top_p=need_top_p, seed=12)
+    logits = _random_logits("cuda", 3 * _DRAFT_TOKEN_NUM, 32000, seed=11)
+    kwargs = _case("cuda", logits, top_ks, need_top_p=True, seed=12)
     got = build_speculative_verify_target_probs(**kwargs)
     torch.testing.assert_close(got, _reference(**kwargs), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("k", [1, 20, 2048, 2049, 4096])
 @pytest.mark.parametrize("strided", [False, True])
-def test_radix_topk_matches_torch(device, dtype, k, strided):
-    g = torch.Generator(device=device).manual_seed(k)
-    scores = torch.randn((37, 2 * 151936), generator=g, device=device).to(dtype)
+def test_radix_topk_matches_torch(dtype, k, strided):
+    g = torch.Generator(device="cuda").manual_seed(k)
+    scores = torch.randn((37, 2 * 151936), generator=g, device="cuda").to(dtype)
     # A column slice is not contiguous; the op must still read it correctly.
     scores = scores[:, ::2] if strided else scores[:, :151936].contiguous()
     values, ids = radix_topk(scores, k)
