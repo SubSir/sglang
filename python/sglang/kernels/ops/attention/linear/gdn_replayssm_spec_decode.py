@@ -1431,7 +1431,6 @@ def commit_gdn_replayssm_after_verify(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
-    null_block_id: int = -1,
 ) -> None:
     """Commit one verify step of the compact GDN ring.
 
@@ -1455,7 +1454,7 @@ def commit_gdn_replayssm_after_verify(
         max_cache_len=spec_state.replayssm_d.shape[-2],
         max_spec_len=max_spec_len,
         fold_every_commit=fold_every_commit,
-        null_block_id=null_block_id,
+        null_block_id=-1,  # SGLang pads state slots with -1
     )
     # Capacity rows fold all layers in one launch; track rows snapshot the
     # exact crossing state without disturbing the active circular history.
@@ -1474,7 +1473,7 @@ def commit_gdn_replayssm_after_verify(
         accept_lens=accept_lens,
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
-        null_block_id=null_block_id,
+        null_block_id=-1,
     )
     # Roll back the active conv state and snapshot its interval-crossing window.
     for conv_states, intermediate_conv_window in zip(

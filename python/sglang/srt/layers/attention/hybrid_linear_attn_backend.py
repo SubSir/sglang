@@ -1600,7 +1600,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 src_indices_raw=src_indices_raw,
-                null_block_id=-1,
             )
             self._update_ple_state_after_mtp_verify(
                 state_indices_tensor,
