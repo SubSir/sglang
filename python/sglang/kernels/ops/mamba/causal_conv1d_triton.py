@@ -835,6 +835,7 @@ def _causal_conv1d_update_kernel(
     mask_x_1d = idx_feats < dim
 
     if SAVE_INTERMEDIATE and DEDUP_CONV_WINDOW:
+        tl.static_assert(KERNEL_WIDTH == 4)
         # Deduplicated window (KERNEL_WIDTH == 4, linear chain): step t's window is
         # columns t..t+2 of one shared per-channel row
         # [state[1], state[2], x_0, ..., x_{seqlen-1}]. Write those seqlen + 2
