@@ -110,7 +110,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: Optional[TargetHiddenKvInjector] = None,
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
@@ -350,6 +350,7 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        assert self.kv_injector is not None, "commit_hidden needs a kv_injector"
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,

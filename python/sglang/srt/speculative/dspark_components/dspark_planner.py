@@ -76,8 +76,12 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
+        external_confidence: bool = False,
     ) -> None:
         self.draft_model = draft_model
+        # The worker supplies the confidence itself (a draft without a
+        # confidence head), so ragged modes need no head.
+        self._external_confidence = external_confidence
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
@@ -135,7 +139,7 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if self._confidence_head is None and not self._external_confidence:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
                     f"schedules per-request verify lengths from the draft confidence "
@@ -205,7 +209,7 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._confidence_head is not None or self._external_confidence
 
     @property
     def schedules_verify_budget(self) -> bool:
