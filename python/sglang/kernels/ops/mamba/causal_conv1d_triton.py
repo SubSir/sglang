@@ -667,6 +667,8 @@ def _causal_conv1d_update_kernel(
     IS_VARLEN_X: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     OUT_PACKED: tl.constexpr = False,
+    DEDUP_WINDOW: tl.constexpr = False,
+    NP2_WIN: tl.constexpr = 1,
 ):
     # ruff: noqa: E501
     if USE_GDC:
@@ -847,6 +849,33 @@ def _causal_conv1d_update_kernel(
     x_base_1d = x_base  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
 
+    if SAVE_INTERMEDIATE and DEDUP_WINDOW:
+        # Deduplicated window (memory_pool._allocate_deduplicated_conv_window, K=4 only):
+        # per channel the buffer is [state[1], state[2], x_0, .., x_{T-1}] and step t's
+        # window is columns t..t+2. Write it as one [BLOCK_N, NP2_WIN] tile, contiguous
+        # along the window axis, instead of 3 lane-strided 2-byte stores per token
+        # (24 per channel at T=8, each touching a separate 32B sector).
+        idx_c = tl.arange(0, NP2_WIN)
+        x_win = tl.load(
+            x_base[:, None] + ((idx_c - 2) * stride_x_token)[None, :],
+            mask_w[:, None] & ((idx_c >= 2) & (idx_c - 2 < x_len))[None, :],
+            other=0.0,
+        )
+        win = tl.where(
+            (idx_c < 2)[None, :],
+            tl.where((idx_c == 0)[None, :], col1[:, None], col2[:, None]),
+            x_win,
+        )
+        # Same columns the per-token path writes: windows t < x_len, none for an empty slot.
+        tl.store(
+            intermediate_conv_window_ptr
+            + intermediate_state_batch_coord * stride_inter_seq
+            + (idx_feats * stride_inter_dim)[:, None]
+            + (idx_c * stride_inter_win)[None, :],
+            win,
+            mask=mask_w[:, None] & ((idx_c < x_len + 2) & (x_len > 0))[None, :],
+        )
+
     # STEP 5: compute each token
     for idx_token in tl.static_range(seqlen):
         acc = acc_preload
@@ -992,7 +1021,7 @@ def _causal_conv1d_update_kernel(
                 col1 = col2
                 col2 = matrix_x
 
-            if SAVE_INTERMEDIATE:
+            if SAVE_INTERMEDIATE and not DEDUP_WINDOW:
                 # Save the window state after consuming this token
                 # Layout: [seq(cache line), step, dim, win(K-1)]
                 base_ptr = (
@@ -1190,6 +1219,16 @@ def causal_conv1d_update(
         )
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+    # Overlapping as_strided view (step stride == window stride): store the shared
+    # buffer once per program. Chain (no tree mask), K=4 only; anything else keeps
+    # the per-token stores.
+    dedup_window = (
+        intermediate_conv_window is not None
+        and conv_state_indices is not None
+        and retrieve_next_token is None
+        and width == 4
+        and stride_inter_step == stride_inter_win
+    )
 
     # prepare retrieve next token buffer strides if provided
     if retrieve_next_token is not None:
@@ -1282,6 +1321,8 @@ def causal_conv1d_update(
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         IS_VARLEN_X=query_start_loc is not None,
         OUT_PACKED=out_packed,
+        DEDUP_WINDOW=dedup_window,
+        NP2_WIN=triton.next_power_of_2(seqlen + width - 2),
         **pdl_kwargs,
     )
     if unsqueeze:
