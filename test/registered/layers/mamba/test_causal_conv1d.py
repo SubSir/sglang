@@ -491,6 +491,74 @@ def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
     torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("seqlen", [2, 4, 8, 16])
+@pytest.mark.parametrize("dim", [1000, 10240])
+@pytest.mark.parametrize("with_padding", [True, False])
+def test_causal_conv1d_update_dedup_window_matches_per_token(
+    with_padding, dim, seqlen, itype
+):
+    """The deduplicated verify window is written as one tile; it must hold the
+    same bytes as the per-token stores into a dense window and leave the slots of
+    padded rows untouched."""
+    device = get_device()
+    torch.manual_seed(0)
+    batch, width, num_slots = 6, 4, 16
+    # Verify tokens are token-major, as in the GDN and Mamba verify reshape.
+    x = torch.randn(batch, seqlen, dim, device=device, dtype=itype).transpose(1, 2)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype)
+    conv_state = torch.randn(num_slots, dim, width - 1, device=device, dtype=itype)
+    slots = torch.randperm(num_slots, device=device)[: 2 * batch].to(torch.int32)
+    conv_state_indices, window_indices = slots[:batch].clone(), slots[batch:]
+    if with_padding:
+        conv_state_indices[0] = conv_state_indices[-1] = PAD_SLOT_ID
+    real = conv_state_indices != PAD_SLOT_ID
+
+    # MambaPool._allocate_deduplicated_conv_window: one [dim, T + K - 2] row per
+    # slot, viewed as [T, dim, K - 1] windows with step stride == window stride.
+    shared = torch.randn(num_slots, dim, seqlen + width - 2, device=device, dtype=itype)
+    dedup = shared.as_strided(
+        (num_slots, seqlen, dim, width - 1), (shared.stride(0), 1, shared.stride(1), 1)
+    )
+    dense = torch.randn(num_slots, seqlen, dim, width - 1, device=device, dtype=itype)
+    shared_before, dense_before = shared.clone(), dense.clone()
+
+    def run(window):
+        state = conv_state.clone()
+        out = causal_conv1d_update(
+            x,
+            state,
+            weight,
+            bias,
+            activation="silu",
+            conv_state_indices=conv_state_indices,
+            intermediate_conv_window=window,
+            intermediate_state_indices=window_indices,
+            pad_slot_id=PAD_SLOT_ID,
+        )
+        return out, state
+
+    out_tile, state_tile = run(dedup)
+    out_ref, state_ref = run(dense)
+
+    # Each real row's shared window row is [state[1], state[2], x_0, ..., x_{T-1}].
+    rows = torch.cat(
+        [conv_state[conv_state_indices[real].long(), :, 1:], x[real]], dim=-1
+    )
+    written = window_indices[real].long()
+    expected_shared = shared_before.clone()
+    expected_shared[written] = rows
+    expected_dense = dense_before.clone()
+    expected_dense[written] = rows.unfold(-1, width - 1, 1).transpose(1, 2)
+
+    assert torch.equal(shared, expected_shared)
+    assert torch.equal(dense, expected_dense)
+    assert torch.equal(dedup[written], dense[written])
+    assert torch.equal(out_tile[real], out_ref[real])
+    assert torch.equal(state_tile, state_ref)
+
+
 if __name__ == "__main__":
     import sys
 
