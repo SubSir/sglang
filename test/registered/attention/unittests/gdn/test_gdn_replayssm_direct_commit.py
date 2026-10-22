@@ -260,6 +260,12 @@ def _rows_and_slots(num_slots=NUM_SLOTS, num_real=NUM_REAL):
     return req_rows, cache_indices
 
 
+def _dense_qsl(num_slots=NUM_SLOTS):
+    return torch.arange(
+        0, num_slots * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
+    )
+
+
 def _dense_inputs(num_slots=NUM_SLOTS):
     return [
         (
@@ -342,9 +348,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         template = _template(ssm_dtype)
         req_rows, cache_indices = _rows_and_slots()
         real_rows, real_slots = req_rows[:NUM_REAL], cache_indices[:NUM_REAL].long()
-        qsl = torch.arange(
-            0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
-        )
+        qsl = _dense_qsl()
         arms = {
             "replayssm": _Arm(
                 template,
@@ -510,9 +514,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         track_slots = torch.tensor(unused[:NUM_REAL], device="cuda")
         accept = torch.tensor([8, 5, 3, 1, 6, 8], device="cuda")
         track_steps = torch.tensor([7, 2, -1, 0, 5, 3], device="cuda")
-        qsl = torch.arange(
-            0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
-        )
+        qsl = _dense_qsl()
         batch = _batch(NUM_SLOTS * WIDTH, req_rows)
         tracked, plain, at_step = (self._replayssm(template) for _ in range(3))
         backends = [
@@ -592,9 +594,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         layers = _make_layers()
         template = _template(ssm_dtype)
         req_rows, cache_indices = _rows_and_slots()
-        qsl = torch.arange(
-            0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
-        )
+        qsl = _dense_qsl()
         batch = _batch(NUM_SLOTS * WIDTH, req_rows)
         clean, poisoned = (
             _Arm(
@@ -658,9 +658,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         layers = _make_layers()
         template = _template(torch.bfloat16)
         req_rows, cache_indices = _rows_and_slots()
-        qsl = torch.arange(
-            0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
-        )
+        qsl = _dense_qsl()
         batch = _batch(NUM_SLOTS * WIDTH, req_rows)
         arm = self._replayssm(template)
         slotless = cache_indices.clone()
