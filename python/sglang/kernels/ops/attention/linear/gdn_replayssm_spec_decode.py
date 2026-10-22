@@ -816,8 +816,10 @@ def _advance_gdn_spec_cursors_kernel(
     is_flush_ptr,
     num_accepted_ptr,
     replay_indices_ptr,
+    state_indices_ptr,
     n_rows,
     stride_replay_indices: tl.constexpr,
+    stride_state_indices: tl.constexpr,
     stride_na: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
     MAX_SPEC_LEN: tl.constexpr,
@@ -828,12 +830,17 @@ def _advance_gdn_spec_cursors_kernel(
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
-    blk = tl.load(
-        replay_indices_ptr + offs * stride_replay_indices,
+    state_idx = tl.load(
+        state_indices_ptr + offs * stride_state_indices,
         mask=row_mask,
         other=NULL_BLOCK_ID,
     ).to(tl.int64)
-    valid = row_mask & (blk > NULL_BLOCK_ID)
+    # A row without a state slot neither wrote the ring in the verify nor gets
+    # folded or finished by the commit, so its cursors must not move either.
+    valid = row_mask & (state_idx > NULL_BLOCK_ID)
+    blk = tl.load(
+        replay_indices_ptr + offs * stride_replay_indices, mask=valid, other=0
+    ).to(tl.int64)
 
     write_pos = tl.load(write_pos_ptr + blk, mask=valid, other=0).to(tl.int32)
     cache_base = tl.load(cache_base_ptr + blk, mask=valid, other=0).to(tl.int32)
@@ -861,7 +868,8 @@ def _advance_gdn_spec_cursors_kernel(
     # committed state. The strict '>' uses the buffer exactly (max write_pos at a
     # flush step = max_cache_len - max_spec_len, zero headroom); usable committed
     # history is max_cache_len - 2*max_spec_len + 1; raise the cache length
-    # for more. Config enforces max_cache_len >= 2 * max_spec_len.
+    # for more. The pool enforces max_cache_len >= max_spec_len; below
+    # 2 * max_spec_len every commit folds.
     if FOLD_EVERY_COMMIT:
         next_is_flush = (new_wp > 0).to(tl.int8)
     else:
@@ -1237,13 +1245,18 @@ def commit_gdn_replayssm_spec(
     is_flush: torch.Tensor,
     num_accepted: torch.Tensor,  # [n_rows] int  (already includes the bonus token)
     replay_indices: torch.Tensor,  # [n_rows] int active request row
+    state_batch_indices: torch.Tensor,  # [n_rows] int physical mamba slot
     max_cache_len: int,
     max_spec_len: int,
     fold_every_commit: bool = False,
     cache_buf_len: int | None = None,
     null_block_id: int = 0,
 ):
-    """Advance request-keyed cursors once per verify step (device-only)."""
+    """Advance request-keyed cursors once per verify step (device-only).
+
+    Rows whose state slot is ``<= null_block_id`` keep their cursors, like the
+    verify, commit and finish kernels skip them.
+    """
     if cache_buf_len is None:
         cache_buf_len = max_cache_len
     n_rows = replay_indices.shape[0]
@@ -1254,8 +1267,10 @@ def commit_gdn_replayssm_spec(
         is_flush,
         num_accepted,
         replay_indices,
+        state_batch_indices,
         n_rows,
         stride_replay_indices=replay_indices.stride(0),
+        stride_state_indices=state_batch_indices.stride(0),
         stride_na=num_accepted.stride(0),
         MAX_CACHE_LEN=max_cache_len,
         MAX_SPEC_LEN=max_spec_len,

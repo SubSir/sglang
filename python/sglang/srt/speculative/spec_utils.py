@@ -1011,6 +1011,7 @@ def commit_mamba_states_after_verify(
             is_flush=mamba_pool.replayssm_is_flush,
             num_accepted=accept_lens,  # [bs], includes the bonus token
             replay_indices=replay_indices,
+            state_batch_indices=state_batch_indices,
             max_cache_len=spec_state.replayssm_d.shape[-2],
             max_spec_len=draft_token_num,
             fold_every_commit=spec_state.temporal.dtype != torch.float32,
