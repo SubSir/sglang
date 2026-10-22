@@ -11,7 +11,10 @@ chain of verify/commit steps, calibrated against the snapshot path (recurrent
 verify + per-draft snapshot scatter) on the same inputs. Track slots must hold
 the state of the tracked step, non-finite rejected drafts must not reach
 accepted outputs or the committed state, the request cursors must move only
-for rows with a state slot, and CUDA graph replay must match eager.
+for rows with a state slot, and CUDA graph replay must match eager. A ragged
+verify step, where each request owns a variable number of packed tokens, must
+match the dense step of the same real tokens bit for bit, in eager mode and in
+CUDA graph replay.
 """
 
 import math
@@ -36,6 +39,10 @@ from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    build_capture_verify_lens,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -153,10 +160,15 @@ class _Arm:
             )
             self.pool = SimpleNamespace()
         self.dispatcher = dispatcher
+        self.replayssm = replayssm
         self.lazy = lazy
 
-    def backend(self, query_start_loc, cache_indices):
+    def backend(self, query_start_loc, cache_indices, packed=False):
+        """packed: compact verify, where every target verify is read by
+        query_start_loc."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
+        backend.use_replayssm_spec_verify = self.replayssm
+        backend.packed_target_verify = packed
         backend.req_to_token_pool = SimpleNamespace(
             size=NUM_ROWS - 1,
             mamba2_layer_cache=self.state.at_layer_idx,
@@ -176,7 +188,9 @@ class _Arm:
         )
         backend.kernel_dispatcher = self.dispatcher
         backend.mis_metadata = None
-        backend._use_strided_target_verify_qkv = False
+        # As in production (_target_verify_supports_strided_qkv), ReplaySSM
+        # reads q/k/v as strided views of the conv output.
+        backend._use_strided_target_verify_qkv = self.replayssm
         hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
         hybrid.linear_attn_backend = backend
         self.hybrid = hybrid
@@ -772,6 +786,249 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                     graph_arm.pool.replayssm_cache_base,
                     eager_arm.pool.replayssm_cache_base,
                 )
+            )
+
+    def test_ragged_matches_dense(self):
+        """A ragged step equals the dense step of the same real tokens bit for
+        bit: outputs, ring records, committed state, conv and cursors."""
+        cases = {
+            # No padding slots; lengths 1 and W.
+            "unpadded": ([3, WIDTH, 1, 5], 4, WIDTH + 9),
+            # Padding slots left with zero tokens.
+            "zero_length_padding": ([1, WIDTH, 3, 4], 6, WIDTH + 8),
+            # Top tier, padding slots capped at W, uncovered leftovers.
+            "uncovered_leftover": ([2, WIDTH - 1], 4, 4 * WIDTH),
+            # Top tier fully used: the dense identity layout.
+            "full_top_tier": ([WIDTH] * 4, 4, 4 * WIDTH),
+            # Top tier, no padding slot: the last request's row is extended
+            # past its verify length by the tier leftover.
+            "extended_last_row": ([1, 1, 1, 1], 4, 4 * WIDTH),
+        }
+        for ssm_dtype in (torch.bfloat16, torch.float32):
+            for case, (real_lens, num_slots, num_tokens) in cases.items():
+                with self.subTest(ssm_dtype=ssm_dtype, case=case):
+                    self._check_ragged(ssm_dtype, real_lens, num_slots, num_tokens)
+
+    def _check_ragged(self, ssm_dtype, real_lens, num_slots, num_tokens):
+        torch.manual_seed(1234 + num_slots + num_tokens)
+        layers = _make_layers()
+        template = _template(ssm_dtype)
+        num_real = len(real_lens)
+        req_rows, cache_indices = _rows_and_slots(num_slots, num_real)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=real_lens, device="cuda", grid=[num_tokens]
+        )
+        # The capped layout CUDA-graph replay hands the mamba backends.
+        qsl = layout.padded_to_bucket(padded_bs=num_slots, cap=WIDTH).qo_indptr_device
+        starts = qsl.tolist()
+
+        # The dense arm holds the same real tokens and random padding steps.
+        packed_inputs, dense_inputs = [], _dense_inputs(num_slots)
+        for dense in dense_inputs:
+            packed = tuple(_randn(num_tokens, x.shape[1]) for x in dense)
+            for i, length in enumerate(real_lens):
+                for src, dst in zip(packed, dense):
+                    dst[i * WIDTH : i * WIDTH + length] = src[
+                        starts[i] : starts[i] + length
+                    ]
+            packed_inputs.append(packed)
+
+        ragged, dense = self._replayssm(template), self._replayssm(template)
+        # Same circular ring origin in both arms, away from zero.
+        base = torch.randint(0, RING, (NUM_ROWS,), device="cuda", dtype=torch.int32)
+        for arm in (ragged, dense):
+            arm.pool.replayssm_cache_base.copy_(base)
+        dense_qsl = torch.arange(
+            0, num_slots * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
+        )
+        out = _verify(
+            ragged.backend(qsl, cache_indices, packed=True),
+            layers,
+            _batch(num_tokens, req_rows),
+            packed_inputs,
+        )
+        expected = _verify(
+            dense.backend(dense_qsl, cache_indices),
+            layers,
+            _batch(num_slots * WIDTH, req_rows),
+            dense_inputs,
+        )
+
+        real_tokens = torch.cat(
+            [
+                torch.arange(starts[i], starts[i] + n, device="cuda")
+                for i, n in enumerate(real_lens)
+            ]
+        )
+        dense_tokens = torch.cat(
+            [
+                torch.arange(i * WIDTH, i * WIDTH + n, device="cuda")
+                for i, n in enumerate(real_lens)
+            ]
+        )
+        for actual, ref in zip(out, expected):
+            actual = actual.reshape(-1, V_HEADS, HEAD_DIM)
+            ref = ref.reshape(-1, V_HEADS, HEAD_DIM)
+            self.assertEqual(actual.shape[0], num_tokens)
+            # Padding rows and uncovered tier leftovers come out as zeros.
+            self.assertTrue(torch.isfinite(actual).all())
+            self.assertTrue(torch.equal(actual[real_tokens], ref[dense_tokens]))
+        state, dense_state = ragged.state, dense.state
+        for i, n in enumerate(real_lens):
+            row = int(req_rows[i])
+            positions = (int(base[row]) + torch.arange(n, device="cuda")) % RING
+            for name in RING_FIELDS:
+                ring, dense_ring = getattr(state, name), getattr(dense_state, name)
+                self.assertTrue(
+                    torch.equal(
+                        ring[:, row].index_select(2, positions),
+                        dense_ring[:, row].index_select(2, positions),
+                    ),
+                    name,
+                )
+        # Verify never writes the SSM state.
+        self.assertTrue(torch.equal(state.temporal, template["temporal"]))
+
+        # Commit an accepted step below each request's verify length,
+        # including both ends of the range.
+        accept_steps = torch.tensor(
+            [
+                0 if i == 0 else n - 1 if i == 1 else int(torch.randint(n, ()))
+                for i, n in enumerate(real_lens)
+            ],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        for arm in (ragged, dense):
+            arm.commit(accept_steps, req_rows[:num_real])
+        self.assertTrue(torch.equal(state.temporal, dense_state.temporal))
+        self.assertTrue(torch.equal(state.conv[0], dense_state.conv[0]))
+        for name in ("replayssm_spec_write_pos", "replayssm_cache_base"):
+            self.assertTrue(
+                torch.equal(getattr(ragged.pool, name), getattr(dense.pool, name))
+            )
+        committed = cache_indices[:num_real].long()
+        self.assertFalse(
+            torch.equal(
+                state.temporal[:, committed], template["temporal"][:, committed]
+            )
+        )
+
+    def test_ragged_cuda_graph_replay_matches_eager(self):
+        """A ragged verify captured once at a token tier replays live layouts
+        (fewer requests, mixed lengths, uncovered leftovers) like eager, whether
+        the capture layout was ragged or uniform."""
+        for ssm_dtype in (torch.bfloat16, torch.float32):
+            for uniform_capture in (False, True):
+                with self.subTest(ssm_dtype=ssm_dtype, uniform_capture=uniform_capture):
+                    self._check_ragged_graph(ssm_dtype, uniform_capture)
+
+    def _check_ragged_graph(self, ssm_dtype, uniform_capture):
+        torch.manual_seed(2468)
+        layers = _make_layers()
+        template = _template(ssm_dtype)
+        num_slots = NUM_SLOTS
+        if uniform_capture:
+            num_tokens = num_slots * WIDTH
+            capture_lens = [WIDTH] * num_slots
+        else:
+            num_tokens = 3 * WIDTH + 5
+            capture_lens = build_capture_verify_lens(
+                num_tokens=num_tokens, num_slots=num_slots, num_draft_tokens=WIDTH
+            )
+        qsl = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=capture_lens, device="cuda", grid=[num_tokens]
+        ).qo_indptr_device.clone()
+        static_rows, static_cache = _rows_and_slots(num_slots, num_slots)
+        static_inputs = [
+            tuple(_randn(num_tokens, n) for n in (DIM, V_HEADS, V_HEADS))
+            for _ in layers
+        ]
+        graph_arm = self._replayssm(template)
+        graph_backend = graph_arm.backend(qsl, static_cache, packed=True)
+        capture_batch = _batch(num_tokens, static_rows)
+
+        def run():
+            return [
+                graph_backend.forward_extend(layer, capture_batch, mixed_qkv, a, b)
+                for layer, (mixed_qkv, a, b) in zip(layers, static_inputs)
+            ]
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = run()
+
+        for real_lens in (
+            [WIDTH, 1, 3, WIDTH, 2],
+            [1, 1],
+            [WIDTH] * 3 + [5],
+            # One padding row capped at W: uncovered tier leftovers.
+            [1, 2, 1, 1, 1, 1],
+            # No padding row: the last row is extended, the rest uncovered.
+            [1] * NUM_SLOTS,
+        ):
+            num_real = len(real_lens)
+            live = RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=real_lens, device="cuda", grid=[num_tokens]
+            ).padded_to_bucket(padded_bs=num_slots, cap=WIDTH)
+            req_rows, cache_indices = _rows_and_slots(num_slots, num_real)
+            for static in static_inputs:
+                for tensor in static:
+                    tensor.copy_(_randn(*tensor.shape))
+            qsl.copy_(live.qo_indptr_device)
+            static_rows.copy_(req_rows)
+            static_cache.copy_(cache_indices)
+
+            eager_arm = self._replayssm(template)
+            base = torch.randint(0, RING, (NUM_ROWS,), device="cuda", dtype=torch.int32)
+            for arm in (graph_arm, eager_arm):
+                arm.state.temporal.copy_(template["temporal"])
+                arm.state.conv[0].copy_(template["conv"])
+                for name in RING_FIELDS:
+                    getattr(arm.state, name).zero_()
+                arm.pool.replayssm_cache_base.copy_(base)
+            graph.replay()
+
+            expected = _verify(
+                eager_arm.backend(live.qo_indptr_device, cache_indices, packed=True),
+                layers,
+                _batch(num_tokens, req_rows),
+                static_inputs,
+            )
+            starts = live.qo_indptr_device.tolist()
+            real = torch.cat(
+                [
+                    torch.arange(starts[i], starts[i] + n, device="cuda")
+                    for i, n in enumerate(real_lens)
+                ]
+            )
+            for actual, ref in zip(static_out, expected):
+                actual = actual.reshape(-1, V_HEADS, HEAD_DIM)
+                ref = ref.reshape(-1, V_HEADS, HEAD_DIM)
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual[real], ref[real]))
+            for name in RING_FIELDS:
+                self.assertTrue(
+                    torch.equal(
+                        getattr(graph_arm.state, name), getattr(eager_arm.state, name)
+                    ),
+                    name,
+                )
+            accept_steps = torch.tensor(
+                [int(torch.randint(n, ())) for n in real_lens], device="cuda"
+            )
+            graph_arm.commit(accept_steps, req_rows[:num_real])
+            eager_arm.commit(accept_steps, req_rows[:num_real])
+            self.assertTrue(
+                torch.equal(graph_arm.state.temporal, eager_arm.state.temporal)
+            )
+            self.assertTrue(
+                torch.equal(graph_arm.state.conv[0], eager_arm.state.conv[0])
             )
 
 

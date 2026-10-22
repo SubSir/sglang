@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
@@ -26,6 +27,8 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     _validate_gdn_target_verify_layout,
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.runtime_context import override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -276,23 +279,74 @@ class TestGDNRaggedVerifyRefusal(CustomTestCase):
             spec_algorithm=algorithm, is_draft_worker=is_draft_worker
         )
 
-    def test_gdn_target_refuses_compact_verify(self):
+    def test_snapshot_verify_refuses_compact_verify(self):
         with (
             envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
             self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE=compact"),
         ):
-            _validate_gdn_target_verify_layout(self._runner())
+            _validate_gdn_target_verify_layout(
+                self._runner(), use_replayssm_spec_verify=False
+            )
+
+    def test_replayssm_verify_takes_compact_verify(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _validate_gdn_target_verify_layout(
+                self._runner(), use_replayssm_spec_verify=True
+            )
 
     def test_dense_verify_layouts_pass(self):
         # Cap-accept verifies the dense window and only trims acceptance.
         for mode in ("static", "cap-accept"):
             with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
-                _validate_gdn_target_verify_layout(self._runner())
+                _validate_gdn_target_verify_layout(
+                    self._runner(), use_replayssm_spec_verify=False
+                )
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             # Only ragged-verify algorithms build ragged layouts, and only
             # the target runs the verify.
-            _validate_gdn_target_verify_layout(self._runner(ragged_verify=False))
-            _validate_gdn_target_verify_layout(self._runner(is_draft_worker=True))
+            _validate_gdn_target_verify_layout(
+                self._runner(ragged_verify=False), use_replayssm_spec_verify=False
+            )
+            _validate_gdn_target_verify_layout(
+                self._runner(is_draft_worker=True), use_replayssm_spec_verify=False
+            )
+
+    def test_ragged_replayssm_spec_needs_a_ring_writing_verify_on_kda_only(self):
+        """GDN reads ragged rows with its ReplaySSM verify under any verify
+        backend; KDA still needs a verify kernel that writes the ring."""
+        cases = (
+            ({"linear_attention_layers": [0]}, None, True),
+            ({"linear_attention_layers": [0]}, "flashinfer", True),
+            ({"kda_layers": [0]}, None, False),
+            ({"kda_layers": [0]}, "flashinfer", False),
+            ({"kda_layers": [0]}, "triton", True),
+        )
+        for linear_config, verify, accepted in cases:
+            with (
+                self.subTest(linear_config=linear_config, verify=verify),
+                envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+                patch(
+                    "sglang.srt.arg_groups.attention_hook.model_config_of",
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(linear_attn_config=linear_config)
+                    ),
+                ),
+                override_platform(is_sm100=False),
+                override_platform(is_cuda=False),
+            ):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="DSPARK",
+                    enable_linear_replayssm_spec=True,
+                    linear_attn_decode_backend="triton",
+                    linear_attn_verify_backend=verify,
+                    mamba_ssm_dtype="bfloat16",
+                )
+                if accepted:
+                    handle_linear_attn_backend(args)
+                else:
+                    with self.assertRaisesRegex(ValueError, "ring-writing verify"):
+                        handle_linear_attn_backend(args)
 
 
 if __name__ == "__main__":
