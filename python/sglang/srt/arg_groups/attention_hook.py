@@ -469,25 +469,25 @@ def handle_linear_attn_backend(server_args: Any):
 
         ragged_mode = read_ragged_verify_mode()
         if ragged_mode is not RaggedVerifyMode.STATIC:
-            # Ragged ring-writes need the KDA fold-every-commit family
-            # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
-            # back to it for ragged layouts). The GDN ring-write kernels do
-            # not take the ragged layout and the flashinfer verify kernel
-            # never writes the ring -> a stale ring would be folded; keep
-            # refusing those combinations.
+            # Ragged layouts come from DSPARK/DFLASH, which commit through the
+            # fold-every-commit path. GDN reads the packed rows with its
+            # ReplaySSM verify, which writes the ring under every verify
+            # backend. KDA writes the ring from the triton verify kernel
+            # (nv_cutedsl falls back to it for ragged layouts); its flashinfer
+            # verify never writes the ring, so the commit would fold a stale
+            # one.
             _algo = (cfg.speculative_algorithm or "").upper()
             verify = cfg.linear_attn_verify_backend
-            if _algo not in ("DSPARK", "DFLASH") or verify not in (
-                "triton",
-                "nv_cutedsl",
+            if _algo not in ("DSPARK", "DFLASH") or (
+                verify not in ("triton", "nv_cutedsl")
+                and uses_kda_attention(model_config_of(server_args).hf_config)
             ):
                 raise ValueError(
                     "--enable-linear-replayssm-spec with "
-                    f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
-                    "KDA fold-every-commit family (DSPARK/DFLASH) and a "
-                    "ring-writing verify kernel (--linear-attn-verify-backend "
-                    "triton or nv_cutedsl); got "
-                    f"algorithm={cfg.speculative_algorithm!r}, "
+                    f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires "
+                    "DSPARK or DFLASH, and on KDA models a ring-writing verify "
+                    "kernel (--linear-attn-verify-backend triton or nv_cutedsl); "
+                    f"got algorithm={cfg.speculative_algorithm!r}, "
                     f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.disaggregation_mode == "prefill":

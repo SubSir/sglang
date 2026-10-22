@@ -73,6 +73,7 @@ def gdn_replayssm_spec_circular_kernel(
     cache_base,  # [num_replay_slots] int32
     is_flush_flags,  # [num_replay_slots] int8
     scale,
+    num_tokens,  # rows of the packed q/k/v/o buffers
     stride_q_t: tl.constexpr,  # per-token stride of q (= H*K)
     stride_k_t: tl.constexpr,  # per-token stride of k (= H*K)
     stride_v_t: tl.constexpr,  # per-token stride of v (= HV*V)
@@ -137,6 +138,19 @@ def gdn_replayssm_spec_circular_kernel(
 
     # output pointer (packed): token (bos + o_s), value-head i_hv, dim o_v
     p_o = o + (bos + o_s_safe[:, None]) * stride_o_t + i_hv * V + o_v[None, :]
+
+    if not IS_FLUSH:
+        if i_n == tl.num_programs(1) - 1:
+            # Packed rows past the last request belong to no request (CUDA-graph
+            # tier leftovers under ragged verify). Zero them like a null slot's
+            # rows so every output row is finite.
+            for t0 in range(eos, num_tokens, BS):
+                o_t = t0 + o_s
+                tl.store(
+                    o + o_t[:, None] * stride_o_t + i_hv * V + o_v[None, :],
+                    tl.zeros([BS, BV], dtype=tl.float32).to(o.dtype.element_ty),
+                    mask=(o_t < num_tokens)[:, None] & mask_v[None, :],
+                )
 
     if IS_FLUSH:
         if state_idx <= NULL_BLOCK_ID:
@@ -999,6 +1013,7 @@ def _launch_gdn_spec(
         cache_base,
         is_flush,
         scale,
+        out.shape[0],
         q.stride(0),
         k.stride(0),
         v.stride(0),
