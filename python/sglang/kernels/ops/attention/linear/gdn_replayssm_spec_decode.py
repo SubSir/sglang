@@ -844,21 +844,16 @@ def _compact_history_parts(
 def _compact_history_keys(
     k_rows,
     i_h,
-    base,
-    chunk_start,
-    n_history,
-    o_r,
+    phys_r,
+    history_r,
     o_k,
     K: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
-    HISTORY_CHUNK: tl.constexpr,
 ):
     """Transposed key rows of one history chunk, zero past the history."""
-    step_r = chunk_start + o_r % HISTORY_CHUNK
-    phys_r = (base + step_r) & (MAX_CACHE_LEN - 1)
     keys = tl.load(
         k_rows + (i_h * MAX_CACHE_LEN + phys_r[:, None]) * K + o_k[None, :],
-        mask=(step_r < n_history)[:, None],
+        mask=history_r[:, None],
         other=0.0,
     )
     return tl.trans(keys)
@@ -978,8 +973,10 @@ def gdn_replayssm_head_group_commit_kernel(
     NUM_CHUNKS: tl.constexpr = tl.cdiv(MAX_CACHE_LEN, HISTORY_CHUNK)
     if NUM_CHUNKS == 1:
         n_chunks = 1
+        step_r = o_r % HISTORY_CHUNK
+        phys_r = (base + step_r) & (MAX_CACHE_LEN - 1)
         ring_keys = _compact_history_keys(
-            k_rows, i_h, base, 0, n_history, o_r, o_k, K, MAX_CACHE_LEN, HISTORY_CHUNK
+            k_rows, i_h, phys_r, step_r < n_history, o_k, K, MAX_CACHE_LEN
         )
     else:
         n_chunks = tl.maximum(tl.cdiv(n_history, HISTORY_CHUNK), 1)
@@ -999,16 +996,7 @@ def gdn_replayssm_head_group_commit_kernel(
             keys = ring_keys
         else:
             keys = _compact_history_keys(
-                k_rows,
-                i_h,
-                base,
-                chunk_start,
-                n_history,
-                o_r,
-                o_k,
-                K,
-                MAX_CACHE_LEN,
-                HISTORY_CHUNK,
+                k_rows, i_h, phys_r, history_r, o_k, K, MAX_CACHE_LEN
             )
         gates = tl.load(
             g_cache + i_hv * MAX_CACHE_LEN + phys, mask=o_t < n_history, other=0.0
