@@ -488,24 +488,6 @@ class NgramEmbeddingInfo:
         )
 
 
-def spec_mrope_token_deltas(
-    *,
-    deltas: torch.Tensor,
-    num_tokens: int,
-    verify_lens: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Each spec-forward token's mRoPE delta: the tokens split evenly over the
-    requests, or verify_lens[i] tokens for request i under a ragged verify,
-    then graph-padding tokens with delta 0."""
-    if verify_lens is None:
-        return deltas.repeat_interleave(num_tokens // deltas.numel())
-    ends = torch.cumsum(verify_lens.to(device=deltas.device, dtype=torch.int64), 0)
-    req = torch.searchsorted(
-        ends, torch.arange(num_tokens, device=deltas.device), right=True
-    )
-    return torch.cat((deltas, deltas.new_zeros(1)))[req]
-
-
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -1552,11 +1534,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             for i in range(batch_size)
         ]
-        token_deltas = spec_mrope_token_deltas(
-            deltas=torch.cat(mrope_deltas).to(device=device),
-            num_tokens=seq_positions.numel(),
-            verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
-        )
+        deltas = torch.cat(mrope_deltas).to(device=device)
+        num_tokens = seq_positions.numel()
+        if ragged_layout is None:
+            token_deltas = deltas.repeat_interleave(num_tokens // batch_size)
+        else:
+            # verify_lens[i] tokens of request i, then graph padding with delta 0.
+            ends = torch.cumsum(ragged_layout.verify_lens.to(device, torch.int64), 0)
+            req = torch.searchsorted(
+                ends, torch.arange(num_tokens, device=device), right=True
+            )
+            token_deltas = torch.cat((deltas, deltas.new_zeros(1)))[req]
         self.mrope_positions = (seq_positions + token_deltas).unsqueeze(0).repeat(3, 1)
 
     def _expand_mrope_from_input(

@@ -3140,7 +3140,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
         if self._acceptance_estimator is not None:
-            self._observe_acceptance(accept_len=accept_len, layout=layout)
+            # The drafts the target verified (every draft without a layout)
+            # and how many of them it accepted.
+            self._acceptance_estimator.observe(
+                self._draft_feature,
+                num_verified=(
+                    torch.full_like(accept_len, int(self.block_size) - 1)
+                    if layout is None
+                    else layout.verify_lens - 1
+                ),
+                num_accepted=accept_len,
+            )
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
@@ -3177,10 +3187,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
-            if confidence is not None:
-                on_publish(new_seq_lens, confidence=confidence)
-            else:
-                on_publish(new_seq_lens)
+            on_publish(new_seq_lens, confidence=confidence)
         if self._info_dumper.enabled:
             self._observe_decode_step(
                 batch=batch,
@@ -3244,22 +3251,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._info_dumper.note_non_decode_step()
         if self._verify_planner is not None:
             self._verify_planner.note_non_decode_step()
-
-    def _observe_acceptance(
-        self, *, accept_len: torch.Tensor, layout: Optional[RaggedVerifyLayout]
-    ) -> None:
-        """Teach the acceptance estimator this step's outcome: the drafts the
-        target verified (every draft without a layout) and how many of them
-        it accepted."""
-        self._acceptance_estimator.observe(
-            self._draft_feature,
-            num_verified=(
-                torch.full_like(accept_len, int(self.block_size) - 1)
-                if layout is None
-                else layout.verify_lens - 1
-            ),
-            num_accepted=accept_len,
-        )
 
     def _plan_verify(
         self,
