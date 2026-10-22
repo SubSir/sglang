@@ -168,6 +168,57 @@ def test_planner_schedules_external_confidence_without_a_head(monkeypatch):
     assert layout.verify_lens.tolist() == [4, 1, 2]
 
 
+def test_compact_plan_on_the_full_block_graph_verifies_every_draft(monkeypatch):
+    _patch_planner_context(monkeypatch)
+    monkeypatch.setattr(
+        dspark_planner,
+        "build_sps_cost_table",
+        lambda **_: dspark_planner.SpsCostTable(
+            sample_batch_tokens=[1, 16],
+            sample_steps_per_sec=[2.0, 1.0],
+            max_batch_tokens=16,
+        ),
+    )
+    # Compact graphs of 4, 8, 12 and 16 tokens for blocks of 4 tokens.
+    runner = types.SimpleNamespace(
+        ragged_verify_mode=True, capture_num_tokens=[4, 8, 12, 16], max_bs=4
+    )
+    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+        planner = dspark_planner.DSparkVerifyPlanner(
+            draft_model=types.SimpleNamespace(),
+            gamma=3,
+            model_runner=types.SimpleNamespace(decode_cuda_graph_runner=runner),
+            device=torch.device("cpu"),
+            tp_rank=1,
+            verify_num_draft_tokens=4,
+            tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
+            external_confidence=True,
+        )
+
+        def plan(bs, budget):
+            return planner.schedule_layout(
+                req_pool_indices=torch.arange(1, bs + 1),
+                prefix_lens=torch.full((bs,), 5),
+                device=torch.device("cpu"),
+                confidence=torch.tensor([[0.9, 0.5, 0.1]] * bs),
+                budget=budget,
+            )
+
+        # Any plan of a single request replays the 4-token graph of its block.
+        assert not planner.plans_verify_budget(num_reqs=1)
+        single = plan(1, 0)
+        assert single.is_full_block(4) and plan(1, 2) is single
+
+        # Three requests: 9 planned tokens replay the 12-token graph of the
+        # full blocks, so every draft is verified; 7 fit the 8-token graph.
+        assert planner.plans_verify_budget(num_reqs=3)
+        full = plan(3, 6)
+        assert full.is_full_block(4) and full.verify_lens.tolist() == [4, 4, 4]
+        trimmed = plan(3, 4)
+        assert not trimmed.is_full_block(4)
+        assert trimmed.graph_num_tokens == 8 and int(trimmed.verify_lens.sum()) == 7
+
+
 def test_observe_counts_the_drafts_the_target_verified():
     class Recorder:
         def observe(self, x, num_verified, num_accepted):
