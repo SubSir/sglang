@@ -561,13 +561,19 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
 
     def test_rejected_non_finite_drafts_stay_contained(self):
         """Non-finite activations at rejected draft positions leave the
-        accepted outputs, the committed state, conv, the cursors and the next
-        step bit-identical to a run with finite rejected drafts."""
-        for ssm_dtype in (torch.bfloat16, torch.float32):
-            with self.subTest(ssm_dtype=ssm_dtype):
-                self._check_non_finite_drafts(ssm_dtype)
+        accepted outputs, the committed state, conv, the cursors and the later
+        steps bit-identical to a run with finite rejected drafts, also under
+        the lazy fold of the generic spec commit, whose verifies replay the
+        committed history."""
+        for ssm_dtype, lazy in (
+            (torch.bfloat16, False),
+            (torch.float32, False),
+            (torch.float32, True),
+        ):
+            with self.subTest(ssm_dtype=ssm_dtype, lazy=lazy):
+                self._check_non_finite_drafts(ssm_dtype, lazy)
 
-    def _check_non_finite_drafts(self, ssm_dtype):
+    def _check_non_finite_drafts(self, ssm_dtype, lazy):
         torch.manual_seed(2024)
         layers = _make_layers()
         template = _template(ssm_dtype)
@@ -576,13 +582,27 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
         )
         batch = _batch(NUM_SLOTS * WIDTH, req_rows)
-        clean, poisoned = self._replayssm(template), self._replayssm(template)
+        clean, poisoned = (
+            _Arm(
+                template,
+                replayssm=True,
+                dispatcher=self.dispatcher,
+                ring_len=4 * WIDTH if lazy else RING,
+                lazy=lazy,
+            )
+            for _ in range(2)
+        )
         backends = [arm.backend(qsl, cache_indices) for arm in (clean, poisoned)]
         accept = [1, 3, WIDTH, 5, 2, 7]
-        for step in range(2):
+        poisoned_steps = (0, 2)
+        for step in range(4):
+            if lazy and step == 2:
+                # The second poisoned window follows committed history.
+                history = clean.pool.replayssm_spec_write_pos[req_rows[:NUM_REAL]]
+                self.assertGreater(int(history.min()), 0)
             inputs = _dense_inputs()
             bad_inputs = [tuple(x.clone() for x in layer) for layer in inputs]
-            if step == 0:
+            if step in poisoned_steps:
                 for mixed_qkv, a, b in bad_inputs:
                     for i, n in enumerate(accept):
                         rejected = slice(i * WIDTH + n, (i + 1) * WIDTH)
@@ -595,8 +615,10 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 out = out.reshape(-1, V_HEADS, HEAD_DIM)
                 ref = ref.reshape(-1, V_HEADS, HEAD_DIM)
                 for i, n in enumerate(accept):
-                    # The step after the poisoned one compares whole windows.
-                    rows = slice(i * WIDTH, i * WIDTH + (n if step == 0 else WIDTH))
+                    # The steps after a poisoned one compare whole windows.
+                    if step not in poisoned_steps:
+                        n = WIDTH
+                    rows = slice(i * WIDTH, i * WIDTH + n)
                     self.assertTrue(torch.equal(out[rows], ref[rows]), (step, i))
             accept_steps = torch.tensor(accept, device="cuda") - 1
             for arm in (clean, poisoned):

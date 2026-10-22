@@ -400,7 +400,9 @@ def gdn_replayssm_spec_circular_kernel(
     # strictly-lower A and T = (I + A)^{-1}.
     # Position i depends only on positions <= i. The causal terms below are
     # selected, not multiplied by zero, so a non-finite later (rejected) draft
-    # cannot reach an earlier position's output or ring record.
+    # cannot reach an earlier position's output or ring record. A select
+    # around a product would split its fused multiply-add, so the updates use
+    # tl.fma and the T reduction masks an operand instead.
     # ------------------------------------------------------------------
     lower = (o_s[:, None] > o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ij = G_s[:, None] - G_s[None, :]
@@ -411,7 +413,7 @@ def gdn_replayssm_spec_circular_kernel(
         row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
         row = tl.where(o_s < ii, row, 0.0)
         row = row + tl.sum(
-            tl.where((o_s < ii)[:, None], row[:, None] * b_Ai, 0.0), axis=0
+            row[:, None] * tl.where((o_s < ii)[:, None], b_Ai, 0.0), axis=0
         )
         b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
@@ -428,7 +430,9 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
         Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
-        D_spec += tl.where((o_s >= j)[None, :], Rj[:, None] * Tj[None, :], 0.0)
+        D_spec = tl.where(
+            (o_s >= j)[None, :], tl.fma(Rj[:, None], Tj[None, :], D_spec), D_spec
+        )
 
     # ------------------------------------------------------------------
     # outputs.
@@ -440,7 +444,7 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
         Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
-        DF += tl.where((o_s >= j)[None, :], Dj[:, None] * Fj[None, :], 0.0)
+        DF = tl.where((o_s >= j)[None, :], tl.fma(Dj[:, None], Fj[None, :], DF), DF)
     O_tile = expG_s[None, :] * hw_q + DF
 
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)
