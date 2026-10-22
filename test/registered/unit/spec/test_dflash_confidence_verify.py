@@ -218,6 +218,41 @@ def test_ragged_verify_gates_open_for_dflash_outside_static(monkeypatch):
     assert not needs_relay("EAGLE", "compact")
 
 
+def test_forced_budget_frac_trims_a_compact_plan_without_a_table(monkeypatch):
+    from sglang.srt.managers.scheduler_components import internal_state
+
+    _patch_planner_context(monkeypatch)
+    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+        planner = _planner(external_confidence=True)
+    # Compact without a profiled table verifies every draft, unless the
+    # profiler pins a budget.
+    assert planner.is_verify_all
+    planner.set_forced_budget_frac(0.5)
+    assert not planner.is_verify_all
+    planner.set_forced_budget_frac(None)
+    assert planner.is_verify_all
+
+    # A simulated acceptance above 0 could run past the pinned lengths.
+    controller = types.SimpleNamespace(
+        scheduler=types.SimpleNamespace(
+            spec_algorithm=worker_mod.SpeculativeAlgorithm.DFLASH,
+            draft_worker=types.SimpleNamespace(set_dspark_forced_budget_frac=None),
+        )
+    )
+    controller._require_dspark_worker = types.MethodType(
+        internal_state.SchedulerInternalStateController._require_dspark_worker,
+        controller,
+    )
+    validate = (
+        internal_state.SchedulerInternalStateController._validate_dspark_budget_frac
+    )
+    validate(controller, "dspark_force_budget_frac", 0.5)
+    with envs.SGLANG_SIMULATE_ACC_LEN.override(3.0):
+        validate(controller, "dspark_force_budget_frac", None)
+        with pytest.raises(internal_state.UpdateRejected, match="SIMULATE_ACC_LEN"):
+            validate(controller, "dspark_force_budget_frac", 0.5)
+
+
 def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatch):
     import contextlib
 
