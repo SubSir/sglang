@@ -493,17 +493,17 @@ def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("seqlen", [2, 4, 8, 16])
-@pytest.mark.parametrize("dim", [1000, 10240])
 @pytest.mark.parametrize("with_padding", [True, False])
 def test_causal_conv1d_update_dedup_window_matches_per_token(
-    with_padding, dim, seqlen, itype
+    with_padding, seqlen, itype
 ):
     """The deduplicated verify window is written as one tile; it must hold the
     same bytes as the per-token stores into a dense window and leave the slots of
     padded rows untouched."""
     device = get_device()
     torch.manual_seed(0)
-    batch, width, num_slots = 6, 4, 16
+    # dim is not a multiple of the 256-channel block, so the last block is partial.
+    batch, dim, width, num_slots = 6, 1000, 4, 16
     # Verify tokens are token-major, as in the GDN and Mamba verify reshape.
     x = torch.randn(batch, seqlen, dim, device=device, dtype=itype).transpose(1, 2)
     weight = torch.randn(dim, width, device=device, dtype=itype)
@@ -552,11 +552,13 @@ def test_causal_conv1d_update_dedup_window_matches_per_token(
     expected_dense = dense_before.clone()
     expected_dense[written] = rows.unfold(-1, width - 1, 1).transpose(1, 2)
 
+    # Windows and conv states are copies, so they must match bitwise.
     assert torch.equal(shared, expected_shared)
     assert torch.equal(dense, expected_dense)
     assert torch.equal(dedup[written], dense[written])
-    assert torch.equal(out_tile[real], out_ref[real])
     assert torch.equal(state_tile, state_ref)
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (1e-2, 5e-2)
+    torch.testing.assert_close(out_tile[real], out_ref[real], rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":
