@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+    commit_gdn_replayssm_after_verify,
     commit_gdn_replayssm_spec,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -102,14 +103,20 @@ def _conv_window(dtype):
 class _Arm:
     """One verify/commit path over its own copy of the pool contents."""
 
-    def __init__(self, template, *, replayssm, dispatcher):
+    def __init__(self, template, *, replayssm, dispatcher, ring_len=RING, lazy=False):
         conv = template["conv"].clone()
         temporal = template["temporal"].clone()
         if replayssm:
 
             def ring(heads, last, dtype):
                 return torch.zeros(
-                    NUM_LAYERS, NUM_ROWS, heads, RING, *last, device="cuda", dtype=dtype
+                    NUM_LAYERS,
+                    NUM_ROWS,
+                    heads,
+                    ring_len,
+                    *last,
+                    device="cuda",
+                    dtype=dtype,
                 )
 
             self.state = MambaPool.SpeculativeState(
@@ -146,6 +153,7 @@ class _Arm:
             )
             self.pool = SimpleNamespace()
         self.dispatcher = dispatcher
+        self.lazy = lazy
 
     def backend(self, query_start_loc, cache_indices):
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
@@ -175,6 +183,23 @@ class _Arm:
         return backend
 
     def commit(self, accept_steps, req_rows, track_slots=None, track_steps=None):
+        if self.lazy:
+            # The generic spec commit of an fp32 state: fold only when the
+            # next window would not fit, so later verifies replay history.
+            metadata = self.hybrid.linear_attn_backend.forward_metadata
+            commit_gdn_replayssm_after_verify(
+                spec_state=self.state,
+                write_pos=self.pool.replayssm_spec_write_pos,
+                cache_base=self.pool.replayssm_cache_base,
+                is_flush=self.pool.replayssm_is_flush,
+                state_batch_indices=metadata.mamba_cache_indices[: len(req_rows)],
+                replay_indices=req_rows,
+                accept_lens=accept_steps + 1,
+                last_correct_step_indices=accept_steps,
+                max_spec_len=WIDTH,
+                fold_every_commit=False,
+            )
+            return
         self.hybrid.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=accept_steps,
             mamba_track_indices=track_slots,
@@ -291,7 +316,13 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             with self.subTest(ssm_dtype=ssm_dtype):
                 self._check_chain(ssm_dtype, num_steps=256)
 
-    def _check_chain(self, ssm_dtype, num_steps):
+    def test_lazy_fold_chain_replays_history(self):
+        """The generic spec commit of an fp32 state folds only when the next
+        window would not fit the ring, so verifies replay committed history;
+        the outputs stay as close to the reference as the snapshot path's."""
+        self._check_chain(torch.float32, num_steps=128, lazy=True)
+
+    def _check_chain(self, ssm_dtype, num_steps, lazy=False):
         torch.manual_seed(7)
         layers = _make_layers()
         template = _template(ssm_dtype)
@@ -300,9 +331,18 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         qsl = torch.arange(
             0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
         )
-        arms = {"replayssm": self._replayssm(template)}
-        # The Triton recurrent verify writes a snapshot per draft on every GPU.
-        arms["snapshot"] = _Arm(template, replayssm=False, dispatcher=self.dispatcher)
+        arms = {
+            "replayssm": _Arm(
+                template,
+                replayssm=True,
+                dispatcher=self.dispatcher,
+                ring_len=4 * WIDTH if lazy else RING,
+                lazy=lazy,
+            ),
+            # The Triton recurrent verify writes a snapshot per draft on every
+            # GPU.
+            "snapshot": _Arm(template, replayssm=False, dispatcher=self.dispatcher),
+        }
         backends = {name: arm.backend(qsl, cache_indices) for name, arm in arms.items()}
         replayssm = arms["replayssm"]
         untouched_rows = [
@@ -316,10 +356,15 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             "temporal": template["temporal"].double(),
             "conv": template["conv"].double(),
         }
-        errors = {name: {"out": [], "state": []} for name in arms}
+        # Under the lazy fold the checkpoint lags the committed state by the
+        # history kept in the ring, so only the outputs are compared; they
+        # depend on the checkpoint and the replayed history together.
+        keys = ("out",) if lazy else ("out", "state")
+        errors = {name: {key: [] for key in keys} for name in arms}
         batch = _batch(NUM_SLOTS * WIDTH, req_rows)
         generator = torch.Generator().manual_seed(11)
         expected_base = torch.zeros(NUM_REAL, dtype=torch.int64)
+        max_history = 0
         for _ in range(num_steps):
             inputs = _dense_inputs()
             accept = torch.randint(1, WIDTH + 1, (NUM_REAL,), generator=generator)
@@ -353,12 +398,13 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                     ]
                 )
                 errors[name]["out"].append(_relative_error(out, torch.stack(ref_out)))
-                errors[name]["state"].append(
-                    _relative_error(
-                        arm.state.temporal[:, real_slots],
-                        reference["temporal"][:, real_slots],
+                if not lazy:
+                    errors[name]["state"].append(
+                        _relative_error(
+                            arm.state.temporal[:, real_slots],
+                            reference["temporal"][:, real_slots],
+                        )
                     )
-                )
                 # Conv rollback is an exact copy of the accepted inputs.
                 self.assertTrue(
                     torch.equal(
@@ -371,9 +417,13 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             for out in outputs["replayssm"]:
                 padding = out.reshape(-1, V_HEADS, HEAD_DIM)[NUM_REAL * WIDTH :]
                 self.assertEqual(padding.abs().max().item(), 0.0)
+            pool = replayssm.pool
+            if lazy:
+                history = pool.replayssm_spec_write_pos[real_rows]
+                max_history = max(max_history, int(history.max()))
+                continue
             # Cursors: folded and reset every commit, ring origin advanced.
             expected_base = (expected_base + accept) % RING
-            pool = replayssm.pool
             self.assertEqual(
                 pool.replayssm_spec_write_pos[real_rows].abs().sum().item(), 0
             )
@@ -383,6 +433,9 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 expected_base.tolist(),
             )
 
+        if lazy:
+            # Later verifies saw committed history.
+            self.assertGreater(max_history, WIDTH)
         pool = replayssm.pool
         for cursor in (
             pool.replayssm_spec_write_pos,
@@ -413,7 +466,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             for name, errs in errors.items()
         }
         print(f"\n{ssm_dtype} relative error (mean, early, late): {summary}")
-        for key in ("out", "state"):
+        for key in keys:
             values = errors["replayssm"][key]
             chain_mean, early, late = summary["replayssm"][key]
             self.assertTrue(all(map(math.isfinite, values)), key)

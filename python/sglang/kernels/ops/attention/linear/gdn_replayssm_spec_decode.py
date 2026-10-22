@@ -164,13 +164,16 @@ def gdn_replayssm_spec_circular_kernel(
 
     b_wp_i = b_write_pos.to(tl.int32)
     cache_valid = o_c < b_write_pos
+    # A row folded at its last commit has no committed history to replay; its
+    # history terms would add exact zeros, so they are skipped.
+    has_history = b_write_pos > 0
 
     # CIRCULAR physical slots (addresses only; masks/cumsums stay logical).
     phys_c = (b_cache_base + o_c) & (MAX_CACHE_LEN - 1)  # [BC] history
     phys_spec = (b_cache_base + b_wp_i + o_s) & (MAX_CACHE_LEN - 1)  # [BS] spec
 
     # ------------------------------------------------------------------
-    # Block 0: gates / beta / local cumsum + committed-history replay decay.
+    # Block 0: gates / beta / local cumsum.
     # ------------------------------------------------------------------
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
@@ -189,34 +192,6 @@ def gdn_replayssm_spec_circular_kernel(
     beta_s = tl.where(mask_s, 1.0 / (1.0 + tl.exp(-b_s)), 0.0)
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
-
-    if not IS_FLUSH:
-        # Committed-history replay decay from cached g (history loads -> phys_c).
-        # Output reconstruction only. On flush steps the history is folded into
-        # the checkpoint by the exact-fold kernel (launched first), so none of
-        # this is needed there.
-        p_g_main = g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys_c
-        b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
-        b_g_prefix = tl.cumsum(b_g_all, axis=0)
-        b_g_total = tl.sum(b_g_all, axis=0)
-        b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
-        b_total_decay = tl.exp(b_g_total)
-
-        p_d_main = d_cache + (
-            replay_idx * stride_d_slot
-            + (i_hv * MAX_CACHE_LEN + phys_c[None, :]) * V
-            + o_v[:, None]
-        )
-        b_d_all = tl.load(
-            p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
-        ).to(tl.float32)
-        b_d_scaled_fp32 = b_d_all * b_replay_decay[None, :]
-        if STATE_FP32:
-            # Preserve the pre-existing fp32-checkpoint path: these dots use
-            # fp32 operands with DOT_PRECISION (TF32 by default).
-            b_d_scaled = b_d_scaled_fp32
-        else:
-            b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -330,21 +305,22 @@ def gdn_replayssm_spec_circular_kernel(
                 hw_k += tl.dot(sc_tile, k_residual_T)
 
         if not IS_FLUSH:
-            # cached-key history load -> phys_c (output reconstruction only)
-            p_k = k_cache + (
-                replay_idx * stride_k_slot
-                + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
-                + o_kt[None, :]
-            )
-            khist_tile = tl.load(
-                p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-            )
-            if STATE_FP32:
-                khist_tile = khist_tile.to(tl.float32)
-            else:
-                khist_tile = khist_tile.to(k_cache.dtype.element_ty)
-            scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
-            scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
+            if has_history:
+                # cached-key history load -> phys_c (output reconstruction only)
+                p_k = k_cache + (
+                    replay_idx * stride_k_slot
+                    + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
+                    + o_kt[None, :]
+                )
+                khist_tile = tl.load(
+                    p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
+                )
+                if STATE_FP32:
+                    khist_tile = khist_tile.to(tl.float32)
+                else:
+                    khist_tile = khist_tile.to(k_cache.dtype.element_ty)
+                scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
+                scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
 
         if write_k:
             spec_kt_mask = (
@@ -379,12 +355,46 @@ def gdn_replayssm_spec_circular_kernel(
             )
 
     if not IS_FLUSH:
-        hw_q = b_total_decay * hw_q + tl.dot(
-            b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
-        )
-        hw_k = b_total_decay * hw_k + tl.dot(
-            b_d_scaled, scores_k.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
-        )
+        if has_history:
+            # Committed-history replay decay from cached g (history loads ->
+            # phys_c). Output reconstruction only; built after the K loop so
+            # its tiles are not live across it. On flush steps the history is
+            # folded into the checkpoint by the exact-fold kernel (launched
+            # first), so none of this is needed there.
+            p_g_main = (
+                g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys_c
+            )
+            b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
+            b_g_prefix = tl.cumsum(b_g_all, axis=0)
+            b_g_total = tl.sum(b_g_all, axis=0)
+            b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
+            b_total_decay = tl.exp(b_g_total)
+
+            p_d_main = d_cache + (
+                replay_idx * stride_d_slot
+                + (i_hv * MAX_CACHE_LEN + phys_c[None, :]) * V
+                + o_v[:, None]
+            )
+            b_d_all = tl.load(
+                p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
+            ).to(tl.float32)
+            b_d_scaled_fp32 = b_d_all * b_replay_decay[None, :]
+            if STATE_FP32:
+                # Preserve the pre-existing fp32-checkpoint path: these dots
+                # use fp32 operands with DOT_PRECISION (TF32 by default).
+                b_d_scaled = b_d_scaled_fp32
+            else:
+                b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
+            hw_q = b_total_decay * hw_q + tl.dot(
+                b_d_scaled,
+                scores_q.to(b_d_scaled.dtype),
+                input_precision=DOT_PRECISION,
+            )
+            hw_k = b_total_decay * hw_k + tl.dot(
+                b_d_scaled,
+                scores_k.to(b_d_scaled.dtype),
+                input_precision=DOT_PRECISION,
+            )
 
     # ------------------------------------------------------------------
     # strictly-lower A and T = (I + A)^{-1}.
