@@ -4,8 +4,7 @@ A packed call must match the dense call on the same tokens, each sequence
 zero-padded to the draft width, bit for bit: the real output rows, the conv
 state and the intermediate conv windows (both the dense per-step layout and
 the deduplicated overlapping one). Sequences without a state slot or without
-rows, and packed rows past the last sequence, touch no state. Also checks
-CUDA-graph replay against eager.
+rows, and packed rows past the last sequence, touch no state.
 """
 
 import pytest
@@ -178,60 +177,6 @@ def test_packed_rows_other_widths(draft_tokens):
             tail=3,
         )
     )
-
-
-def test_cuda_graph_replay_matches_eager():
-    """One capture serves every layout of the same row count."""
-    T, dim = 8, 640
-    capture_lens = [2] * 8
-    slots = [5, 2, 7, 0, -1, 3, -1, 1]
-    case = _Case(
-        capture_lens,
-        slots,
-        dim=dim,
-        draft_tokens=T,
-        dtype=torch.bfloat16,
-        dedup=True,
-        tail=0,
-    )
-    qsl_buf = case.qsl.clone()
-    state = case.conv_state.clone()
-    phys = case.win_phys.clone()
-    view = phys.as_strided(case.win_view.shape, case.win_view.stride())
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        case.run_packed(state, view, qsl_buf)  # warm up / compile
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out_graph = case.run_packed(state, view, qsl_buf)
-
-    for lens in ([1, 3, 0, 4, 0, 2, 1, 5], [8, 1, 1, 1, 0, 0, 2, 3], [0] * 8):
-        assert sum(lens) <= case.num_tokens
-        qsl = torch.zeros(len(lens) + 1, device=DEV, dtype=torch.int32)
-        qsl[1:] = torch.cumsum(torch.tensor(lens, device=DEV), 0)
-
-        eager_state = case.conv_state.clone()
-        eager_phys = case.win_phys.clone()
-        eager_view = eager_phys.as_strided(case.win_view.shape, case.win_view.stride())
-        eager = case.run_packed(eager_state, eager_view, qsl)
-
-        state.copy_(case.conv_state)
-        phys.copy_(case.win_phys)
-        qsl_buf.copy_(qsl)
-        graph.replay()
-        torch.cuda.synchronize()
-        n = int(qsl[-1])
-        real = torch.zeros(case.num_tokens, dtype=torch.bool, device=DEV)
-        for i, (s, e) in enumerate(zip(qsl[:-1].tolist(), qsl[1:].tolist())):
-            if slots[i] >= 0:
-                real[s:e] = True
-        torch.testing.assert_close(out_graph[real], eager[real], rtol=0, atol=0)
-        torch.testing.assert_close(state, eager_state, rtol=0, atol=0)
-        torch.testing.assert_close(phys, eager_phys, rtol=0, atol=0)
-        assert n <= case.num_tokens
 
 
 if __name__ == "__main__":

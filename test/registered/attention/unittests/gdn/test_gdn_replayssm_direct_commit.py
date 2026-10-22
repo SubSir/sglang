@@ -277,6 +277,29 @@ def _dense_inputs(num_slots=NUM_SLOTS):
     ]
 
 
+def _capture(run):
+    """Warm run up on a side stream, then capture it in a CUDA graph."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    return graph, out
+
+
+def _reset(template, base, *arms):
+    """Restore the template state, clear the rings and set the ring origins."""
+    for arm in arms:
+        arm.state.temporal.copy_(template["temporal"])
+        arm.state.conv[0].copy_(template["conv"])
+        for name in RING_FIELDS:
+            getattr(arm.state, name).zero_()
+        arm.pool.replayssm_cache_base.copy_(base)
+
+
 def _gdn_reference(layer, conv_state, ssm_state, mixed_qkv, a, b):
     """float64 sequential GDN over one window: conv1d with its state, l2-normed
     q/k, scalar decay, delta rule. Returns per-step outputs, states and conv
@@ -702,7 +725,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         layers = _make_layers()
         template = _template(ssm_dtype)
         num_tokens = NUM_SLOTS * WIDTH
-        qsl = torch.arange(0, num_tokens + 1, WIDTH, device="cuda", dtype=torch.int32)
+        qsl = _dense_qsl()
         static_rows, static_cache = _rows_and_slots()
         static_inputs = [
             (
@@ -722,14 +745,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 for layer, (mixed_qkv, a, b) in zip(layers, static_inputs)
             ]
 
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            run()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            static_out = run()
+        graph, static_out = _capture(run)
 
         real = slice(0, NUM_REAL * WIDTH)
         for _ in range(num_replays):
@@ -742,12 +758,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
 
             eager_arm = self._replayssm(template)
             base = torch.randint(0, RING, (NUM_ROWS,), device="cuda", dtype=torch.int32)
-            for arm in (graph_arm, eager_arm):
-                arm.state.temporal.copy_(template["temporal"])
-                arm.state.conv[0].copy_(template["conv"])
-                for name in RING_FIELDS:
-                    getattr(arm.state, name).zero_()
-                arm.pool.replayssm_cache_base.copy_(base)
+            _reset(template, base, graph_arm, eager_arm)
             graph.replay()
 
             expected = _verify(
@@ -836,9 +847,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         base = torch.randint(0, RING, (NUM_ROWS,), device="cuda", dtype=torch.int32)
         for arm in (ragged, dense):
             arm.pool.replayssm_cache_base.copy_(base)
-        dense_qsl = torch.arange(
-            0, num_slots * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
-        )
+        dense_qsl = _dense_qsl(num_slots)
         out = _verify(
             ragged.backend(qsl, cache_indices, packed=True),
             layers,
@@ -952,14 +961,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 for layer, (mixed_qkv, a, b) in zip(layers, static_inputs)
             ]
 
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            run()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            static_out = run()
+        graph, static_out = _capture(run)
 
         for real_lens in (
             [WIDTH, 1, 3, WIDTH, 2],
@@ -984,12 +986,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
 
             eager_arm = self._replayssm(template)
             base = torch.randint(0, RING, (NUM_ROWS,), device="cuda", dtype=torch.int32)
-            for arm in (graph_arm, eager_arm):
-                arm.state.temporal.copy_(template["temporal"])
-                arm.state.conv[0].copy_(template["conv"])
-                for name in RING_FIELDS:
-                    getattr(arm.state, name).zero_()
-                arm.pool.replayssm_cache_base.copy_(base)
+            _reset(template, base, graph_arm, eager_arm)
             graph.replay()
 
             expected = _verify(

@@ -685,6 +685,7 @@ def _causal_conv1d_update_kernel(
         x_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
         x_len = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64) - x_start
     else:
+        x_start = 0
         x_len = seqlen
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
@@ -774,14 +775,13 @@ def _causal_conv1d_update_kernel(
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
     VAL = state_len - seqlen
-    if IS_VARLEN:
-        x_base = (
-            x_ptr + x_start * stride_x_token + (idx_feats * stride_x_dim)
-        )  # [BLOCK_N]
-    else:
-        x_base = (
-            x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
-        )  # [BLOCK_N]
+    # Packed rows have stride_x_seq == 0 and start at x_start.
+    x_base = (
+        x_ptr
+        + (idx_seq * stride_x_seq)
+        + (x_start * stride_x_token)
+        + (idx_feats * stride_x_dim)
+    )  # [BLOCK_N]
 
     x_ptrs = (
         x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
@@ -990,17 +990,14 @@ def _causal_conv1d_update_kernel(
         else:
             matrix_w = w_col0
             matrix_x = col0
+            mask_x_tok = mask_x_1d & (idx_token < x_len)
 
             for j in tl.static_range(KERNEL_WIDTH):
                 if KERNEL_WIDTH == 2:
                     if j == 1:  # KERNEL_WIDTH-1:
                         matrix_w = w_col1
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(
-                            x_ptrs_1d,
-                            mask=mask_x_1d & (idx_token < x_len),
-                            other=0.0,
-                        )
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_tok, other=0.0)
                 elif KERNEL_WIDTH == 3:
                     if j == 1:
                         matrix_w = w_col1
@@ -1008,11 +1005,7 @@ def _causal_conv1d_update_kernel(
                     elif j == 2:
                         matrix_w = w_col2
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(
-                            x_ptrs_1d,
-                            mask=mask_x_1d & (idx_token < x_len),
-                            other=0.0,
-                        )
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_tok, other=0.0)
                 elif KERNEL_WIDTH == 4:
                     if j == 1:
                         matrix_w = w_col1
@@ -1023,11 +1016,7 @@ def _causal_conv1d_update_kernel(
                     elif j == 3:
                         matrix_w = w_col3
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(
-                            x_ptrs_1d,
-                            mask=mask_x_1d & (idx_token < x_len),
-                            other=0.0,
-                        )
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_tok, other=0.0)
 
                 acc += matrix_x * matrix_w  # [BLOCK_N]
 
@@ -1062,19 +1051,12 @@ def _causal_conv1d_update_kernel(
         mask_1d = (idx_token < x_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        if IS_VARLEN:
-            o_ptrs = (
-                o_ptr
-                + (x_start + idx_token) * stride_o_token
-                + (idx_feats * stride_o_dim)
-            )
-        else:
-            o_ptrs = (
-                o_ptr
-                + (idx_seq) * stride_o_seq
-                + idx_token * stride_o_token
-                + (idx_feats * stride_o_dim)
-            )
+        o_ptrs = (
+            o_ptr
+            + (idx_seq) * stride_o_seq
+            + (x_start + idx_token) * stride_o_token
+            + (idx_feats * stride_o_dim)
+        )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
