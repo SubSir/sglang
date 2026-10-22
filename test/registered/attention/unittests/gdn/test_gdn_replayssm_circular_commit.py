@@ -6,20 +6,25 @@ partial V tile, slot-strided and layer-inner state pools, null rows, rings of
 16 to 128 steps (histories longer than one fold chunk), with and without track
 rows, and with bf16 rings plus residuals or fp32 rings without them. Ring
 entries past the committed history are NaN and must not be read, and every
-slot the commit does not own stays bit-identical.
+slot the commit does not own stays bit-identical. Every case runs through both
+commit kernels (per value head and per head group), and the ring length picks
+the kernel.
 """
 
+import itertools
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.attention.linear import gdn_replayssm_spec_decode
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
     commit_gdn_replayssm_circular,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 
 DEVICE = "cuda"
 LAYERS, SLOTS = 2, 12
@@ -57,6 +62,7 @@ class TestGdnReplayssmCircularCommit(CustomTestCase):
         ring=16,
         residual=True,
         track=True,
+        head_group=False,
     ):
         gen = torch.Generator(device=DEVICE).manual_seed(h * 100 + hv + ring)
 
@@ -105,23 +111,28 @@ class TestGdnReplayssmCircularCommit(CustomTestCase):
         cache_base = ints(bases)
         is_flush = ints([r[3] for r in ROWS])
         accepted = ints(ACCEPTED)
-        commit_gdn_replayssm_circular(
-            checkpoint_state=state,
-            d_cache=d,
-            k_cache=k,
-            g_cache=g,
-            d_residual_cache=d_lo if residual else None,
-            k_residual_cache=k_lo if residual else None,
-            state_batch_indices=state_indices,
-            replay_indices=replay_indices,
-            write_pos=write_pos,
-            cache_base=cache_base,
-            is_flush=is_flush,
-            accept_lens=accepted,
-            mamba_track_indices=ints([r[4] for r in ROWS]) if track else None,
-            mamba_steps_to_track=ints([r[5] for r in ROWS]) if track else None,
-            null_block_id=-1,
-        )
+        with mock.patch.object(
+            gdn_replayssm_spec_decode,
+            "_commit_by_head_group",
+            return_value=head_group,
+        ):
+            commit_gdn_replayssm_circular(
+                checkpoint_state=state,
+                d_cache=d,
+                k_cache=k,
+                g_cache=g,
+                d_residual_cache=d_lo if residual else None,
+                k_residual_cache=k_lo if residual else None,
+                state_batch_indices=state_indices,
+                replay_indices=replay_indices,
+                write_pos=write_pos,
+                cache_base=cache_base,
+                is_flush=is_flush,
+                accept_lens=accepted,
+                mamba_track_indices=ints([r[4] for r in ROWS]) if track else None,
+                mamba_steps_to_track=ints([r[5] for r in ROWS]) if track else None,
+                null_block_id=-1,
+            )
 
         if state_dtype == torch.bfloat16:
             tol = dict(rtol=8e-3, atol=1e-3)
@@ -185,22 +196,35 @@ class TestGdnReplayssmCircularCommit(CustomTestCase):
             (4, 12, 128, 128),
         ]:
             for state_dtype in (torch.float32, torch.bfloat16):
-                for layout in ("contiguous", "slot_strided", "layer_inner"):
+                for layout, head_group in itertools.product(
+                    ("contiguous", "slot_strided", "layer_inner"), (False, True)
+                ):
                     with self.subTest(
-                        h=h, hv=hv, k=k, v=v, state_dtype=state_dtype, layout=layout
+                        h=h,
+                        hv=hv,
+                        k=k,
+                        v=v,
+                        state_dtype=state_dtype,
+                        layout=layout,
+                        head_group=head_group,
                     ):
-                        self._run(h, hv, k, v, state_dtype, layout)
+                        self._run(
+                            h, hv, k, v, state_dtype, layout, head_group=head_group
+                        )
 
     def test_ring_lengths_track_and_residual(self):
         for ring in (16, 32, 64, 128):
             for residual in (True, False):
                 for track in (True, False):
-                    for state_dtype in (torch.float32, torch.bfloat16):
+                    for state_dtype, head_group in itertools.product(
+                        (torch.float32, torch.bfloat16), (False, True)
+                    ):
                         with self.subTest(
                             ring=ring,
                             residual=residual,
                             track=track,
                             state_dtype=state_dtype,
+                            head_group=head_group,
                         ):
                             self._run(
                                 2,
@@ -211,7 +235,45 @@ class TestGdnReplayssmCircularCommit(CustomTestCase):
                                 ring=ring,
                                 residual=residual,
                                 track=track,
+                                head_group=head_group,
                             )
+
+    def test_ring_length_picks_the_kernel(self):
+        """Rings of one 16-step fold chunk commit per head group, longer rings
+        per value head."""
+
+        def ints(values):
+            return torch.tensor(values, device=DEVICE, dtype=torch.int32)
+
+        for ring, head_group in ((16, True), (32, False), (64, False), (128, False)):
+            with (
+                self.subTest(ring=ring),
+                mock.patch.object(
+                    gdn_replayssm_spec_decode, "gdn_replayssm_head_group_commit_kernel"
+                ) as by_group,
+                mock.patch.object(
+                    gdn_replayssm_spec_decode, "gdn_replayssm_compact_commit_kernel"
+                ) as by_head,
+            ):
+                commit_gdn_replayssm_circular(
+                    checkpoint_state=torch.zeros(1, 2, 6, 128, 128, device=DEVICE),
+                    d_cache=torch.zeros(1, 1, 6, ring, 128, device=DEVICE),
+                    k_cache=torch.zeros(1, 1, 2, ring, 128, device=DEVICE),
+                    g_cache=torch.zeros(1, 1, 6, ring, device=DEVICE),
+                    d_residual_cache=None,
+                    k_residual_cache=None,
+                    state_batch_indices=ints([0]),
+                    replay_indices=ints([0]),
+                    write_pos=ints([4]),
+                    cache_base=ints([0]),
+                    is_flush=ints([1]),
+                    accept_lens=ints([4]),
+                )
+                launched, skipped = (
+                    (by_group, by_head) if head_group else (by_head, by_group)
+                )
+                launched.__getitem__.assert_called_once()
+                skipped.__getitem__.assert_not_called()
 
 
 if __name__ == "__main__":
