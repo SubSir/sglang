@@ -836,6 +836,7 @@ def _causal_conv1d_update_kernel(
 
     if SAVE_INTERMEDIATE and DEDUP_CONV_WINDOW:
         tl.static_assert(KERNEL_WIDTH == 4)
+        tl.static_assert(not HAS_EAGLE_TREE_CUSTOM_ATTN_MASK)
         # Deduplicated window (KERNEL_WIDTH == 4, linear chain): step t's window is
         # columns t..t+2 of one shared per-channel row
         # [state[1], state[2], x_0, ..., x_{seqlen-1}]. Write those seqlen + 2
@@ -1164,10 +1165,13 @@ def causal_conv1d_update(
         )
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
-    # A window view whose step stride equals its window stride (the deduplicated
-    # layout from MambaPool) keeps step t's window at columns t..t+K-2 of one shared
-    # row, so a linear chain can write that row once. Tree verify and other widths
-    # keep the per-token stores.
+    # In a width-4 linear chain, step t's window is columns t..t+2 of the row
+    # [state[1], state[2], x_0, ..., x_{seqlen-1}]. When the window view's step
+    # stride equals its window stride s, the per-token stores write column t + w
+    # of that row at (t + w) * s, and one store of the whole row writes column c
+    # at c * s: the same addresses and values for any layout with these strides
+    # (MambaPool's deduplicated view is one). The kernel then writes the row as
+    # one tile. Tree verify and other widths keep the per-token stores.
     dedup_conv_window = (
         intermediate_conv_window is not None
         and retrieve_next_token is None
@@ -1264,7 +1268,9 @@ def causal_conv1d_update(
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         DEDUP_CONV_WINDOW=dedup_conv_window,
-        NP2_WINDOW_COLS=triton.next_power_of_2(seqlen + width - 2),
+        NP2_WINDOW_COLS=(
+            triton.next_power_of_2(seqlen + width - 2) if dedup_conv_window else 1
+        ),
         **pdl_kwargs,
     )
     if unsqueeze:
