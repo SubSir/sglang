@@ -388,6 +388,9 @@ def gdn_replayssm_spec_circular_kernel(
 
     # ------------------------------------------------------------------
     # strictly-lower A and T = (I + A)^{-1}.
+    # Position i depends only on positions <= i. The causal terms below are
+    # selected, not multiplied by zero, so a non-finite later (rejected) draft
+    # cannot reach an earlier position's output or ring record.
     # ------------------------------------------------------------------
     lower = (o_s[:, None] > o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ij = G_s[:, None] - G_s[None, :]
@@ -397,7 +400,9 @@ def gdn_replayssm_spec_circular_kernel(
     for ii in range(2, BS):
         row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
         row = tl.where(o_s < ii, row, 0.0)
-        row = row + tl.sum(row[:, None] * b_Ai, axis=0)
+        row = row + tl.sum(
+            tl.where((o_s < ii)[:, None], row[:, None] * b_Ai, 0.0), axis=0
+        )
         b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
@@ -413,7 +418,7 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
         Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
-        D_spec += Rj[:, None] * Tj[None, :]
+        D_spec += tl.where((o_s >= j)[None, :], Rj[:, None] * Tj[None, :], 0.0)
 
     # ------------------------------------------------------------------
     # outputs.
@@ -425,7 +430,7 @@ def gdn_replayssm_spec_circular_kernel(
     for j in tl.static_range(BS):
         Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
         Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
-        DF += Dj[:, None] * Fj[None, :]
+        DF += tl.where((o_s >= j)[None, :], Dj[:, None] * Fj[None, :], 0.0)
     O_tile = expG_s[None, :] * hw_q + DF
 
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)
@@ -672,6 +677,9 @@ def gdn_replayssm_compact_commit_kernel(
     k_residual_cache += i_layer * stride_k_residual_layer
     base = tl.load(cache_base + replay_idx).to(tl.int32)
     o_t = tl.arange(0, MAX_CACHE_LEN)
+    # Read only the committed history. Rejected drafts past it are never
+    # loaded: a zero decay cannot cancel a non-finite record.
+    history_mask = o_t < n_history
     phys = (base + o_t) & (MAX_CACHE_LEN - 1)
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -689,21 +697,25 @@ def gdn_replayssm_compact_commit_kernel(
         k_cache
         + replay_idx * stride_k_slot
         + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-        + o_k[None, :]
+        + o_k[None, :],
+        mask=history_mask[:, None],
+        other=0.0,
     )
     if HAS_RESIDUAL:
         key_residual = tl.load(
             k_residual_cache
             + replay_idx * stride_k_residual_slot
             + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-            + o_k[None, :]
+            + o_k[None, :],
+            mask=history_mask[:, None],
+            other=0.0,
         )
     updates = tl.load(
         d_cache
         + replay_idx * stride_d_slot
         + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
         + o_v[None, :],
-        mask=mask_v[None, :],
+        mask=history_mask[:, None] & mask_v[None, :],
         other=0.0,
     ).to(tl.float32)
     if HAS_RESIDUAL:
@@ -712,11 +724,13 @@ def gdn_replayssm_compact_commit_kernel(
             + replay_idx * stride_d_residual_slot
             + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
             + o_v[None, :],
-            mask=mask_v[None, :],
+            mask=history_mask[:, None] & mask_v[None, :],
             other=0.0,
         ).to(tl.float32)
     gates = tl.load(
-        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+        mask=history_mask,
+        other=0.0,
     ).to(tl.float32)
 
     if fold_active:
