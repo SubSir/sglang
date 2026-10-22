@@ -1261,7 +1261,7 @@ def commit_gdn_replayssm_spec(
     replay_indices: torch.Tensor,  # [n_rows] int active request row
     state_batch_indices: torch.Tensor,  # [n_rows] int physical mamba slot
     max_cache_len: int,
-    max_spec_len: int,
+    max_spec_len: int | None,  # early-flush margin; unused under the fold
     fold_every_commit: bool = False,
     cache_buf_len: int | None = None,
     null_block_id: int = 0,
@@ -1271,6 +1271,8 @@ def commit_gdn_replayssm_spec(
     Rows whose state slot is ``<= null_block_id`` keep their cursors, like the
     verify, commit and finish kernels skip them.
     """
+    if max_spec_len is None and not fold_every_commit:
+        raise ValueError("the lazy fold needs max_spec_len for its early flush")
     if cache_buf_len is None:
         cache_buf_len = max_cache_len
     n_rows = replay_indices.shape[0]
@@ -1287,7 +1289,7 @@ def commit_gdn_replayssm_spec(
         stride_state_indices=state_batch_indices.stride(0),
         stride_na=num_accepted.stride(0),
         MAX_CACHE_LEN=max_cache_len,
-        MAX_SPEC_LEN=max_spec_len,
+        MAX_SPEC_LEN=0 if fold_every_commit else max_spec_len,
         CACHE_BUF_LEN=cache_buf_len,
         FOLD_EVERY_COMMIT=fold_every_commit,
         BLOCK=BLOCK,
@@ -1398,3 +1400,84 @@ def commit_gdn_replayssm_circular(
         BLOCK=block,
         NULL_BLOCK_ID=null_block_id,
     )
+
+
+def commit_gdn_replayssm_after_verify(
+    *,
+    spec_state,  # MambaPool.SpeculativeState (all layers)
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    state_batch_indices: torch.Tensor,  # [B] physical mamba slot
+    replay_indices: torch.Tensor,  # [B] request row keying the ring and cursors
+    accept_lens: torch.Tensor,  # [B] committed verify positions, incl. the bonus
+    last_correct_step_indices: torch.Tensor,  # [B] conv rollback step
+    fold_every_commit: bool,
+    max_spec_len: int | None = None,  # needed only without fold_every_commit
+    mamba_track_indices: torch.Tensor | None = None,
+    mamba_steps_to_track: torch.Tensor | None = None,
+    src_indices_raw: torch.Tensor | None = None,
+    null_block_id: int = -1,
+) -> None:
+    """Commit one verify step of the compact GDN ring.
+
+    Shared by the generic spec commit and the DSPARK/DFLASH backend commit.
+    Advances the request cursors by the accepted count, materializes capacity
+    rows (every row with ``fold_every_commit``) and track rows into
+    ``temporal``, and rolls back the conv state. Rejected drafts are never
+    read: the next verify overwrites them.
+    """
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        fused_conv_window_scatter_with_mask,
+    )
+
+    commit_gdn_replayssm_spec(
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        num_accepted=accept_lens,
+        replay_indices=replay_indices,
+        state_batch_indices=state_batch_indices,
+        max_cache_len=spec_state.replayssm_d.shape[-2],
+        max_spec_len=max_spec_len,
+        fold_every_commit=fold_every_commit,
+        null_block_id=null_block_id,
+    )
+    # Capacity rows fold all layers in one launch; track rows snapshot the
+    # exact crossing state without disturbing the active circular history.
+    commit_gdn_replayssm_circular(
+        checkpoint_state=spec_state.temporal,
+        d_cache=spec_state.replayssm_d,
+        k_cache=spec_state.replayssm_k,
+        g_cache=spec_state.replayssm_g,
+        d_residual_cache=spec_state.replayssm_rawv,
+        k_residual_cache=spec_state.replayssm_rawk,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=null_block_id,
+    )
+    # Roll back the active conv state and snapshot its interval-crossing window.
+    for conv_states, intermediate_conv_window in zip(
+        spec_state.conv, spec_state.intermediate_conv_window
+    ):
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window,
+            state_batch_indices,
+            last_correct_step_indices,
+            src_indices_raw,
+        )
+        if mamba_track_indices is not None:
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )

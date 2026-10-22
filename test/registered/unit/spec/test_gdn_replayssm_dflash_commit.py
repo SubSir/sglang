@@ -2,7 +2,9 @@
 
 Under ``--enable-linear-replayssm-spec`` a GDN verify appends the draft window
 to a compact request ring of ``--linear-replayssm-cache-len`` positions and the
-commit folds the accepted prefix into the checkpoint.
+commit folds the accepted prefix into the checkpoint. DSPARK and DFLASH commit
+through ``HybridLinearAttnBackend.update_mamba_state_after_mtp_verify``, which
+goes through the same ring commit as the generic spec commit.
 """
 
 import unittest
@@ -17,6 +19,9 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.attention.linear.gdn_backend import (
     _validate_gdn_target_verify_layout,
 )
@@ -28,6 +33,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _KERNELS = "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode"
+_BACKEND = "sglang.srt.layers.attention.hybrid_linear_attn_backend"
+_GDN_COMMIT = f"{_KERNELS}.commit_gdn_replayssm_after_verify"
 DRAFT_TOKENS = 8
 
 
@@ -66,6 +73,26 @@ def _gdn_pool():
     )
 
 
+def _hybrid_backend(mamba_pool, spec_state, cache_indices):
+    """A HybridLinearAttnBackend whose sidecar translates virtual mamba ids by
+    +100, so the test can tell translated ids from raw ones."""
+    req_to_token_pool = SimpleNamespace(
+        mamba_pool=mamba_pool,
+        get_speculative_mamba2_params_all_layers=lambda: spec_state,
+        get_mamba_indices=lambda rows: rows // 2,
+        short_conv_pool=SimpleNamespace(conv_state=None, intermediate_conv_state=None),
+        ngram_pool=SimpleNamespace(context=None, intermediate_context=None),
+    )
+    hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+    hybrid.linear_attn_backend = SimpleNamespace(
+        req_to_token_pool=req_to_token_pool,
+        forward_metadata=SimpleNamespace(mamba_cache_indices=cache_indices),
+        accept_lens_pool=None,
+        _translate_mamba_indices=lambda ids: ids + 100,
+    )
+    return hybrid
+
+
 class TestGDNReplaySSMRingLength(CustomTestCase):
     @staticmethod
     def _pool(ring_len, draft_tokens=DRAFT_TOKENS):
@@ -102,6 +129,100 @@ class TestGDNReplaySSMRingLength(CustomTestCase):
                     tuple(state.replayssm_d.shape), (2, 4, hv, ring_len, v_dim)
                 )
                 self.assertEqual(pool.replayssm_cache_base.shape[0], 4)
+
+
+class TestGDNReplaySSMBackendCommit(CustomTestCase):
+    def _commit(self, hybrid, last_correct, req_rows, **kwargs):
+        hybrid.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct,
+            mamba_track_indices=kwargs.get("track_indices"),
+            mamba_steps_to_track=kwargs.get("track_steps"),
+            model=None,
+            req_pool_indices=req_rows,
+        )
+
+    def test_gdn_ring_commit_replaces_snapshot_scatter(self):
+        pool, state = _gdn_pool(), _spec_state()
+        # Rows past the request count are graph padding (state -1).
+        hybrid = _hybrid_backend(pool, state, torch.tensor([5, 9, 2, -1]))
+        req_rows = torch.tensor([17, 23, 31, 0])
+        with (
+            patch(_GDN_COMMIT) as commit,
+            patch(f"{_BACKEND}.scatter_mamba_states_after_mtp_verify") as scatter,
+        ):
+            self._commit(hybrid, torch.tensor([2, 0, 7]), req_rows)
+
+        scatter.assert_not_called()
+        commit.assert_called_once()
+        kwargs = commit.call_args.kwargs
+        self.assertIs(kwargs["spec_state"], state)
+        self.assertEqual(kwargs["state_batch_indices"].tolist(), [5, 9, 2])
+        self.assertEqual(kwargs["replay_indices"].tolist(), [17, 23, 31])
+        self.assertEqual(kwargs["accept_lens"].tolist(), [3, 1, 8])
+        # Every accepted window folds, so `temporal` is the committed state.
+        self.assertIs(kwargs["fold_every_commit"], True)
+
+    def test_pp_rows_and_track_slots_are_translated(self):
+        pool, state = _gdn_pool(), _spec_state()
+        hybrid = _hybrid_backend(pool, state, torch.tensor([7, 7, 7]))
+        req_rows = torch.tensor([14, 22, 30])
+        track_steps = torch.tensor([1, -1, 5])
+        with (
+            patch(_GDN_COMMIT) as commit,
+            patch(f"{_BACKEND}.pp_spec_stable_rows_enabled", return_value=True),
+        ):
+            self._commit(
+                hybrid,
+                torch.tensor([3, 0, 6]),
+                req_rows,
+                track_indices=torch.tensor([40, 41, 42]),
+                track_steps=track_steps,
+            )
+
+        kwargs = commit.call_args.kwargs
+        # PP stable rows read the slots of the delayed batch's request rows.
+        self.assertEqual(kwargs["state_batch_indices"].tolist(), [107, 111, 115])
+        self.assertEqual(kwargs["src_indices_raw"].tolist(), [14, 22, 30])
+        self.assertEqual(kwargs["replay_indices"].tolist(), [14, 22, 30])
+        self.assertEqual(kwargs["mamba_track_indices"].tolist(), [140, 141, 142])
+        self.assertIs(kwargs["mamba_steps_to_track"], track_steps)
+        self.assertEqual(kwargs["accept_lens"].tolist(), [4, 1, 7])
+
+    def test_empty_batch_is_noop(self):
+        hybrid = _hybrid_backend(_gdn_pool(), _spec_state(), torch.tensor([-1]))
+        with (
+            patch(_GDN_COMMIT) as commit,
+            patch(f"{_BACKEND}.scatter_mamba_states_after_mtp_verify") as scatter,
+        ):
+            self._commit(
+                hybrid,
+                torch.zeros(0, dtype=torch.int64),
+                torch.zeros(0, dtype=torch.int64),
+            )
+        commit.assert_not_called()
+        scatter.assert_not_called()
+
+    def test_snapshot_scatter_requires_snapshots(self):
+        pool = SimpleNamespace(replayssm_is_kda=False, replayssm_cache_base=None)
+        cache_indices = torch.tensor([5, 9])
+        last_correct = torch.tensor([1, 0])
+        req_rows = torch.tensor([3, 4])
+
+        hybrid = _hybrid_backend(pool, _spec_state(), cache_indices)
+        with (
+            patch(f"{_BACKEND}.scatter_mamba_states_after_mtp_verify") as scatter,
+            self.assertRaisesRegex(AssertionError, "no ReplaySSM commit"),
+        ):
+            self._commit(hybrid, last_correct, req_rows)
+        scatter.assert_not_called()
+
+        snapshots = torch.zeros(1, 4, DRAFT_TOKENS, 2, 4, 4)
+        state = _spec_state(intermediate_ssm=snapshots)
+        hybrid = _hybrid_backend(pool, state, cache_indices)
+        with patch(f"{_BACKEND}.scatter_mamba_states_after_mtp_verify") as scatter:
+            self._commit(hybrid, last_correct, req_rows)
+        scatter.assert_called_once()
+        self.assertIs(scatter.call_args.args[0], state)
 
 
 class TestGDNReplaySSMGenericCommit(CustomTestCase):
