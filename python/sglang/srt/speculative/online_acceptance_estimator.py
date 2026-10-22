@@ -50,14 +50,10 @@ _MAX_BLOCK_REQS = 256
 class OnlineAcceptanceEstimator:
     """Per-position conditional acceptance probabilities from draft confidence.
 
-    Per verify step the caller:
-    1. ``feature_from_scores`` on the draft scores of each position,
-    2. ``predict`` to get the conditional acceptance probabilities,
-    3. after verification, ``observe`` with the same features and the verify
-       outcome.
-    ``feature_and_predict`` does steps 1 and 2 in one kernel launch.
-    ``observe`` evaluates the Newton weights at the current coefficients, so it
-    may run before or after the next step's ``predict``.
+    Per verify step the caller runs ``feature_and_predict`` on the draft scores
+    and, after verification, ``observe`` with the same features and the verify
+    outcome. ``observe`` evaluates the Newton weights at the current
+    coefficients, so it may run before or after the next step's prediction.
     """
 
     def __init__(
@@ -84,32 +80,18 @@ class OnlineAcceptanceEstimator:
         # observe() calls since the last refit.
         self._num_calls = torch.zeros((1,), dtype=torch.int32, device=device)
 
-    def feature_from_scores(
-        self, scores: torch.Tensor, temperatures: torch.Tensor
-    ) -> torch.Tensor:
-        """scores [bs, num_positions, num_candidates]: the draft logits each
-        position sampled from; temperatures: per request, greedy rows <= 0.
-        Returns logit(q_max) of the temperature-scaled rows, float32
-        [bs, num_positions]."""
-        assert scores.dim() == 3 and scores.shape[1] == self.num_positions
-        return max_log_odds(scores, temperatures, _MAX_LOG_ODDS)[0]
-
     def feature_and_predict(
         self, scores: torch.Tensor, temperatures: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``feature_from_scores`` and ``predict`` fused into one kernel launch.
-        Returns the features and the conditional acceptance probabilities, both
-        float32 [bs, num_positions]. Does not change any state."""
+        """scores [bs, num_positions, num_candidates]: the draft logits each
+        position sampled from; temperatures: per request, greedy rows <= 0.
+        Returns logit(q_max) of the temperature-scaled rows and the conditional
+        acceptance probabilities, both float32 [bs, num_positions], from one
+        kernel launch. Does not change any state."""
         assert scores.dim() == 3 and scores.shape[1] == self.num_positions
         return max_log_odds(
             scores, temperatures, _MAX_LOG_ODDS, self.slope, self.intercepts
         )
-
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """Conditional acceptance probability of each draft position, float32
-        [bs, num_positions]. Does not change any state."""
-        assert x.dim() == 2 and x.shape[1] == self.num_positions
-        return torch.sigmoid(torch.addcmul(self.intercepts, x.float(), self.slope))
 
     def observe(
         self,

@@ -149,7 +149,9 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
             temps = torch.rand(bs, 1, generator=gen) * 1.5 + 0.1
             temps[0] = 0.0  # greedy rows are scored at T = 1
             est = self._estimator(k=k)
-            x = est.feature_from_scores(scores.to(self.device), temps.to(self.device))
+            x, _ = est.feature_and_predict(
+                scores.to(self.device), temps.to(self.device)
+            )
             self.assertEqual(x.dtype, torch.float32)
             self.assertEqual(tuple(x.shape), (bs, k))
             torch.testing.assert_close(
@@ -169,7 +171,7 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         )
         scores = rows[:, None, :]
         temps = torch.ones(rows.shape[0])
-        x = self._estimator(k=1).feature_from_scores(
+        x, _ = self._estimator(k=1).feature_and_predict(
             scores.to(self.device), temps.to(self.device)
         )
         expected = torch.tensor(
@@ -182,41 +184,29 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         base = torch.randn(6, 9, 40, generator=gen)
         scores = base[::2, 1:8, ::3]  # non-contiguous on every dim
         temps = torch.full((3,), 0.7)
-        x = self._estimator(k=7).feature_from_scores(
+        x, _ = self._estimator(k=7).feature_and_predict(
             scores.to(self.device), temps.to(self.device)
         )
         torch.testing.assert_close(
             x.cpu().double(), _ref_feature(scores, temps), rtol=1e-5, atol=1e-4
         )
 
-    def test_feature_and_predict_matches_separate_calls(self):
+    def test_predict_is_stateless_logistic(self):
         gen = torch.Generator().manual_seed(4)
         k = 7
         est = self._estimator(k=k)
         est.slope.fill_(1.3)
         est.intercepts.copy_(torch.linspace(-1, 1, k))
+        stats, calls = est._stats.clone(), est._num_calls.clone()
         for bs, n_cand, dtype in [(5, 16, torch.float32), (33, 300, torch.bfloat16)]:
             scores = (torch.randn(bs, k, n_cand, generator=gen) * 4.0).to(dtype)
             temps = torch.rand(bs, generator=gen) + 0.1
-            scores, temps = scores.to(self.device), temps.to(self.device)
-            x, p = est.feature_and_predict(scores, temps)
-            self.assertTrue(torch.equal(x, est.feature_from_scores(scores, temps)))
-            torch.testing.assert_close(p, est.predict(x), rtol=0, atol=1e-6)
-        x, p = est.feature_and_predict(
-            torch.empty(0, k, 8, device=self.device), torch.empty(0, device=self.device)
-        )
-        self.assertEqual((tuple(x.shape), tuple(p.shape)), ((0, k), (0, k)))
-
-    def test_predict_is_stateless_logistic(self):
-        est = self._estimator(k=7)
-        x = torch.randn(9, 7, device=self.device) * 5
-        p = est.predict(x)
-        torch.testing.assert_close(p, torch.sigmoid(_INIT_SLOPE * x + _INIT_BIAS))
-        est.slope.fill_(1.3)
-        est.intercepts.copy_(torch.linspace(-1, 1, 7))
-        stats, calls = est._stats.clone(), est._num_calls.clone()
-        p = est.predict(x)
-        torch.testing.assert_close(p, torch.sigmoid(1.3 * x + est.intercepts))
+            x, p = est.feature_and_predict(
+                scores.to(self.device), temps.to(self.device)
+            )
+            torch.testing.assert_close(
+                p, torch.sigmoid(1.3 * x + est.intercepts), rtol=0, atol=1e-6
+            )
         self.assertTrue(torch.equal(est._stats, stats))
         self.assertTrue(torch.equal(est._num_calls, calls))
 
@@ -279,12 +269,6 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
             for step in range(steps):
                 x, verified, accepted = _random_step(
                     gen, bs, k, true_slope, true_bias, self.device
-                )
-                torch.testing.assert_close(
-                    est.predict(x).cpu().double(),
-                    ref.predict(x.cpu()),
-                    atol=1e-5,
-                    rtol=1e-5,
                 )
                 est.observe(x, verified, accepted)
                 ref.observe(x, verified, accepted)
@@ -391,10 +375,10 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         # No observations: the refit leaves the coefficients alone.
         self.assertEqual(est.slope.item(), _INIT_SLOPE)
         self.assertTrue(torch.equal(est.intercepts.cpu(), torch.full((3,), _INIT_BIAS)))
-        x = est.feature_from_scores(
+        x, p = est.feature_and_predict(
             torch.empty(0, 3, 8, device=self.device), torch.empty(0, device=self.device)
         )
-        self.assertEqual(tuple(x.shape), (0, 3))
+        self.assertEqual((tuple(x.shape), tuple(p.shape)), ((0, 3), (0, 3)))
 
     def test_no_host_sync(self):
         k = 7
@@ -404,14 +388,12 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         verified = torch.full((16,), k, dtype=torch.int32, device=self.device)
         accepted = torch.randint(0, k + 1, (16,), dtype=torch.int32, device=self.device)
         # Compile the kernels first.
-        est.observe(est.feature_from_scores(scores, temps), verified, accepted)
+        est.observe(est.feature_and_predict(scores, temps)[0], verified, accepted)
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
             for _ in range(3):  # crosses a refit
-                x = est.feature_from_scores(scores, temps)
-                est.predict(x)
-                est.feature_and_predict(scores, temps)
+                x, _ = est.feature_and_predict(scores, temps)
                 est.observe(x, verified, accepted)
         finally:
             torch.cuda.set_sync_debug_mode("default")
@@ -427,10 +409,9 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         accepted = torch.zeros(bs, dtype=torch.int32, device=self.device)
 
         def body(est):
-            x, fused_prob = est.feature_and_predict(scores, temps)
-            prob = est.predict(est.feature_from_scores(scores, temps))
+            x, prob = est.feature_and_predict(scores, temps)
             est.observe(x, verified, accepted)
-            return prob, fused_prob
+            return x, prob
 
         warm = self._estimator(k=k, max_num_reqs=bs)
         stream = torch.cuda.Stream()

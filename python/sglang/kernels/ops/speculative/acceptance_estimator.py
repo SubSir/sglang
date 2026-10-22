@@ -1,14 +1,14 @@
 """Kernels for the online draft acceptance estimator.
 
 ``max_log_odds`` turns draft scores into the estimator's feature, the log-odds
-of the most likely draft token, and optionally the logistic prediction from it.
+of the most likely draft token, and the logistic prediction from it.
 ``observe_acceptance`` folds verified drafts into the per-round Newton (IRLS)
 statistics and, every ``refit_interval`` calls, refits the logistic
 coefficients in place. Both read their state from device tensors only, so they
 never synchronize with the host and can be captured in a CUDA graph.
 """
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton
@@ -37,7 +37,6 @@ def _max_log_odds_kernel(
     num_positions,
     num_candidates,
     MAX_LOG_ODDS: tl.constexpr,
-    WITH_PROBS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -79,26 +78,24 @@ def _max_log_odds_kernel(
     feature = tl.where(run_rest > 0.0, -tl.log(run_rest), MAX_LOG_ODDS)
     feature = tl.minimum(tl.maximum(feature, -MAX_LOG_ODDS), MAX_LOG_ODDS)
     tl.store(out_ptr + row, feature)
-    if WITH_PROBS:
-        bias = tl.load(intercepts_ptr + pos)
-        tl.store(probs_ptr + row, tl.sigmoid(tl.load(slope_ptr) * feature + bias))
+    bias = tl.load(intercepts_ptr + pos)
+    tl.store(probs_ptr + row, tl.sigmoid(tl.load(slope_ptr) * feature + bias))
 
 
 def max_log_odds(
     scores: torch.Tensor,
     temperatures: torch.Tensor,
     clamp: float,
-    slope: Optional[torch.Tensor] = None,
-    intercepts: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    slope: torch.Tensor,
+    intercepts: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Log-odds of the most likely candidate of each temperature-scaled row.
 
     scores: [bs, num_positions, num_candidates] logits; temperatures: one per
-    request (any shape with bs elements). Returns the float32 log-odds
-    [bs, num_positions], clamped to +-clamp, and, when the float32 logistic
-    coefficients slope [1] and intercepts [num_positions] are given, the
-    probabilities sigmoid(slope * x + intercepts[k]) from the same launch
-    (otherwise None).
+    request (any shape with bs elements); slope [1] and intercepts
+    [num_positions]: the float32 logistic coefficients. Returns the float32
+    log-odds [bs, num_positions], clamped to +-clamp, and the probabilities
+    sigmoid(slope * x + intercepts[k]) from the same launch.
 
     One program handles one row and walks its candidates in blocks, so the
     kernel is sized for candidate lists; a full-vocabulary row runs serially.
@@ -106,13 +103,10 @@ def max_log_odds(
     bs, num_positions, num_candidates = scores.shape
     temperatures = temperatures.reshape(-1)
     assert temperatures.numel() == bs, (temperatures.shape, scores.shape)
-    with_probs = slope is not None
-    assert with_probs == (intercepts is not None)
-    if with_probs:
-        assert slope.numel() == 1 and intercepts.shape == (num_positions,)
-        assert slope.dtype == intercepts.dtype == torch.float32
+    assert slope.numel() == 1 and intercepts.shape == (num_positions,)
+    assert slope.dtype == intercepts.dtype == torch.float32
     out = torch.empty((bs, num_positions), dtype=torch.float32, device=scores.device)
-    probs = torch.empty_like(out) if with_probs else None
+    probs = torch.empty_like(out)
     if out.numel() == 0:
         return out, probs
     block_n = min(triton.next_power_of_2(num_candidates), 4096)
@@ -123,14 +117,13 @@ def max_log_odds(
         scores.stride(2),
         temperatures,
         temperatures.stride(0),
-        slope if with_probs else out,
-        intercepts if with_probs else out,
+        slope,
+        intercepts,
         out,
-        probs if with_probs else out,
+        probs,
         num_positions,
         num_candidates,
         MAX_LOG_ODDS=clamp,
-        WITH_PROBS=with_probs,
         BLOCK_N=block_n,
         num_warps=1 if block_n <= 256 else 4,
     )
