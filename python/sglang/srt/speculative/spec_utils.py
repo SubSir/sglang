@@ -1013,7 +1013,6 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
-            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         return
 
