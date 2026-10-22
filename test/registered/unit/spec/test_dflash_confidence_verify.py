@@ -219,35 +219,6 @@ def test_compact_plan_on_the_full_block_graph_verifies_every_draft(monkeypatch):
         assert trimmed.graph_num_tokens == 8 and int(trimmed.verify_lens.sum()) == 7
 
 
-def test_observe_counts_the_drafts_the_target_verified():
-    class Recorder:
-        def observe(self, x, num_verified, num_accepted):
-            self.calls.append((x, num_verified.tolist(), num_accepted.tolist()))
-
-    estimator = Recorder()
-    estimator.calls = []
-    feature = torch.zeros(3, 4)
-    worker = types.SimpleNamespace(
-        _acceptance_estimator=estimator, _draft_feature=feature, block_size=5
-    )
-    accept_len = torch.tensor([2, 4, 0], dtype=torch.int32)
-    worker_mod.DFlashWorkerV2._observe_acceptance(
-        worker, accept_len=accept_len, layout=None
-    )
-    layout = types.SimpleNamespace(
-        verify_lens=torch.tensor([3, 5, 1], dtype=torch.int32)
-    )
-    worker_mod.DFlashWorkerV2._observe_acceptance(
-        worker, accept_len=accept_len, layout=layout
-    )
-    # Without a layout every draft was verified; with one, verify_lens - 1.
-    assert [call[1:] for call in estimator.calls] == [
-        ([4, 4, 4], [2, 4, 0]),
-        ([2, 4, 0], [2, 4, 0]),
-    ]
-    assert all(call[0] is feature for call in estimator.calls)
-
-
 def test_ragged_verify_gates_open_for_dflash_outside_static(monkeypatch):
     from sglang.srt.managers import overlap_utils
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

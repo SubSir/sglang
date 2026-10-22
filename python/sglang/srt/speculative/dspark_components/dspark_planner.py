@@ -311,16 +311,10 @@ class DSparkVerifyPlanner:
         requests. It cannot when even the shortest plan replays the compact
         graph of the full block, as for a single request: the step then
         verifies every draft and prices no budget."""
-        if (
+        return (
             self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
-            or not self._dynamic_graph_tier
-        ):
-            return True
-        full_tier = self._compact_graph_tier(num_reqs * self.verify_num_draft_tokens)
-        floor_tier = self._compact_graph_tier(
-            num_reqs * max(self._schedule_cfg.min_verify_len, 1)
+            or not self._plan_verifies_every_draft(num_reqs=num_reqs, budget=0)
         )
-        return full_tier is None or floor_tier != full_tier
 
     def _plan_verifies_every_draft(
         self, *, num_reqs: int, budget: Optional[int]
