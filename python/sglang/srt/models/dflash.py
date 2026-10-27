@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -13,6 +14,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.dflash_boundary import (
+    CUTE_CONFIGS,
+    DFlashBoundary,
+    coef_gemm,
+    finish_norm,
+)
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -662,6 +669,51 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
+    @staticmethod
+    def _boundary(fused, y, residual, norm, conv, pending):
+        """The previous sublayer's finish conv, the residual add, the RMSNorm, the
+        coefficient projection and the prepare conv. Returns the sublayer input, the
+        residual, and the (coefficients, finish base) the next boundary finishes with."""
+        boundary, cute = fused
+        M = y.shape[0]
+        fcoef, fbase = pending if pending is not None else (None, None)
+        # Parameters require grad, and dlpack (TGV, CuTe) refuses to export those.
+        weight = conv.kernel_projection.weight.detach()
+        base = conv.base_kernel.detach()
+        if cute is not None and cute.config(M) is not None:
+            x, res_out = torch.empty_like(y), torch.empty_like(y)
+            coef = torch.empty((M, weight.shape[0]), dtype=y.dtype, device=y.device)
+            cute(y, residual, norm.weight.detach(), weight, base[0], x, res_out, coef,
+                 fcoef=fcoef, fbase=fbase, eps=norm.variance_epsilon)
+            return x, res_out, (coef, base[1])
+        u = torch.empty_like(y)
+        res_out = torch.empty_like(y)
+        finish_norm(y, residual, norm.weight, norm.variance_epsilon, u, res_out,
+                    fcoef, fbase, block=conv.block_size)
+        if boundary.dense:
+            x = torch.empty_like(y)
+            coef = torch.empty((M, weight.shape[0]), dtype=y.dtype, device=y.device)
+            boundary.dense_gemm_conv(u, weight, base[0], x, coef)
+        elif boundary.fused_rows(M):
+            x = torch.empty_like(y)
+            coef = torch.empty((M, weight.shape[0]), dtype=y.dtype, device=y.device)
+            boundary.gemm_conv(u, weight, base[0], x, coef)
+        else:
+            coef = coef_gemm(u, weight)
+            x = conv._convolve(u, coef.view(M, 2, conv.taps, conv.num_groups)[:, 0], side=0)
+        return x, res_out, (coef, base[1])
+
+    def forward_fused(self, positions, hidden_states, forward_batch, residual, pending, fused):
+        """forward() with every conv folded into the boundaries around the sublayers.
+        hidden_states is the previous layer's unfinished MLP output (or the input
+        embeddings); returns this layer's unfinished MLP output."""
+        x, residual, pending = self._boundary(
+            fused, hidden_states, residual, self.input_layernorm, self.attention_conv, pending)
+        attn_out = self.self_attn(positions=positions, hidden_states=x, forward_batch=forward_batch)
+        x, residual, pending = self._boundary(
+            fused, attn_out, residual, self.post_attention_layernorm, self.mlp_conv, pending)
+        return self.mlp(x), residual, pending
+
 
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
@@ -731,6 +783,36 @@ class DFlashDraftModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Boundary fusion (SubSir/sglang dflash2-boundary-fusion 1d9c97878a..7f6ed9184c, ported onto c1c287a4).
+        # The fused kernels are written for 2-tap convs over groups of 16 channels. Triton's
+        # kernels use PDL (sm_90+); the CuTe cluster kernel and its tables are Blackwell-only.
+        # Switches (env, read here instead of srt/environ.py): SGLANG_DFLASH_FUSED_CONV (default 1),
+        # SGLANG_DFLASH_FUSED_CONV_BACKEND ("cute" default, or "triton").
+        self._fused_boundary: Optional[DFlashBoundary] = None
+        self._fused_cute = None
+        if (
+            os.environ.get("SGLANG_DFLASH_FUSED_CONV", "1").lower() not in ("0", "false", "no")
+            and draft_config.conv_kernel_size == 2
+            and draft_config.conv_group_size == 16
+            and torch.cuda.is_available()
+            and torch.version.cuda is not None
+            and torch.cuda.get_device_capability()[0] >= 9
+        ):
+            device = torch.device("cuda", torch.cuda.current_device())
+            self._fused_boundary = DFlashBoundary(hidden_size, device, block=self.block_size)
+            if (
+                os.environ.get("SGLANG_DFLASH_FUSED_CONV_BACKEND", "cute") == "cute"
+                and hidden_size in CUTE_CONFIGS
+                and torch.cuda.get_device_capability()[0] == 10
+            ):
+                from sglang.kernels.ops.speculative.dflash_boundary_cute import DFlashBoundaryCute
+
+                self._fused_cute = DFlashBoundaryCute(hidden_size, device, CUTE_CONFIGS[hidden_size],
+                                                      block=self.block_size)
+            logger.warning(
+                "DFLASH_FUSED_CONV on: H=%d block=%d backend=%s", hidden_size, self.block_size,
+                "cute" if self._fused_cute is not None else ("dense" if self._fused_boundary.dense else "triton"),
+            )
 
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
@@ -1020,6 +1102,18 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        if self._fused_boundary is not None and hidden_states.numel() != 0:
+            pending = None
+            for layer in self.layers:
+                hidden_states, residual, pending = layer.forward_fused(
+                    positions, hidden_states, forward_batch, residual, pending,
+                    (self._fused_boundary, self._fused_cute),
+                )
+            out = torch.empty_like(hidden_states)
+            finish_norm(hidden_states, residual, self.norm.weight, self.norm.variance_epsilon,
+                        out, torch.empty_like(hidden_states), *pending, block=self.block_size)
+            return LogitsProcessorOutput(next_token_logits=None, hidden_states=out)
+
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -1158,6 +1252,11 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
+        if self._fused_cute is not None:
+            # Permuted weight copies must exist before CUDA graph capture.
+            for layer in self.layers:
+                for conv in (layer.attention_conv, layer.mlp_conv):
+                    self._fused_cute.prepare_weight(conv.kernel_projection.weight.detach())
 
 
 class DFlashLagunaAttention(DFlashAttention):
