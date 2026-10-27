@@ -176,6 +176,11 @@ def _pd_prefill_skips_mamba_spec_state() -> bool:
     )
 
 
+def dflash_shared_context_kv(hf_config) -> Optional[str]:
+    """paper/q36-fusekv: the draft config's shared_context_kv ("fused": one [K | V] for every draft layer)."""
+    return (getattr(hf_config, "dflash_config", None) or {}).get("shared_context_kv")
+
+
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
     """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
     stays a bf16 ring; MTP/EAGLE NextN follows the env."""
@@ -2569,6 +2574,11 @@ class KVCacheConfigurator:
             pool_cls = PageInterleaveMHATokenToKVPool
             pool_kwargs["shard_spec"] = self.kv_shard_spec
             pool_kwargs["shard_group"] = self.kv_shard_group
+        layer_num, end_layer = self.layer_info.num_effective_layers, self.layer_info.end_layer
+        # paper/q36-fusekv one copy: every draft layer attends to the same shared [K | V] as layer 0
+        # (models/dflash.py), so the draft pool stores a single layer.
+        if self.is_draft_worker and dflash_shared_context_kv(self.model_config.hf_config) == "fused":
+            layer_num, end_layer = 1, self.layer_info.start_layer + 1
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -2578,11 +2588,11 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
+            layer_num=layer_num,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
+            end_layer=end_layer,
             enable_alt_stream=not get_disagg().enable_pdmux,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             **pool_kwargs,

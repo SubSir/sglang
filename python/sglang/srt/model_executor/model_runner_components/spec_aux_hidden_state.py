@@ -231,9 +231,11 @@ def _resolve_dflash_aux_hidden_state(
         config.draft_model_config = draft_model_config
         config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        # paper/q36-fusekv one copy: a shared [K | V] costs one draft layer per token (the draft pool holds one layer).
+        shared_kv = (getattr(draft_model_config.hf_config, "dflash_config", None) or {}).get("shared_context_kv")
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
-            draft_num_layers=int(draft_num_layers),
+            draft_num_layers=1 if shared_kv == "fused" else int(draft_num_layers),
         )
 
 

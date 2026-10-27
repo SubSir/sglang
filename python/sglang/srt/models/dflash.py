@@ -809,6 +809,11 @@ class DFlashDraftModel(nn.Module):
             self.supports_fused_context_kv = False
             for layer in self.layers:
                 layer.self_attn.shared_context_kv = self.shared_context_kv
+                if self.shared_context_kv == "fused":
+                    # One copy of the context K/V: all layers use the pool's single layer. Layers run in order and
+                    # each writes its block K/V right before attending, so layer i still sees its own block rows.
+                    # Set after construction: the constructor's layer_id also picks layer_types[layer_id].
+                    layer.self_attn.attn.layer_id = 0
 
         # The model loader calls load_weights() before set_block_size(). Build
         # Domino projector modules here so their parameters are present while

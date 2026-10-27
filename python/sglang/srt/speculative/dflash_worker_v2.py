@@ -1949,7 +1949,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                for layer in self.draft_model.layers:
+                for layer in self._context_kv_layers():
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
@@ -1993,13 +1993,35 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_cache_loc=cache_loc,
             )
 
+    def _context_kv_layers(self):
+        """Draft layers whose context K/V is materialized: only layer 0 when they all share one copy (fused)."""
+        layers = self.draft_model.layers
+        if getattr(self.draft_model, "shared_context_kv", None) != "fused":
+            return layers
+        if not getattr(self, "_shared_kv_checked", False):
+            # Checked at the first write: the draft runner's pool is attached after this worker's __init__.
+            pool = self.draft_model_runner.token_to_kv_pool
+            ids = sorted({layer.self_attn.attn.layer_id for layer in layers})
+            if getattr(pool, "layer_num", None) != 1 or ids != [0]:
+                raise RuntimeError(
+                    f"DFLASH shared K/V expects a 1-layer draft pool and layer ids [0], "
+                    f"got {getattr(pool, 'layer_num', None)} / {ids}"
+                )
+            logger.warning(
+                "DFLASH_SHARED_KV_ONE_COPY draft layers=%d pool layers=%d K+V bytes=%d",
+                len(layers), pool.layer_num,
+                sum(t.numel() * t.element_size() for t in (*pool.k_buffer, *pool.v_buffer)),
+            )
+            self._shared_kv_checked = True
+        return layers[:1]
+
     def _append_target_hidden_sequential(
         self,
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
-        for layer in self.draft_model.layers:
+        for layer in self._context_kv_layers():
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
