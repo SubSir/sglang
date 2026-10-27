@@ -100,6 +100,7 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
     check_simulate_acc_token_mode,
+    commit_mamba_states_after_verify,
     draft_pp_context,
     draft_tp_context,
 )
@@ -2109,6 +2110,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         model_runner = self.target_worker.model_runner
+        mamba_pool = getattr(model_runner.req_to_token_pool, "mamba_pool", None)
+        if getattr(mamba_pool, "replayssm_cache_base", None) is not None and not getattr(
+            mamba_pool, "replayssm_is_kda", False
+        ):
+            # GDN ReplaySSM: the verify wrote the drafts into the ring and kept no
+            # intermediate state to scatter. The accepted block is a prefix, so
+            # its last step is commit_lens - 1 and the bonus is inside it.
+            commit_mamba_states_after_verify(
+                target_worker=self.target_worker,
+                batch=batch,
+                accept_lens=commit_lens,
+                accept_index=commit_lens,
+                draft_token_num=int(self.block_size),
+                prepared_step_indices=(last_correct_step_indices, mamba_steps_to_track),
+            )
+            return
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_correct_step_indices,

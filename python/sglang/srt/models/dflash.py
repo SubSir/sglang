@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -29,7 +30,7 @@ from sglang.srt.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
@@ -195,6 +196,12 @@ _ROPE_DIM_SUPERSEDED_KEYS = frozenset(
 
 
 class DFlashAttention(nn.Module):
+    # Set to the draft's shared_context_kv. "fused": context tokens arrive as the shared, already-normed [K | V].
+    # "mla": they arrive as the shared, normed [c ; k_R]; this layer up-projects c with ctx_uk / ctx_uv.
+    shared_context_kv = None
+    # paper/q36-mla: armed by DFlashDraftModel for one call, (positions, final K, V) -> logs DFLASH_MLA_KV_CHECK.
+    _mla_check = None
+
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
     ) -> None:
@@ -412,6 +419,23 @@ class DFlashAttention(nn.Module):
         This is used by DFlash to materialize ctx tokens into the draft KV cache:
         we only need K/V for the cached tokens; Q is never consumed.
         """
+        if self.shared_context_kv == "mla":
+            # K per head = [k_R (rope dims, shared by every head and layer) ; W_UK c], V = W_UV c. torch.cat
+            # builds a fresh K for every layer, so apply_k_rope's in-place rotation touches this layer's copy only.
+            latent, rope_key = hidden_states.split([self.ctx_uv.in_features, self.mla_rope_dim], dim=-1)
+            n = int(hidden_states.shape[0])
+            rope_key = rope_key.unsqueeze(1).expand(n, self.num_kv_heads, self.mla_rope_dim)
+            nope_key = self.ctx_uk(latent).view(n, self.num_kv_heads, -1)
+            k = torch.cat((rope_key, nope_key), dim=-1).view(n, -1)
+            v = self.ctx_uv(latent)
+            if self._mla_check is not None:
+                self._mla_check_v = v
+            return k, v
+        if self.shared_context_kv:
+            k, v = hidden_states.split([self.kv_size, self.kv_size], dim=-1)
+            # Every layer reads the same [K | V] and apply_k_rope rotates in place: hand each layer its own K,
+            # or the rotations pile up layer after layer. clone, not contiguous: one row already counts as contiguous.
+            return k.clone(), v
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
         can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
         if can_slice_qkv_weight:
@@ -433,6 +457,8 @@ class DFlashAttention(nn.Module):
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
+        if self.shared_context_kv:
+            return k  # fused: ctx_k_norm ran once for every layer; mla: k_R was normed, W_UK c has no norm
         k_by_head = k.reshape(-1, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         return k_by_head.view_as(k)
@@ -441,6 +467,10 @@ class DFlashAttention(nn.Module):
         # Match K shape so RoPE kernel head-count check passes on all backends.
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
+        if self._mla_check is not None:
+            check, self._mla_check = self._mla_check, None
+            check(positions, k, self._mla_check_v)
+            self._mla_check_v = None
         return k
 
 
@@ -732,6 +762,54 @@ class DFlashDraftModel(nn.Module):
             )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
+        # paper/q36-fusekv: one GEMM from the raw target features to one [K | V] shared by every layer, each
+        # half per-head RMSNormed; it replaces fc/hidden_norm and every layer's context K/V projection.
+        # paper/q36-mla: the same GEMM slot produces the MLA latent [c ; k_R] instead (see below).
+        dflash_cfg = getattr(config, "dflash_config", None) or {}
+        self.shared_context_kv = dflash_cfg.get("shared_context_kv")
+        if self.shared_context_kv is not None:
+            attn0 = self.layers[0].self_attn
+            # ponytail: TP1 bf16 only (the eval setting); TP needs the [K | V] output sharded by kv head.
+            if (
+                self.shared_context_kv not in ("fused", "mla")
+                or self.quantizable
+                or get_parallel().tp_size != 1
+            ):
+                raise ValueError(f"shared_context_kv={self.shared_context_kv!r} is served for unquantized TP1 only")
+            del self.fc, self.hidden_norm
+            if self.shared_context_kv == "fused":
+                self.ctx_kv = nn.Linear(self.num_context_features * hidden_size, 2 * attn0.kv_size, bias=False)
+                self.ctx_k_norm = RMSNorm(attn0.head_dim, eps=rms_norm_eps)
+                self.ctx_v_norm = RMSNorm(attn0.head_dim, eps=rms_norm_eps)
+            else:
+                # paper/q36-mla (draft.py, DeepSeek-V2 decoupled RoPE): one GEMM to [c ; k_R] (latent + rotary
+                # dims), each RMSNormed, cached once per token; every layer's ctx_uk / ctx_uv up-project c.
+                latent_dim = int(dflash_cfg["ctx_latent_dim"])
+                rope_dim = int(attn0.head_dim * float(getattr(config, "partial_rotary_factor", 1.0)))
+                if not 0 < rope_dim < attn0.head_dim:
+                    raise ValueError(f"shared_context_kv='mla' needs 0 < rotary dims < head_dim, got {rope_dim}")
+                self.mla_latent_dim, self.mla_rope_dim = latent_dim, rope_dim
+                self.mla_rope_theta = float(get_rope_config(config)[0])
+                self.ctx_dkv = nn.Linear(self.num_context_features * hidden_size, latent_dim + rope_dim, bias=False)
+                self.ctx_latent_norm = RMSNorm(latent_dim, eps=rms_norm_eps)
+                self.ctx_rope_norm = RMSNorm(rope_dim, eps=rms_norm_eps)
+                for layer in self.layers:
+                    attn = layer.self_attn
+                    rotary = attn.rotary_emb
+                    # Queries and keys must rotate exactly the trainer's dims: the first rope_dim, NeoX.
+                    if type(rotary) is not RotaryEmbedding or rotary.rotary_dim != rope_dim or not rotary.is_neox_style:
+                        raise ValueError(
+                            f"shared_context_kv='mla' needs plain NeoX RoPE over the first {rope_dim} dims, "
+                            f"got {rotary!r}"
+                        )
+                    attn.mla_rope_dim = rope_dim
+                    attn.ctx_uk = nn.Linear(latent_dim, attn.num_kv_heads * (attn.head_dim - rope_dim), bias=False)
+                    attn.ctx_uv = nn.Linear(latent_dim, attn.kv_size, bias=False)
+            # The worker's fused materializer stacks per-layer k/v weights; there are none here.
+            self.supports_fused_context_kv = False
+            for layer in self.layers:
+                layer.self_attn.shared_context_kv = self.shared_context_kv
+
         # The model loader calls load_weights() before set_block_size(). Build
         # Domino projector modules here so their parameters are present while
         # checkpoint weights are loaded.
@@ -787,6 +865,10 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
+        if self.shared_context_kv == "mla":
+            return self._project_mla_latent(target_hidden)
+        if self.shared_context_kv is not None:
+            return self._project_shared_context_kv(target_hidden)
         expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
@@ -801,6 +883,119 @@ class DFlashDraftModel(nn.Module):
         if self.quantizable:
             projected = projected[0]
         return self.hidden_norm(projected)
+
+    def _project_shared_context_kv(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """[N, K*H] -> [N, 2*kv_size] = [ctx_k_norm(K) | ctx_v_norm(V)], in the trainer's (2, kv_heads, head_dim) layout."""
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != self.ctx_kv.in_features:
+            raise ValueError(
+                f"DFLASH shared context K/V expects target_hidden [N, {self.ctx_kv.in_features}], "
+                f"got {tuple(target_hidden.shape)}."
+            )
+        attn0 = self.layers[0].self_attn
+        n, hd = int(target_hidden.shape[0]), attn0.head_dim
+        kv = self.ctx_kv(target_hidden).view(n, 2, -1, hd)
+        k = self.ctx_k_norm(kv[:, 0].reshape(-1, hd)).view(n, -1)
+        v = self.ctx_v_norm(kv[:, 1].reshape(-1, hd)).view(n, -1)
+        out = torch.cat((k, v), dim=-1)
+        if (
+            n
+            and not getattr(self, "_fused_kv_checked", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and bool(target_hidden.abs().amax() > 0)  # warmup feeds zeros; wait for a real request
+        ):
+            # One-off check of what the context-KV writer receives against an fp32 transcription of the
+            # trainer (draft.py: ctx_kv -> unflatten(2, kv_heads, -1) -> ctx_k_norm / ctx_v_norm).
+            self._fused_kv_checked = True
+            ref = (target_hidden.float() @ self.ctx_kv.weight.float().T).view(n, 2, -1, hd)
+
+            def rms(x, norm):
+                return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon) * norm.weight.float()
+
+            k_got, v_got = attn0.kv_proj_only(out)
+            k_got = attn0.apply_k_norm(k_got)
+            errs = [
+                float((got.float().view(n, -1, hd) - want).norm() / want.norm())
+                for got, want in ((k_got, rms(ref[:, 0], self.ctx_k_norm)), (v_got, rms(ref[:, 1], self.ctx_v_norm)))
+            ]
+            logger.warning("DFLASH_FUSED_KV_CHECK n=%d rel_err_k=%.2e rel_err_v=%.2e", n, *errs)
+        return out
+
+    def _project_mla_latent(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """[N, K*H] -> [N, latent + rope] = [ctx_latent_norm(c) ; ctx_rope_norm(k_R)], k_R not yet rotated:
+        each layer's apply_k_rope rotates the k_R half of its own fresh K."""
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != self.ctx_dkv.in_features:
+            raise ValueError(
+                f"DFLASH MLA context expects target_hidden [N, {self.ctx_dkv.in_features}], "
+                f"got {tuple(target_hidden.shape)}."
+            )
+        latent, rope_key = self.ctx_dkv(target_hidden).split([self.mla_latent_dim, self.mla_rope_dim], dim=-1)
+        out = torch.cat(
+            (self.ctx_latent_norm(latent.contiguous()), self.ctx_rope_norm(rope_key.contiguous())), dim=-1
+        )
+        if (
+            target_hidden.shape[0]
+            and not getattr(self, "_mla_kv_checked", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and bool(target_hidden.abs().amax() > 0)  # warmup feeds zeros; wait for a real request
+        ):
+            # Arm a one-off check on the first and last layer: their apply_k_rope compares the K and V handed
+            # to the KV writer against the trainer formula, recomputed in fp32 from target_hidden.
+            self._mla_kv_checked = True
+            for layer_id in sorted({0, len(self.layers) - 1}):
+                attn = self.layers[layer_id].self_attn
+                attn._mla_check = functools.partial(self._mla_kv_check, layer_id, target_hidden)
+        return out
+
+    def _mla_kv_check(
+        self,
+        layer_id: int,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """fp32 transcription of draft.py (mla): [c ; r] = W_DKV H; c, k_R RMSNormed; K = [RoPE(k_R) ; W_UK c],
+        NeoX RoPE over the first rope_dim dims with inv_freq = theta ** -(arange(0, rope_dim, 2) / rope_dim);
+        V = W_UV c. Compared against the final K (after this layer's RoPE) and V the worker writes."""
+        attn = self.layers[layer_id].self_attn
+        n, heads, hd, rd = int(target_hidden.shape[0]), attn.num_kv_heads, attn.head_dim, self.mla_rope_dim
+        if int(k.shape[0]) != n or int(positions.shape[0]) != n:
+            logger.warning(
+                "DFLASH_MLA_KV_CHECK layer=%d skipped: rows k=%d pos=%d hidden=%d",
+                layer_id,
+                k.shape[0],
+                positions.shape[0],
+                n,
+            )
+            return
+
+        def rms(x, norm):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon) * norm.weight.float()
+
+        projected = target_hidden.float() @ self.ctx_dkv.weight.float().T
+        latent = rms(projected[:, : self.mla_latent_dim], self.ctx_latent_norm)
+        rope_key = rms(projected[:, self.mla_latent_dim :], self.ctx_rope_norm)
+        inv_freq = 1.0 / self.mla_rope_theta ** (
+            torch.arange(0, rd, 2, device=positions.device, dtype=torch.float) / rd
+        )
+        freqs = positions.float()[:, None] * inv_freq[None, :]
+        cos, sin = torch.cat((freqs, freqs), -1).cos(), torch.cat((freqs, freqs), -1).sin()
+        rope_ref = rope_key * cos + torch.cat((-rope_key[:, rd // 2 :], rope_key[:, : rd // 2]), -1) * sin
+        nope_ref = (latent @ attn.ctx_uk.weight.float().T).view(n, heads, hd - rd)
+        v_ref = (latent @ attn.ctx_uv.weight.float().T).view(n, heads, hd)
+        k_got = k.float().view(n, heads, hd)
+
+        def rel(got, want):
+            return float((got - want).norm() / want.norm())
+
+        logger.warning(
+            "DFLASH_MLA_KV_CHECK layer=%d n=%d rel_err_k_rope=%.2e rel_err_k_nope=%.2e rel_err_v=%.2e",
+            layer_id,
+            n,
+            rel(k_got[..., :rd], rope_ref[:, None].expand(n, heads, rd)),
+            rel(k_got[..., rd:], nope_ref),
+            rel(v.float().view(n, heads, hd), v_ref),
+        )
 
     @torch.no_grad()
     def forward(
@@ -853,6 +1048,7 @@ class DFlashDraftModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        ignored = []
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -901,6 +1097,7 @@ class DFlashDraftModel(nn.Module):
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
                     # Ignore unexpected weights (e.g., HF rotary caches).
+                    ignored.append(name)
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
@@ -941,6 +1138,12 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
+
+        # Eval guard: a config that names a module the export lacks would serve it untrained.
+        unloaded = sorted(set(params_dict) - loaded_params)
+        logger.warning(
+            "DFLASH_LOAD_CHECK loaded=%d unloaded=%s ignored=%s", len(loaded_params), unloaded, sorted(ignored)
+        )
 
         if self.projector_type == "domino":
             required = {
